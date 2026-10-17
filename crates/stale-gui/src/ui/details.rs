@@ -28,7 +28,7 @@ fn hive_label(hive: Hive) -> &'static str {
 }
 
 fn last_used_text(row: &Row) -> String {
-    let Some(usage) = &row.usage else { return strings::NEVER_SEEN.to_string() };
+    let Some(usage) = &row.usage else { return strings::PENDING.to_string() };
     let (Some(when), Some(source)) = (usage.last_used.when, usage.last_used.source) else {
         return strings::NEVER_SEEN.to_string();
     };

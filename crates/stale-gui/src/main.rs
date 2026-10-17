@@ -8,10 +8,29 @@ use stale_gui::strings::APP_TITLE;
 
 fn main() -> eframe::Result {
     logging::init();
+    install_panic_hook();
     log::info!("stale {} starting", stale_core::version());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(APP_TITLE),
         ..Default::default()
     };
     eframe::run_native(APP_TITLE, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
+}
+
+/// Logs every panic (message and location) before the default hook runs: in release builds
+/// there is no console, so the log file is the only trace of a crashed scan thread.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info.location().map_or_else(|| "<unknown>".to_string(), |l| l.to_string());
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        log::error!("panic in thread '{thread}' at {location}: {msg}");
+        default(info);
+    }));
 }

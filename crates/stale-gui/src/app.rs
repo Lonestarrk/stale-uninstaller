@@ -169,8 +169,13 @@ impl StaleApp {
                     return;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    // The worker is gone; stop waiting even if it died before `Done`.
-                    self.scanning = false;
+                    // The worker is gone. Without `Done` first it died mid-scan (a panic,
+                    // logged by the panic hook): say so instead of showing partial results silently.
+                    if self.scanning {
+                        log::error!("scan worker disconnected before Done");
+                        self.warnings.push(strings::SCAN_ABORTED.to_string());
+                        self.scanning = false;
+                    }
                     return;
                 }
             }
@@ -279,6 +284,50 @@ mod tests {
 
         app.apply_event(ScanEvent::Done);
         assert!(!app.scanning);
+    }
+
+    /// An app that is scanning and reads `events` from a worker that has already exited.
+    fn app_after_worker(events: Vec<ScanEvent>) -> StaleApp {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for ev in events {
+            tx.send(ev).unwrap();
+        }
+        drop(tx);
+        let mut app = StaleApp::empty(Settings::default());
+        app.rx = Some(rx);
+        app.scanning = true;
+        app
+    }
+
+    #[test]
+    fn disconnect_before_done_warns() {
+        let mut app = app_after_worker(vec![ScanEvent::Programs(vec![program("a", false)])]);
+        app.drain_events();
+        assert!(!app.scanning);
+        assert_eq!(app.rows.len(), 1, "events before the disconnect are applied");
+        assert_eq!(app.warnings, vec![strings::SCAN_ABORTED.to_string()]);
+        assert!(app.rx.is_none());
+    }
+
+    #[test]
+    fn done_then_disconnect_does_not_warn() {
+        let mut app = app_after_worker(vec![ScanEvent::Programs(vec![program("a", false)]), ScanEvent::Done]);
+        app.drain_events();
+        assert!(!app.scanning);
+        assert!(app.warnings.is_empty());
+        assert!(app.rx.is_none());
+    }
+
+    #[test]
+    fn drain_keeps_receiver_while_worker_runs() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = StaleApp::empty(Settings::default());
+        app.rx = Some(rx);
+        app.scanning = true;
+        tx.send(ScanEvent::Warning("w".into())).unwrap();
+        app.drain_events();
+        assert!(app.scanning && app.rx.is_some());
+        assert_eq!(app.warnings, vec!["w".to_string()]);
     }
 
     #[test]

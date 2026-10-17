@@ -98,7 +98,12 @@ fn unused_for_more_than(last_used: Option<DateTime<Utc>>, now: DateTime<Utc>, da
     last_used.is_none_or(|t| (now - t).num_days() > days)
 }
 
-fn usage_matches(bucket: UsageBucket, last_used: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+/// Rows whose usage is not known yet (`row.usage == None`) match only `All`.
+fn usage_matches(bucket: UsageBucket, row: &Row, now: DateTime<Utc>) -> bool {
+    if row.usage.is_none() {
+        return bucket == UsageBucket::All;
+    }
+    let last_used = row.last_used();
     match bucket {
         UsageBucket::All => true,
         UsageBucket::OverSixMonths => unused_for_more_than(last_used, now, SIX_MONTHS_DAYS),
@@ -116,7 +121,7 @@ fn size_matches(bucket: SizeBucket, bytes: Option<u64>) -> bool {
 
 /// True when the row passes every filter; search is a case-insensitive substring of name or publisher.
 pub fn row_matches(row: &Row, f: &Filters, now: DateTime<Utc>) -> bool {
-    usage_matches(f.usage, row.last_used(), now)
+    usage_matches(f.usage, row, now)
         && f.drive.is_none_or(|d| row.program.drive == Some(d))
         && size_matches(f.size, row.size_bytes())
         && search_matches(row, &f.search)
@@ -176,10 +181,9 @@ pub fn visible_rows(rows: &[Row], f: &Filters, s: Sort, now: DateTime<Utc>) -> V
 pub fn bucket_counts(rows: &[Row], now: DateTime<Utc>) -> BucketCounts {
     let mut c = BucketCounts { all: rows.len(), ..BucketCounts::default() };
     for row in rows {
-        let last_used = row.last_used();
-        c.over_six_months += usize::from(usage_matches(UsageBucket::OverSixMonths, last_used, now));
-        c.over_one_year += usize::from(usage_matches(UsageBucket::OverOneYear, last_used, now));
-        c.never_seen += usize::from(last_used.is_none());
+        c.over_six_months += usize::from(usage_matches(UsageBucket::OverSixMonths, row, now));
+        c.over_one_year += usize::from(usage_matches(UsageBucket::OverOneYear, row, now));
+        c.never_seen += usize::from(usage_matches(UsageBucket::NeverSeen, row, now));
         c.over_one_gb += usize::from(size_matches(SizeBucket::OverOneGb, row.size_bytes()));
         if let Some(d) = row.program.drive {
             *c.per_drive.entry(d).or_default() += 1;
@@ -200,6 +204,7 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap()
     }
 
+    /// `days_ago: None` is a never-seen row (usage known, no date); see `pending` for unknown usage.
     fn row(name: &str, days_ago: Option<i64>) -> Row {
         Row {
             program: Program {
@@ -219,12 +224,17 @@ mod tests {
                 hidden: false,
                 scope: Scope::Machine,
             },
-            usage: days_ago.map(|d| ProgramUsage {
-                last_used: LastUsed { when: Some(now() - Duration::days(d)), source: None, confident: true },
+            usage: Some(ProgramUsage {
+                last_used: LastUsed { when: days_ago.map(|d| now() - Duration::days(d)), source: None, confident: true },
                 exes: Vec::new(),
             }),
             size: None,
         }
+    }
+
+    /// A row whose usage has not arrived yet.
+    fn pending(name: &str) -> Row {
+        Row { usage: None, ..row(name, None) }
     }
 
     fn with(mut r: Row, drive: Option<char>, size: Option<u64>, publisher: Option<&str>) -> Row {
@@ -270,6 +280,17 @@ mod tests {
 
         let all = usage_filter(UsageBucket::All);
         assert!([&n, &r200, &r10, &r400].iter().all(|r| row_matches(r, &all, now())));
+    }
+
+    #[test]
+    fn pending_rows_match_only_all() {
+        let p = pending("p");
+        assert!(row_matches(&p, &usage_filter(UsageBucket::All), now()));
+        for bucket in [UsageBucket::OverSixMonths, UsageBucket::OverOneYear, UsageBucket::NeverSeen] {
+            assert!(!row_matches(&p, &usage_filter(bucket), now()), "{bucket:?}");
+        }
+        let c = bucket_counts(&[p, row("n", None)], now());
+        assert_eq!((c.all, c.over_six_months, c.over_one_year, c.never_seen), (2, 1, 1, 1));
     }
 
     #[test]
@@ -327,6 +348,7 @@ mod tests {
             with(row("c", Some(200)), Some('C'), None, None),
             with(row("d", Some(400)), None, Some(ONE_GB + 1), None),
             with(row("e", None), Some('E'), None, None),
+            pending("f"),
         ];
         let count = |f: Filters| rows.iter().filter(|r| row_matches(r, &f, now())).count();
         let c = bucket_counts(&rows, now());
@@ -338,8 +360,8 @@ mod tests {
         for (&d, &n) in &c.per_drive {
             assert_eq!(n, count(Filters { drive: Some(d), ..Filters::default() }), "drive {d}");
         }
-        assert_eq!(c.per_drive, BTreeMap::from([('C', 2), ('D', 1), ('E', 1)]));
-        assert_eq!((c.all, c.over_six_months, c.over_one_year, c.never_seen, c.over_one_gb), (5, 4, 3, 2, 2));
+        assert_eq!(c.per_drive, BTreeMap::from([('C', 3), ('D', 1), ('E', 1)]));
+        assert_eq!((c.all, c.over_six_months, c.over_one_year, c.never_seen, c.over_one_gb), (6, 4, 3, 2, 2));
     }
 
     #[test]

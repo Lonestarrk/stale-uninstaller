@@ -89,6 +89,10 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                     ui.label(format::ymd(row.program.install_date));
                 });
                 table_row.col(|ui| {
+                    if row.usage.is_none() {
+                        ui.label(strings::PENDING);
+                        return;
+                    }
                     let last_used = row.last_used();
                     let mut text = egui::RichText::new(format::relative_date(last_used, now));
                     if is_stale(last_used, now) {

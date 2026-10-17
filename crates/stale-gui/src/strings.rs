@@ -5,6 +5,7 @@ pub const LOADING: &str = "Läser installerade program…";
 pub const NO_PROGRAMS: &str = "Inga program hittades.";
 pub const WARNINGS: &str = "Varningar";
 pub const SCAN_THREAD_FAILED: &str = "Kunde inte starta genomsökningen";
+pub const SCAN_ABORTED: &str = "Genomsökningen avbröts oväntat – se loggfilen";
 pub const UNKNOWN_DRIVE: &str = "?";
 
 // Toolbar
@@ -35,6 +36,8 @@ pub const BUCKET_OVER_ONE_GB: &str = "Över 1 GB";
 
 // Relative dates and sizes
 pub const NEVER_SEEN: &str = "Aldrig sedd";
+/// Usage not known yet (scan still running).
+pub const PENDING: &str = "…";
 pub const TODAY: &str = "Idag";
 pub const YESTERDAY: &str = "Igår";
 pub const DAYS_AGO: &str = "dagar sedan";
