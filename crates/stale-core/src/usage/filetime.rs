@@ -25,7 +25,8 @@ pub fn filetime_to_utc(ft: u64) -> Option<DateTime<Utc>> {
     Some(dt)
 }
 
-/// Last-modified/last-accessed times of exe files: a weak "last used" fallback.
+/// Last-modified times of exe files: a weak "last used" fallback. Last-access times are
+/// ignored because indexers and antivirus scans bump them constantly.
 pub struct FileTimeProvider {
     pub exes: Vec<PathBuf>,
 }
@@ -35,17 +36,16 @@ impl UsageProvider for FileTimeProvider {
         "File times"
     }
 
-    /// One hit per existing file, dated max(modified, accessed); missing files are skipped.
+    /// One hit per existing file, dated by its modified time; missing files are skipped.
     fn collect(&self) -> Result<Vec<UsageHit>, String> {
         Ok(self
             .exes
             .iter()
             .filter_map(|exe| {
                 let meta = std::fs::metadata(exe).ok()?;
-                let last = [meta.modified().ok(), meta.accessed().ok()].into_iter().flatten().max()?;
                 Some(UsageHit {
                     exe_path: exe.clone(),
-                    last_run: DateTime::<Utc>::from(last),
+                    last_run: DateTime::<Utc>::from(meta.modified().ok()?),
                     source: UsageSource::FileTime,
                     run_count: None,
                 })
@@ -93,6 +93,7 @@ mod provider_tests {
         assert_eq!(hits[0].exe_path, exe);
         assert_eq!(hits[0].source, UsageSource::FileTime);
         assert_eq!(hits[0].run_count, None);
-        assert!((Utc::now() - hits[0].last_run).num_minutes().abs() < 5);
+        let modified = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        assert_eq!(hits[0].last_run, DateTime::<Utc>::from(modified));
     }
 }

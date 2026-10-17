@@ -11,7 +11,7 @@ use crate::pathutil::is_shared_root;
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
 use crate::services::service_exes;
-use crate::shortcuts::{shortcut_targets, start_menu_dirs};
+use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
 use crate::usage::matching::{main_exes, match_usage, MatchInput, ProgramUsage};
@@ -40,6 +40,8 @@ pub enum ScanEvent {
 pub type ListRootExesFn = Box<dyn Fn(&Path) -> Vec<(PathBuf, u64)> + Send>;
 /// File-time usage hits for the given exes.
 pub type FileTimesFn = Box<dyn Fn(&[PathBuf]) -> Vec<UsageHit> + Send>;
+/// Target exe of a `.lnk` shortcut, if it resolves to one.
+pub type ResolveLnkFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send>;
 
 /// Everything a scan reads, injectable for tests.
 pub struct ScanSources {
@@ -52,6 +54,8 @@ pub struct ScanSources {
     pub file_times: FileTimesFn,
     /// `norm()`ed exe paths of installed services.
     pub service_exes: Box<dyn Fn() -> HashSet<String> + Send>,
+    /// Resolves `.lnk` hits (UserAssist records Start Menu launches by shortcut path).
+    pub resolve_lnk: ResolveLnkFn,
 }
 
 impl ScanSources {
@@ -74,6 +78,7 @@ impl ScanSources {
                 FileTimeProvider { exes: exes.to_vec() }.collect().unwrap_or_default()
             }),
             service_exes: Box::new(move || service_exes(&*services_reg)),
+            resolve_lnk: Box::new(resolve_lnk),
         }
     }
 }
@@ -81,6 +86,19 @@ impl ScanSources {
 /// Install location worth looking into: present and not a shared root.
 fn own_folder(p: &Program) -> Option<&Path> {
     p.install_location.as_deref().filter(|l| !is_shared_root(l))
+}
+
+/// Replaces each `.lnk` hit's path with the shortcut's target exe; unresolvable ones are dropped.
+fn resolve_lnk_hits(hits: Vec<UsageHit>, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Vec<UsageHit> {
+    hits.into_iter()
+        .filter_map(|hit| {
+            if !hit.exe_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                return Some(hit);
+            }
+            let exe_path = resolve(&hit.exe_path)?;
+            Some(UsageHit { exe_path, ..hit })
+        })
+        .collect()
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -116,6 +134,7 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
             }
         }
     }
+    let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
 
     let services = (src.service_exes)();
@@ -196,6 +215,7 @@ mod tests {
             dir_size: Box::new(|_: &Path| 1234),
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
+            resolve_lnk: Box::new(|_: &Path| None),
         }
     }
 
@@ -247,6 +267,27 @@ mod tests {
         let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
         let beta = usage.keys().find(|id| id.0.ends_with("Beta")).unwrap();
         assert_eq!(usage[beta].last_used.source, Some(UsageSource::FileTime));
+    }
+
+    #[test]
+    fn lnk_hits_are_resolved_before_matching() {
+        let mut reg = FakeRegistry::new();
+        add_program(&mut reg, "Foo", r"C:\Apps\Foo", false);
+        let lnk = UsageHit { source: UsageSource::UserAssist, run_count: Some(3), ..hit(r"C:\Users\X\Start Menu\Foo.lnk") };
+        let gone = UsageHit { source: UsageSource::UserAssist, ..hit(r"C:\Users\X\Start Menu\Gone.LNK") };
+        let mut src = sources(FixedProvider(Ok(vec![lnk.clone(), gone])));
+        src.reg = Arc::new(reg);
+        src.resolve_lnk =
+            Box::new(|p: &Path| p.ends_with("Foo.lnk").then(|| PathBuf::from(r"C:\Apps\Foo\foo.exe")));
+        let events = run(src);
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let foo = usage.keys().find(|id| id.0.ends_with("Foo")).expect("Foo has usage");
+        let exes = &usage[foo].exes;
+        assert_eq!(exes.len(), 1);
+        assert_eq!(exes[0].exe_path, PathBuf::from(r"C:\Apps\Foo\foo.exe"));
+        assert_eq!((exes[0].last_run, exes[0].source, exes[0].run_count), (lnk.last_run, lnk.source, lnk.run_count));
+        let ScanEvent::UnmatchedHits(unmatched) = &events[2] else { unreachable!() };
+        assert!(unmatched.is_empty(), "unresolvable .lnk hit is dropped: {unmatched:?}");
     }
 
     #[test]
