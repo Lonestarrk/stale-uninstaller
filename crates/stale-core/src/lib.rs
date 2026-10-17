@@ -4,6 +4,8 @@ pub mod model;
 pub mod pathutil;
 pub mod programs;
 pub mod registry;
+pub mod services;
+pub mod shortcuts;
 pub mod usage;
 
 pub use model::*;

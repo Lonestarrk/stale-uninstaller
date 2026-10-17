@@ -58,9 +58,117 @@ pub fn drive_letter(p: &Path) -> Option<char> {
     (letter.is_ascii_alphabetic() && chars.next() == Some(':')).then(|| letter.to_ascii_uppercase())
 }
 
+/// Uppercase, backslash-separated, no trailing separator (`C:\` -> `C:`).
+pub fn norm(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', r"\").to_uppercase();
+    s.trim_end_matches('\\').to_string()
+}
+
+/// Folders (normalized) that many programs share; resolved from the environment on each call.
+fn shared_folders() -> Vec<String> {
+    const VARS: [&str; 8] = [
+        "%ProgramFiles%",
+        "%ProgramFiles(x86)%",
+        "%ProgramData%",
+        "%LOCALAPPDATA%",
+        r"%LOCALAPPDATA%\Programs",
+        "%APPDATA%",
+        "%SystemRoot%",
+        "%USERPROFILE%",
+    ];
+    VARS.iter()
+        .map(|v| expand_env(v))
+        .filter(|s| !s.contains('%'))
+        .map(|s| norm(Path::new(&s)))
+        .collect()
+}
+
+/// `%SystemDrive%\Users`, normalized.
+fn users_root() -> Option<String> {
+    let drive = std::env::var("SystemDrive").ok()?;
+    Some(norm(Path::new(&format!(r"{drive}\Users"))))
+}
+
+/// True for drive roots and for the shared folders that hold many programs (Program Files,
+/// ProgramData, AppData roots, Windows, the Users folder and each profile root). Their
+/// subfolders are not shared roots. An empty path counts as shared so it never claims anything.
+pub fn is_shared_root(p: &Path) -> bool {
+    let n = norm(p);
+    let is_drive_root = n.len() == 2 && drive_letter(Path::new(&n)).is_some();
+    if n.is_empty() || is_drive_root || shared_folders().contains(&n) {
+        return true;
+    }
+    users_root().is_some_and(|users| {
+        n == users || n.strip_prefix(&users).and_then(|r| r.strip_prefix('\\')).is_some_and(|r| !r.contains('\\'))
+    })
+}
+
+/// Case-insensitive "`exe` lies inside `install`"; a drive-less `exe` (volume-stripped
+/// Prefetch path such as `\PROGRAM FILES\X.EXE`) is compared against `install` minus its drive.
+pub fn exe_under(exe: &Path, install: &Path) -> bool {
+    normed_under(&norm(exe), &norm(install))
+}
+
+/// [`exe_under`] for paths that are already [`norm`]ed.
+pub(crate) fn normed_under(exe: &str, install: &str) -> bool {
+    let install = match drive_letter(Path::new(install)) {
+        Some(_) if exe.starts_with('\\') => &install[2..],
+        _ => install,
+    };
+    !install.is_empty() && exe.strip_prefix(install).is_some_and(|rest| rest.len() > 1 && rest.starts_with('\\'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_path(var: &str) -> PathBuf {
+        PathBuf::from(std::env::var(var).unwrap())
+    }
+
+    #[test]
+    fn norm_uppercases_and_trims_separators() {
+        assert_eq!(norm(Path::new(r"c:\Program Files\Foo\")), r"C:\PROGRAM FILES\FOO");
+        assert_eq!(norm(Path::new("c:/a/b")), r"C:\A\B");
+        assert_eq!(norm(Path::new(r"C:\")), "C:");
+    }
+
+    #[test]
+    fn shared_roots_are_detected() {
+        assert!(is_shared_root(Path::new(r"C:\")));
+        assert!(is_shared_root(Path::new("d:")));
+        let vars = ["ProgramFiles", "ProgramFiles(x86)", "ProgramData", "LOCALAPPDATA", "APPDATA", "SystemRoot", "USERPROFILE"];
+        for var in vars {
+            let p = env_path(var);
+            assert!(is_shared_root(&p), "{var}");
+            let lower_slash = format!(r"{}\", p.display()).to_lowercase();
+            assert!(is_shared_root(Path::new(&lower_slash)), "{var} lowercase with trailing slash");
+            assert!(!is_shared_root(&p.join("Foo")), "{var} child");
+        }
+        let programs = env_path("LOCALAPPDATA").join("Programs");
+        assert!(is_shared_root(&programs));
+        assert!(!is_shared_root(&programs.join("Foo")));
+        let users = PathBuf::from(format!(r"{}\Users", std::env::var("SystemDrive").unwrap()));
+        assert!(is_shared_root(&users));
+        assert!(is_shared_root(&users.join("SomeoneElse")));
+        assert!(!is_shared_root(&users.join("SomeoneElse").join("Tools")));
+        assert!(is_shared_root(Path::new("")));
+    }
+
+    #[test]
+    fn exe_under_handles_volume_stripped_paths() {
+        assert!(exe_under(Path::new(r"\PROGRAM FILES\FOO\FOO.EXE"), Path::new(r"C:\Program Files\Foo")));
+        assert!(!exe_under(Path::new(r"C:\Program Files\Foobar\x.exe"), Path::new(r"C:\Program Files\Foo")));
+    }
+
+    #[test]
+    fn exe_under_is_case_insensitive_and_needs_a_real_child() {
+        assert!(exe_under(Path::new(r"c:\program files\foo\bin\x.exe"), Path::new(r"C:\Program Files\Foo\")));
+        assert!(!exe_under(Path::new(r"D:\Program Files\Foo\x.exe"), Path::new(r"C:\Program Files\Foo")));
+        assert!(!exe_under(Path::new(r"C:\Program Files\Foo"), Path::new(r"C:\Program Files\Foo")));
+        assert!(!exe_under(Path::new(r"\X.EXE"), Path::new(r"C:\")));
+        assert!(!exe_under(Path::new(r"\\server\share\x.exe"), Path::new(r"C:\server\share")));
+    }
 
     #[test]
     fn expand_env_known_and_unknown() {

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod bam;
 pub mod filetime;
+pub mod matching;
 pub mod prefetch;
 pub mod userassist;
 
