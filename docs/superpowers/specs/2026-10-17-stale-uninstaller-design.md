@@ -12,7 +12,7 @@ listan utgår från **när programmet senast användes**, så att det blir lätt
 vad som bara tar plats. Dessutom visas tydligt **vilken disk** varje program
 ligger på.
 
-Namnet: produkten heter *Stale Uninstaller*, körbar fil och kortnamn är `stale`.
+Namnet: produkten heter *Stale Uninstaller*, körbar fil är `StaleUninstaller.exe`; `stale` används bara som kortnamn i kod och paketnamn.
 
 Bakgrunden är ett återkommande problem: en dator full av program där man inte
 minns vad som används, och mappar i AppData som bara växer utan att man vågar

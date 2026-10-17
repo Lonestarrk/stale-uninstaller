@@ -9,7 +9,7 @@ use stale_gui::strings::APP_TITLE;
 fn main() -> eframe::Result {
     logging::init();
     install_panic_hook();
-    log::info!("stale {} starting", stale_core::version());
+    log::info!("Stale Uninstaller {} starting", stale_core::version());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(APP_TITLE),
         ..Default::default()
