@@ -1,6 +1,7 @@
 //! Application state and the eframe shell.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use stale_core::usage::matching::ProgramUsage;
 use stale_core::{Program, ProgramId};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
-use crate::ui::{filter_panel, table, toolbar};
+use crate::ui::{details, filter_panel, table, toolbar};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -139,6 +140,24 @@ impl StaleApp {
             .collect();
     }
 
+    /// Flips "show hidden entries", re-applies it to the rows without rescanning and saves.
+    pub fn toggle_show_hidden(&mut self) {
+        self.toggle_show_hidden_at(&Settings::path());
+    }
+
+    fn toggle_show_hidden_at(&mut self, path: &Path) {
+        self.settings.show_hidden = !self.settings.show_hidden;
+        self.rebuild_rows();
+        let ids: HashSet<&ProgramId> = self.rows.iter().map(|r| &r.program.id).collect();
+        self.checked.retain(|id| ids.contains(id));
+        if self.selected.as_ref().is_some_and(|id| !ids.contains(id)) {
+            self.selected = None;
+        }
+        if let Err(e) = self.settings.save_to(path) {
+            log::warn!("could not save settings to {}: {e}", path.display());
+        }
+    }
+
     /// Applies every event waiting on the channel.
     fn drain_events(&mut self) {
         let Some(rx) = self.rx.take() else { return };
@@ -183,6 +202,15 @@ impl eframe::App for StaleApp {
         egui::Panel::left("filters")
             .default_size(170.0)
             .show(ui, |ui| filter_panel::show(ui, &mut self.filters, &counts));
+        egui::Panel::bottom("details").resizable(true).default_size(160.0).show(ui, |ui| {
+            let row = self.selected.as_ref().and_then(|id| self.rows.iter().find(|r| &r.program.id == id));
+            match row {
+                Some(row) => details::details_panel(ui, row),
+                None => {
+                    ui.label(strings::NO_SELECTION);
+                }
+            }
+        });
         egui::CentralPanel::default().show(ui, |ui| {
             if self.rows.is_empty() {
                 if !self.scanning {
@@ -282,5 +310,26 @@ mod tests {
         assert_eq!(a.size, Some(7), "re-applying the filter keeps attached data");
         let h = app.rows.iter().find(|r| r.program.id.0 == "h").unwrap();
         assert_eq!(h.size, Some(9), "data received while hidden is kept");
+    }
+
+    #[test]
+    fn toggling_show_hidden_reapplies_without_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings { show_hidden: false, ..Settings::default() });
+        app.apply_event(ScanEvent::Programs(vec![program("h", true), program("v", false)]));
+        assert_eq!(app.rows.len(), 1);
+
+        app.toggle_show_hidden_at(&path);
+        assert_eq!(app.rows.len(), 2);
+        assert!(app.settings.show_hidden);
+        assert!(Settings::load_from(&path).show_hidden, "setting is saved");
+        app.checked.insert(ProgramId("h".into()));
+        app.selected = Some(ProgramId("h".into()));
+
+        app.toggle_show_hidden_at(&path);
+        assert_eq!(app.rows.len(), 1);
+        assert!(app.checked.is_empty(), "checked id that disappeared is pruned");
+        assert_eq!(app.selected, None);
     }
 }

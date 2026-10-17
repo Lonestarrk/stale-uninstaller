@@ -14,6 +14,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         if ui.add_enabled(!app.scanning, egui::Button::new(strings::REFRESH)).clicked() {
             app.refresh();
         }
+        let mut show_hidden = app.settings.show_hidden;
+        let mut toggled = false;
+        ui.menu_button(strings::SETTINGS_MENU, |ui| {
+            toggled = ui.checkbox(&mut show_hidden, strings::SHOW_HIDDEN).changed();
+        });
+        if toggled {
+            app.toggle_show_hidden();
+        }
         if app.scanning {
             ui.spinner();
             ui.label(strings::LOADING);

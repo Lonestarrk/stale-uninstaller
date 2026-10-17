@@ -43,3 +43,28 @@ pub const YEARS_AGO: &str = "år sedan";
 pub const MB: &str = "MB";
 pub const GB: &str = "GB";
 pub const UNKNOWN_VALUE: &str = "–";
+
+// Settings menu
+pub const SETTINGS_MENU: &str = "⚙";
+pub const SHOW_HIDDEN: &str = "Visa dolda poster";
+
+// Details panel
+pub const NO_SELECTION: &str = "Inget program valt";
+pub const DETAIL_LOCATION: &str = "Plats";
+pub const DETAIL_UNINSTALLER: &str = "Avinstallerare";
+pub const DETAIL_REGISTRY_KEY: &str = "Registernyckel";
+pub const DETAIL_LAST_USED: &str = "Senast använd";
+pub const UNCERTAIN_FILETIME: &str = " – osäker (filtid)";
+pub const COL_FILE: &str = "Fil";
+pub const COL_LAST_RUN: &str = "Senast körd";
+pub const COL_SOURCE: &str = "Källa";
+pub const COL_COUNTED: &str = "Räknas";
+pub const COUNTED_YES: &str = "✓";
+pub const RUNS: &str = "körningar";
+pub const EXCLUDED_NAME_PATTERN: &str = "uppdaterare/tjänst-namn";
+pub const EXCLUDED_SERVICE: &str = "tjänst";
+pub const EXCLUDED_NOT_MAIN: &str = "inte huvudprogram";
+pub const SOURCE_PREFETCH: &str = "Prefetch";
+pub const SOURCE_BAM: &str = "BAM";
+pub const SOURCE_USERASSIST: &str = "UserAssist";
+pub const SOURCE_FILETIME: &str = "filtid";

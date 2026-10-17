@@ -1,6 +1,7 @@
 //! Swedish display formatting of dates and sizes (no egui).
 
 use chrono::{DateTime, NaiveDate, Utc};
+use stale_core::usage::UsageSource;
 
 use crate::strings;
 
@@ -44,6 +45,16 @@ pub fn ymd(d: Option<NaiveDate>) -> String {
     d.map_or_else(|| strings::UNKNOWN_VALUE.to_string(), |d| d.format("%Y-%m-%d").to_string())
 }
 
+/// Display name of where a usage date came from.
+pub fn source_label(s: UsageSource) -> &'static str {
+    match s {
+        UsageSource::Prefetch => strings::SOURCE_PREFETCH,
+        UsageSource::Bam => strings::SOURCE_BAM,
+        UsageSource::UserAssist => strings::SOURCE_USERASSIST,
+        UsageSource::FileTime => strings::SOURCE_FILETIME,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
@@ -85,6 +96,14 @@ mod tests {
         assert_eq!(human_size(Some(1)), "1 MB");
         assert_eq!(human_size(Some(1024 * 1024 * 1024 - 1)), "1023 MB");
         assert_eq!(human_size(Some(1024 * 1024 * 1024)), "1,0 GB");
+    }
+
+    #[test]
+    fn source_labels() {
+        assert_eq!(source_label(UsageSource::Prefetch), "Prefetch");
+        assert_eq!(source_label(UsageSource::Bam), "BAM");
+        assert_eq!(source_label(UsageSource::UserAssist), "UserAssist");
+        assert_eq!(source_label(UsageSource::FileTime), "filtid");
     }
 
     #[test]

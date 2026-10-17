@@ -3237,6 +3237,7 @@ dependencies = [
  "log",
  "simplelog",
  "stale-core",
+ "tempfile",
 ]
 
 [[package]]
