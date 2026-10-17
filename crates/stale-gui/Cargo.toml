@@ -6,6 +6,16 @@ edition.workspace = true
 [[bin]]
 name = "stale"
 path = "src/main.rs"
+# Unit tests live in the lib: a test harness built from this bin would carry the
+# requireAdministrator manifest and fail to start unelevated (os error 740).
+test = false
 
 [dependencies]
+chrono = "0.4.45"
+eframe = "0.37.0"
+log = "0.4.34"
+simplelog = "0.12.2"
 stale-core = { path = "../stale-core" }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
