@@ -7,4 +7,5 @@ edition.workspace = true
 chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com", "Win32_Storage_FileSystem"] }
 winreg = "0.56.0"
