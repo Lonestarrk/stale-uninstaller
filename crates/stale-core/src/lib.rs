@@ -1,4 +1,6 @@
 pub mod model;
+pub mod pathutil;
+pub mod programs;
 pub mod registry;
 
 pub use model::*;
