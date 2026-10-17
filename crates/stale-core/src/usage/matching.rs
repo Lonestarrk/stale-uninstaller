@@ -11,7 +11,8 @@ use crate::model::{Program, ProgramId};
 use crate::pathutil::{drive_letter, exe_under, first_path_in_command, is_shared_root, norm, normed_under};
 
 /// Lowercased file-stem fragments that mark an exe as background machinery, not the program itself.
-pub const EXCLUDED_NAME_PARTS: [&str; 8] = ["update", "updater", "service", "helper", "crash", "report", "daemon", "tray"];
+/// `unins` covers `unins000` and `uninstall`: running the uninstaller is not using the program.
+pub const EXCLUDED_NAME_PARTS: [&str; 9] = ["update", "updater", "service", "helper", "crash", "report", "daemon", "tray", "unins"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExeUsage {
@@ -86,20 +87,32 @@ fn dedupe(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 
 /// The exe(s) that represent the program itself: shortcut targets under the install
 /// location; else `display_icon` if it is an exe under the install location; else the
-/// largest exe in the install root. Empty without a (non-shared) install location.
+/// largest exe in the install root. Uninstallers are never main exes. Empty without a
+/// (non-shared) install location.
 pub fn main_exes(p: &Program, shortcut_targets: &[PathBuf], root_exes: &[(PathBuf, u64)]) -> Vec<PathBuf> {
     let Some(install) = p.install_location.as_deref().filter(|i| !is_shared_root(i)) else {
         return vec![];
     };
-    let from_shortcuts = dedupe(shortcut_targets.iter().filter(|t| exe_under(t, install)).cloned());
+    let from_shortcuts =
+        dedupe(shortcut_targets.iter().filter(|t| exe_under(t, install) && !is_uninstaller(t)).cloned());
     if !from_shortcuts.is_empty() {
         return from_shortcuts;
     }
     let icon = p.display_icon.as_deref().map(strip_icon_index);
-    if let Some(icon) = icon.filter(|i| is_exe(i) && exe_under(i, install)) {
+    if let Some(icon) = icon.filter(|i| is_exe(i) && exe_under(i, install) && !is_uninstaller(i)) {
         return vec![icon];
     }
-    root_exes.iter().max_by_key(|(_, size)| *size).map(|(exe, _)| vec![exe.clone()]).unwrap_or_default()
+    root_exes
+        .iter()
+        .filter(|(exe, _)| !is_uninstaller(exe))
+        .max_by_key(|(_, size)| *size)
+        .map(|(exe, _)| vec![exe.clone()])
+        .unwrap_or_default()
+}
+
+/// `unins000.exe`, `Uninstall Foo.exe`, …
+fn is_uninstaller(exe: &Path) -> bool {
+    exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().contains("unins"))
 }
 
 pub fn exclude_reason(exe: &Path, is_main: bool, service_exes: &HashSet<String>) -> Option<ExcludeReason> {
@@ -156,20 +169,26 @@ impl<'a> Candidate<'a> {
     }
 }
 
-/// Picks the program a hit belongs to and the path to record for it: by location (longest
-/// install location wins), else by file name for programs without an install location.
-fn assign_hit(hit: &UsageHit, candidates: &[Candidate]) -> Option<(usize, PathBuf)> {
+/// Picks the program(s) a hit belongs to and the path to record for each. By location, the
+/// longest install location wins and every program tied for it gets the hit (duplicate
+/// entries, or `C:` and `D:` installs for a drive-less Prefetch path), so none of them looks
+/// unused. Otherwise, by file name, the first program without an install location that claims it.
+fn assign_hit(hit: &UsageHit, candidates: &[Candidate]) -> Vec<(usize, PathBuf)> {
     let exe = norm(&hit.exe_path);
-    let by_location = candidates
+    let under: Vec<(usize, usize)> = candidates
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| c.install.as_deref().filter(|inst| normed_under(&exe, inst)).map(|inst| (i, inst)))
-        .max_by_key(|(_, inst)| inst.len());
-    if let Some((i, _)) = by_location {
-        return Some((i, with_install_drive(&hit.exe_path, candidates[i].program)));
+        .filter_map(|(i, c)| c.install.as_deref().filter(|inst| normed_under(&exe, inst)).map(|inst| (i, inst.len())))
+        .collect();
+    if let Some(longest) = under.iter().map(|&(_, len)| len).max() {
+        return under
+            .into_iter()
+            .filter(|&(_, len)| len == longest)
+            .map(|(i, _)| (i, with_install_drive(&hit.exe_path, candidates[i].program)))
+            .collect();
     }
     let name = file_name_upper(&hit.exe_path);
-    candidates.iter().position(|c| c.claims_by_name(&name)).map(|i| (i, hit.exe_path.clone()))
+    candidates.iter().position(|c| c.claims_by_name(&name)).map(|i| (i, hit.exe_path.clone())).into_iter().collect()
 }
 
 /// Gives a drive-less (volume-stripped Prefetch) path the install location's drive.
@@ -221,16 +240,19 @@ fn last_used(exes: &[ExeUsage]) -> LastUsed {
         .unwrap_or(LastUsed { when: None, source: None, confident: true })
 }
 
-/// Assigns every hit to at most one program and summarizes each program's usage.
+/// Assigns hits to programs (see `assign_hit`) and summarizes each program's usage.
 /// Every program gets an entry; hits no program claims are returned in `unmatched`.
 pub fn match_usage(input: &MatchInput) -> MatchResult {
     let candidates: Vec<Candidate> = input.programs.iter().map(|p| Candidate::new(p, input)).collect();
     let mut assigned: Vec<Vec<UsageHit>> = vec![Vec::new(); candidates.len()];
     let mut unmatched = Vec::new();
     for hit in input.hits {
-        match assign_hit(hit, &candidates) {
-            Some((i, exe_path)) => assigned[i].push(UsageHit { exe_path, ..hit.clone() }),
-            None => unmatched.push(hit.clone()),
+        let owners = assign_hit(hit, &candidates);
+        if owners.is_empty() {
+            unmatched.push(hit.clone());
+        }
+        for (i, exe_path) in owners {
+            assigned[i].push(UsageHit { exe_path, ..hit.clone() });
         }
     }
     let by_program = candidates
@@ -443,8 +465,8 @@ mod tests {
     #[test]
     fn no_install_location_matches_on_uninstall_string_file_name_as_not_main() {
         let mut p = prog("Baz", None);
-        p.uninstall_string = Some(r#""C:\x\unins000.exe" /SILENT"#.to_string());
-        let hits = [hit(r"D:\elsewhere\UNINS000.EXE", 4, UsageSource::Bam)];
+        p.uninstall_string = Some(r#""C:\x\remove.exe" /SILENT"#.to_string());
+        let hits = [hit(r"D:\elsewhere\REMOVE.EXE", 4, UsageSource::Bam)];
         let r = run(&[p], &hits, &HashSet::new());
         let u = usage(&r, "Baz");
         assert_eq!(u.exes.len(), 1);
@@ -492,6 +514,49 @@ mod tests {
         assert_eq!(u.exes[0].run_count, Some(7));
         assert_eq!(u.exes[1].exe_path, PathBuf::from(r"D:\APPS\FOO\BIN\TOOL.EXE"));
         assert_eq!(u.exes[1].run_count, None);
+    }
+
+    #[test]
+    fn equal_install_locations_both_get_the_hit() {
+        let programs = [prog("Suite", Some(r"C:\Apps\Foo")), prog("Component", Some(r"c:\apps\foo\"))];
+        let hits = [hit(r"C:\Apps\Foo\foo.exe", 3, UsageSource::Bam)];
+        let r = run(&programs, &hits, &HashSet::new());
+        for id in ["Suite", "Component"] {
+            assert_eq!(usage(&r, id).last_used.when, Some(days_ago(3)), "{id}");
+            assert_eq!(usage(&r, id).exes[0].exe_path, PathBuf::from(r"C:\Apps\Foo\foo.exe"), "{id}");
+        }
+        assert!(r.unmatched.is_empty());
+    }
+
+    #[test]
+    fn drive_less_hit_goes_to_every_drive_with_its_own_drive() {
+        let programs = [prog("OnC", Some(r"C:\Apps\Foo")), prog("OnD", Some(r"D:\Apps\Foo"))];
+        let hits = [hit(r"\APPS\FOO\BAR.EXE", 6, UsageSource::Prefetch)];
+        let r = run(&programs, &hits, &HashSet::new());
+        assert_eq!(usage(&r, "OnC").exes[0].exe_path, PathBuf::from(r"C:\APPS\FOO\BAR.EXE"));
+        assert_eq!(usage(&r, "OnD").exes[0].exe_path, PathBuf::from(r"D:\APPS\FOO\BAR.EXE"));
+        assert!(r.unmatched.is_empty());
+    }
+
+    #[test]
+    fn uninstaller_shortcut_is_not_main() {
+        let mut p = prog("Foo", Some(r"C:\Apps\Foo"));
+        p.display_icon = Some(PathBuf::from(r"C:\Apps\Foo\uninstall.exe,0"));
+        let shortcuts = paths(&[r"C:\Apps\Foo\unins000.exe", r"C:\Apps\Foo\Uninstall Foo.exe"]);
+        let roots = vec![(PathBuf::from(r"C:\Apps\Foo\unins000.exe"), 900), (PathBuf::from(r"C:\Apps\Foo\foo.exe"), 100)];
+        assert_eq!(main_exes(&p, &shortcuts, &roots), paths(&[r"C:\Apps\Foo\foo.exe"]));
+        let services = HashSet::new();
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\unins000.exe"), true, &services), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\Uninstall.exe"), true, &services), Some(ExcludeReason::NamePattern));
+        let hits = [hit(r"C:\Apps\Foo\unins000.exe", 1, UsageSource::Bam)];
+        let r = match_usage(&MatchInput {
+            programs: &[p],
+            hits: &hits,
+            shortcut_targets: &shortcuts,
+            root_exes: &HashMap::from([(ProgramId("Foo".into()), roots)]),
+            service_exes: &services,
+        });
+        assert_eq!(usage(&r, "Foo").last_used.when, None);
     }
 
     #[test]
