@@ -1,4 +1,8 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Duration, Utc};
+
+use super::{UsageHit, UsageProvider, UsageSource};
 
 /// Seconds between 1601-01-01 and 1970-01-01.
 const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
@@ -19,6 +23,35 @@ pub fn filetime_to_utc(ft: u64) -> Option<DateTime<Utc>> {
         return None;
     }
     Some(dt)
+}
+
+/// Last-modified/last-accessed times of exe files: a weak "last used" fallback.
+pub struct FileTimeProvider {
+    pub exes: Vec<PathBuf>,
+}
+
+impl UsageProvider for FileTimeProvider {
+    fn name(&self) -> &'static str {
+        "File times"
+    }
+
+    /// One hit per existing file, dated max(modified, accessed); missing files are skipped.
+    fn collect(&self) -> Result<Vec<UsageHit>, String> {
+        Ok(self
+            .exes
+            .iter()
+            .filter_map(|exe| {
+                let meta = std::fs::metadata(exe).ok()?;
+                let last = [meta.modified().ok(), meta.accessed().ok()].into_iter().flatten().max()?;
+                Some(UsageHit {
+                    exe_path: exe.clone(),
+                    last_run: DateTime::<Utc>::from(last),
+                    source: UsageSource::FileTime,
+                    run_count: None,
+                })
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -42,5 +75,24 @@ mod tests {
     fn filetime_valid_converts() {
         let dt = filetime_to_utc(133_500_000_000_000_000).unwrap();
         assert_eq!(dt.timestamp(), 13_350_000_000 - EPOCH_DIFF_SECS as i64);
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+
+    #[test]
+    fn file_time_provider_reports_existing_files_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let p = FileTimeProvider { exes: vec![exe.clone(), dir.path().join("gone.exe")] };
+        let hits = p.collect().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].exe_path, exe);
+        assert_eq!(hits[0].source, UsageSource::FileTime);
+        assert_eq!(hits[0].run_count, None);
+        assert!((Utc::now() - hits[0].last_run).num_minutes().abs() < 5);
     }
 }

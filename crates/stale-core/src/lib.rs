@@ -2,10 +2,14 @@ pub mod devicepath;
 pub mod knownfolders;
 pub mod model;
 pub mod pathutil;
+pub mod paths;
 pub mod programs;
 pub mod registry;
+pub mod scan;
 pub mod services;
+pub mod settings;
 pub mod shortcuts;
+pub mod size;
 pub mod usage;
 
 pub use model::*;
