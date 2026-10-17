@@ -13,6 +13,7 @@ test = false
 [dependencies]
 chrono = "0.4.45"
 eframe = "0.37.0"
+egui_extras = "0.37.0"
 log = "0.4.34"
 simplelog = "0.12.2"
 stale-core = { path = "../stale-core" }

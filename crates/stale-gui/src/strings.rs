@@ -6,3 +6,40 @@ pub const NO_PROGRAMS: &str = "Inga program hittades.";
 pub const WARNINGS: &str = "Varningar";
 pub const SCAN_THREAD_FAILED: &str = "Kunde inte starta genomsökningen";
 pub const UNKNOWN_DRIVE: &str = "?";
+
+// Toolbar
+pub const UNINSTALL: &str = "Avinstallera";
+pub const FORCE_REMOVE: &str = "Tvingad borttagning";
+pub const FIND_LEFTOVERS: &str = "Sök rester";
+pub const REFRESH: &str = "Uppdatera";
+pub const SEARCH_HINT: &str = "Sök program…";
+pub const NOT_YET: &str = "Kommer i nästa steg";
+
+// Table columns
+pub const COL_NAME: &str = "Namn";
+pub const COL_PUBLISHER: &str = "Utgivare";
+pub const COL_DRIVE: &str = "Disk";
+pub const COL_SIZE: &str = "Storlek";
+pub const COL_INSTALLED: &str = "Installerad";
+pub const COL_LAST_USED: &str = "Senast använd";
+
+// Filter panel
+pub const GROUP_LAST_USED: &str = "Senast använd";
+pub const GROUP_DRIVE: &str = "Disk";
+pub const GROUP_SIZE: &str = "Storlek";
+pub const BUCKET_ALL: &str = "Alla";
+pub const BUCKET_OVER_SIX_MONTHS: &str = "Över 6 månader";
+pub const BUCKET_OVER_ONE_YEAR: &str = "Över 1 år";
+pub const BUCKET_NEVER_SEEN: &str = "Aldrig sedd";
+pub const BUCKET_OVER_ONE_GB: &str = "Över 1 GB";
+
+// Relative dates and sizes
+pub const NEVER_SEEN: &str = "Aldrig sedd";
+pub const TODAY: &str = "Idag";
+pub const YESTERDAY: &str = "Igår";
+pub const DAYS_AGO: &str = "dagar sedan";
+pub const MONTHS_AGO: &str = "mån sedan";
+pub const YEARS_AGO: &str = "år sedan";
+pub const MB: &str = "MB";
+pub const GB: &str = "GB";
+pub const UNKNOWN_VALUE: &str = "–";

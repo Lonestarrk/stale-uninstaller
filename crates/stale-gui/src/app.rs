@@ -1,15 +1,18 @@
 //! Application state and the eframe shell.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::scan::ScanEvent;
 use stale_core::settings::Settings;
 use stale_core::usage::matching::ProgramUsage;
 use stale_core::{Program, ProgramId};
 
+use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
+use crate::ui::{filter_panel, table, toolbar};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -18,11 +21,27 @@ pub struct Row {
     pub size: Option<u64>,
 }
 
+impl Row {
+    /// When the program was last seen in use, if ever.
+    pub fn last_used(&self) -> Option<DateTime<Utc>> {
+        self.usage.as_ref().and_then(|u| u.last_used.when)
+    }
+
+    /// Measured size, falling back to the registry estimate.
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size.or(self.program.estimated_size_bytes)
+    }
+}
+
 pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
     pub scanning: bool,
     pub warnings: Vec<String>,
+    pub filters: Filters,
+    pub sort: Sort,
+    pub selected: Option<ProgramId>,
+    pub checked: HashSet<ProgramId>,
     rx: Option<Receiver<ScanEvent>>,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
@@ -47,11 +66,31 @@ impl StaleApp {
             settings,
             scanning: false,
             warnings: Vec::new(),
+            filters: Filters::default(),
+            sort: Sort::default(),
+            selected: None,
+            checked: HashSet::new(),
             rx: None,
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
         }
+    }
+
+    /// Drops all scan results and starts a new scan.
+    pub fn refresh(&mut self) {
+        self.clear_scan_data();
+        self.rx = Some(worker::spawn_scan());
+        self.scanning = true;
+    }
+
+    /// Forgets programs, usage, sizes and warnings from the previous scan.
+    fn clear_scan_data(&mut self) {
+        self.rows.clear();
+        self.programs.clear();
+        self.usage.clear();
+        self.sizes.clear();
+        self.warnings.clear();
     }
 
     /// Folds one scan event into the state (no UI work).
@@ -118,27 +157,6 @@ impl StaleApp {
             }
         }
     }
-
-    fn show_programs(&self, ui: &mut egui::Ui) {
-        if self.rows.is_empty() {
-            if !self.scanning {
-                ui.label(strings::NO_PROGRAMS);
-            }
-            return;
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("programs").striped(true).show(ui, |ui| {
-                for row in &self.rows {
-                    match row.program.drive {
-                        Some(d) => ui.label(d.to_string()),
-                        None => ui.label(strings::UNKNOWN_DRIVE),
-                    };
-                    ui.label(&row.program.name);
-                    ui.end_row();
-                }
-            });
-        });
-    }
 }
 
 impl eframe::App for StaleApp {
@@ -150,14 +168,9 @@ impl eframe::App for StaleApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let now = Utc::now();
         egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(strings::APP_TITLE);
-                if self.scanning {
-                    ui.spinner();
-                    ui.label(strings::LOADING);
-                }
-            });
+            toolbar::show(ui, self);
             if !self.warnings.is_empty() {
                 ui.collapsing(strings::WARNINGS, |ui| {
                     for w in &self.warnings {
@@ -166,7 +179,22 @@ impl eframe::App for StaleApp {
                 });
             }
         });
-        egui::CentralPanel::default().show(ui, |ui| self.show_programs(ui));
+        let counts = bucket_counts(&self.rows, now);
+        egui::Panel::left("filters")
+            .default_size(170.0)
+            .show(ui, |ui| filter_panel::show(ui, &mut self.filters, &counts));
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.rows.is_empty() {
+                if !self.scanning {
+                    ui.label(strings::NO_PROGRAMS);
+                }
+                return;
+            }
+            let visible = visible_rows(&self.rows, &self.filters, self.sort, now);
+            let state =
+                table::TableState { sort: &mut self.sort, selected: &mut self.selected, checked: &mut self.checked };
+            table::show(ui, &self.rows, &visible, state, now);
+        });
     }
 }
 
@@ -223,6 +251,20 @@ mod tests {
 
         app.apply_event(ScanEvent::Done);
         assert!(!app.scanning);
+    }
+
+    #[test]
+    fn clear_scan_data_forgets_previous_scan() {
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
+        app.apply_event(ScanEvent::Sizes(HashMap::from([(ProgramId("a".into()), 7)])));
+        app.apply_event(ScanEvent::Warning("w".into()));
+        app.clear_scan_data();
+        assert!(app.rows.is_empty() && app.warnings.is_empty());
+        app.rebuild_rows();
+        assert!(app.rows.is_empty(), "no programs left to rebuild from");
+        app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
+        assert_eq!(app.rows[0].size, None, "old sizes are gone");
     }
 
     #[test]

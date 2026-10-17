@@ -1,0 +1,95 @@
+//! Swedish display formatting of dates and sizes (no egui).
+
+use chrono::{DateTime, NaiveDate, Utc};
+
+use crate::strings;
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// "Idag", "Igår", "5 dagar sedan", "14 mån sedan", "4 år sedan" or "Aldrig sedd".
+/// Times in the future count as today.
+pub fn relative_date(when: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(when) = when else {
+        return strings::NEVER_SEEN.to_string();
+    };
+    let days = (now - when).num_days().max(0);
+    let months = days / 30;
+    match days {
+        0 => strings::TODAY.to_string(),
+        1 => strings::YESTERDAY.to_string(),
+        2..=29 => format!("{days} {}", strings::DAYS_AGO),
+        _ if months < 36 => format!("{months} {}", strings::MONTHS_AGO),
+        _ => format!("{} {}", days / 365, strings::YEARS_AGO),
+    }
+}
+
+/// "–" when unknown, whole MB below 1 GiB (at least 1 for non-empty), otherwise GB with
+/// one decimal and a Swedish comma.
+pub fn human_size(bytes: Option<u64>) -> String {
+    let Some(bytes) = bytes else {
+        return strings::UNKNOWN_VALUE.to_string();
+    };
+    if bytes < GIB {
+        let mb = if bytes > 0 { (bytes / MIB).max(1) } else { 0 };
+        format!("{mb} {}", strings::MB)
+    } else {
+        let gb = format!("{:.1}", bytes as f64 / GIB as f64).replace('.', ",");
+        format!("{gb} {}", strings::GB)
+    }
+}
+
+/// "2024-01-20" or "–".
+pub fn ymd(d: Option<NaiveDate>) -> String {
+    d.map_or_else(|| strings::UNKNOWN_VALUE.to_string(), |d| d.format("%Y-%m-%d").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone};
+
+    use super::*;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn relative_dates() {
+        let now = now();
+        let ago = |d: i64| Some(now - Duration::days(d));
+        assert_eq!(relative_date(None, now), "Aldrig sedd");
+        assert_eq!(relative_date(Some(now), now), "Idag");
+        assert_eq!(relative_date(ago(1), now), "Igår");
+        assert_eq!(relative_date(ago(5), now), "5 dagar sedan");
+        assert_eq!(relative_date(ago(29), now), "29 dagar sedan");
+        assert_eq!(relative_date(ago(30), now), "1 mån sedan");
+        assert_eq!(relative_date(ago(420), now), "14 mån sedan");
+        assert_eq!(relative_date(ago(1079), now), "35 mån sedan");
+        assert_eq!(relative_date(ago(1080), now), "2 år sedan");
+        assert_eq!(relative_date(ago(1500), now), "4 år sedan");
+    }
+
+    #[test]
+    fn future_dates_count_as_today() {
+        let now = now();
+        assert_eq!(relative_date(Some(now + Duration::days(3)), now), "Idag");
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(human_size(Some(58 * 1024 * 1024)), "58 MB");
+        assert_eq!(human_size(Some(1_288_490_189)), "1,2 GB");
+        assert_eq!(human_size(None), "–");
+        assert_eq!(human_size(Some(0)), "0 MB");
+        assert_eq!(human_size(Some(1)), "1 MB");
+        assert_eq!(human_size(Some(1024 * 1024 * 1024 - 1)), "1023 MB");
+        assert_eq!(human_size(Some(1024 * 1024 * 1024)), "1,0 GB");
+    }
+
+    #[test]
+    fn ymd_formats_or_dashes() {
+        assert_eq!(ymd(NaiveDate::from_ymd_opt(2024, 1, 20)), "2024-01-20");
+        assert_eq!(ymd(None), "–");
+    }
+}

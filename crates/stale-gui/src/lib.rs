@@ -2,6 +2,9 @@
 //! the admin manifest that `build.rs` embeds into the `stale` binary.
 
 pub mod app;
+pub mod filter;
+pub mod format;
 pub mod logging;
 pub mod strings;
+pub mod ui;
 pub mod worker;
