@@ -2,27 +2,35 @@
 
 use std::path::{Path, PathBuf};
 
-/// Total size of all files under `root`. Symlinks and junctions are not followed;
-/// unreadable entries are skipped. A missing `root` is 0.
-pub fn dir_size(root: &Path) -> u64 {
+/// Total size of all files under `root`, or `None` when `root` is missing or unreadable.
+/// Symlinks and junctions are not followed; unreadable entries below `root` are skipped.
+pub fn dir_size(root: &Path) -> Option<u64> {
     let mut total = 0;
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![];
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        add_entry(&entry, &mut total, &mut stack);
+    }
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
-            // DirEntry::metadata does not traverse links; junctions report as symlinks.
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += meta.len();
-            }
+            add_entry(&entry, &mut total, &mut stack);
         }
     }
-    total
+    Some(total)
+}
+
+/// Adds a file's size to `total` or queues a directory; links are skipped.
+fn add_entry(entry: &std::fs::DirEntry, total: &mut u64, stack: &mut Vec<PathBuf>) {
+    // DirEntry::metadata does not traverse links; junctions report as symlinks.
+    let Ok(meta) = entry.metadata() else { return };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        stack.push(entry.path());
+    } else {
+        *total += meta.len();
+    }
 }
 
 /// `*.exe` files directly in `dir` (not in subfolders) with their sizes.
@@ -50,8 +58,15 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(dir.path().join("a").join("ten.bin"), [0u8; 10]).unwrap();
         std::fs::write(nested.join("twenty.bin"), [0u8; 20]).unwrap();
-        assert_eq!(dir_size(dir.path()), 30);
-        assert_eq!(dir_size(&dir.path().join("missing")), 0);
+        assert_eq!(dir_size(dir.path()), Some(30));
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size(empty.path()), Some(0));
+    }
+
+    #[test]
+    fn dir_size_missing_root_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size(&dir.path().join("missing")), None);
     }
 
     #[test]

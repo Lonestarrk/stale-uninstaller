@@ -30,7 +30,7 @@ pub enum ScanEvent {
     Usage(HashMap<ProgramId, ProgramUsage>),
     /// Usage hits that belong to no installed program.
     UnmatchedHits(Vec<UsageHit>),
-    /// Measured install-folder sizes in bytes.
+    /// Measured install-folder sizes in bytes, only for programs without a registry estimate.
     Sizes(HashMap<ProgramId, u64>),
     Warning(String),
     Done,
@@ -43,13 +43,17 @@ pub type FileTimesFn = Box<dyn Fn(&[PathBuf]) -> Vec<UsageHit> + Send>;
 /// Target exe of a `.lnk` shortcut, if it resolves to one.
 pub type ResolveLnkFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send>;
 
+/// Total size of a folder, `None` when it cannot be measured.
+pub type DirSizeFn = Box<dyn Fn(&Path) -> Option<u64> + Send>;
+
 /// Everything a scan reads, injectable for tests.
 pub struct ScanSources {
     pub reg: Arc<dyn RegistryReader>,
     pub providers: Vec<Box<dyn UsageProvider>>,
     pub shortcut_targets: Vec<PathBuf>,
     pub list_root_exes: ListRootExesFn,
-    pub dir_size: Box<dyn Fn(&Path) -> u64 + Send>,
+    /// Size of an install folder; `None` when it is missing or unreadable.
+    pub dir_size: DirSizeFn,
     /// File-time hits for the given main exes (run after main exes are known).
     pub file_times: FileTimesFn,
     /// `norm()`ed exe paths of installed services.
@@ -153,10 +157,13 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
     tx.send(ScanEvent::Usage(result.by_program))?;
     tx.send(ScanEvent::UnmatchedHits(result.unmatched))?;
 
+    // Spec §5: the registry estimate wins; only programs without one are measured, and only
+    // in a folder of their own.
     let mut batch = HashMap::new();
-    for p in programs.iter().filter(|p| !p.hidden) {
+    for p in programs.iter().filter(|p| !p.hidden && p.estimated_size_bytes.is_none()) {
         let Some(loc) = own_folder(p) else { continue };
-        batch.insert(p.id.clone(), (src.dir_size)(loc));
+        let Some(size) = (src.dir_size)(loc) else { continue };
+        batch.insert(p.id.clone(), size);
         if batch.len() == SIZE_BATCH {
             tx.send(ScanEvent::Sizes(std::mem::take(&mut batch)))?;
         }
@@ -232,7 +239,7 @@ mod tests {
             providers: vec![Box::new(provider)],
             shortcut_targets: vec![],
             list_root_exes: Box::new(|dir: &Path| vec![(dir.join("main.exe"), 100)]),
-            dir_size: Box::new(|_: &Path| 1234),
+            dir_size: Box::new(|_: &Path| Some(1234)),
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
             resolve_lnk: Box::new(|_: &Path| None),
@@ -332,6 +339,37 @@ mod tests {
         let (tx, rx) = channel();
         drop(rx);
         run_scan(sources(FixedProvider(Ok(vec![]))), tx); // must return, not panic
+    }
+
+    #[test]
+    fn programs_with_estimated_size_are_not_measured() {
+        let mut reg = FakeRegistry::new();
+        add_program(&mut reg, "Estimated", r"D:\Apps\Estimated", false);
+        let k = key(Hive::LocalMachine, &format!(r"{UNINSTALL}\Estimated"));
+        reg.set(k, "EstimatedSize", RegValue::Dword(2048));
+        add_program(&mut reg, "Measured", r"D:\Apps\Measured", false);
+        add_program(&mut reg, "Gone", r"D:\Apps\Gone", false);
+        let mut src = sources(FixedProvider(Ok(vec![])));
+        src.reg = Arc::new(reg);
+        let (tx_calls, rx_calls) = channel();
+        src.dir_size = Box::new(move |dir: &Path| {
+            tx_calls.send(dir.to_path_buf()).unwrap();
+            (!dir.ends_with("Gone")).then_some(77)
+        });
+        let events = run(src);
+        let mut calls: Vec<PathBuf> = rx_calls.try_iter().collect();
+        calls.sort();
+        assert_eq!(calls, [PathBuf::from(r"D:\Apps\Gone"), PathBuf::from(r"D:\Apps\Measured")]);
+        let sizes: HashMap<ProgramId, u64> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                ScanEvent::Sizes(s) => Some(s),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(sizes.len(), 1, "only Some results are sent: {sizes:?}");
+        assert!(sizes.iter().all(|(id, &s)| id.0.ends_with("Measured") && s == 77));
     }
 
     #[test]

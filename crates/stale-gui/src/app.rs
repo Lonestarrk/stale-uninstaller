@@ -28,9 +28,9 @@ impl Row {
         self.usage.as_ref().and_then(|u| u.last_used.when)
     }
 
-    /// Measured size, falling back to the registry estimate.
+    /// The registry estimate, else the measured folder size (spec §5).
     pub fn size_bytes(&self) -> Option<u64> {
-        self.size.or(self.program.estimated_size_bytes)
+        self.program.estimated_size_bytes.or(self.size)
     }
 }
 

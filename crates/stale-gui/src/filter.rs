@@ -330,14 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn size_prefers_measured_over_estimate() {
+    fn size_prefers_estimate_over_measured() {
         let mut r = row("a", None);
-        r.program.estimated_size_bytes = Some(5);
-        assert_eq!(r.size_bytes(), Some(5));
         r.size = Some(2 * ONE_GB);
         assert_eq!(r.size_bytes(), Some(2 * ONE_GB));
         let big = Filters { size: SizeBucket::OverOneGb, ..Filters::default() };
         assert!(row_matches(&r, &big, now()));
+        r.program.estimated_size_bytes = Some(5);
+        assert_eq!(r.size_bytes(), Some(5));
+        assert!(!row_matches(&r, &big, now()));
     }
 
     #[test]
