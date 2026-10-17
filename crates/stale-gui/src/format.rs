@@ -1,6 +1,6 @@
 //! Swedish display formatting of dates and sizes (no egui).
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use stale_core::usage::UsageSource;
 
 use crate::strings;
@@ -8,13 +8,18 @@ use crate::strings;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// "Idag", "Igår", "5 dagar sedan", "14 mån sedan", "4 år sedan" or "Aldrig sedd".
-/// Times in the future count as today.
+/// The calendar date of `t` in the local time zone.
+pub fn local_date(t: DateTime<Utc>) -> NaiveDate {
+    t.with_timezone(&Local).date_naive()
+}
+
+/// "Idag", "Igår", "5 dagar sedan", "14 mån sedan", "4 år sedan" or "Aldrig sedd", counted
+/// in local calendar days (yesterday 23:59 is "Igår" at 00:01). Future times count as today.
 pub fn relative_date(when: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(when) = when else {
         return strings::NEVER_SEEN.to_string();
     };
-    let days = (now - when).num_days().max(0);
+    let days = (local_date(now) - local_date(when)).num_days().max(0);
     let months = days / 30;
     match days {
         0 => strings::TODAY.to_string(),
@@ -61,8 +66,27 @@ mod tests {
 
     use super::*;
 
+    /// `y-m-d h:mi` local time, as UTC.
+    fn local(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Local.with_ymd_and_hms(y, m, d, h, mi, 0).single().unwrap().with_timezone(&Utc)
+    }
+
     fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap()
+        local(2026, 10, 18, 12, 0)
+    }
+
+    #[test]
+    fn relative_date_counts_local_calendar_days() {
+        let just_after_midnight = local(2026, 10, 18, 0, 1);
+        assert_eq!(relative_date(Some(local(2026, 10, 17, 23, 59)), just_after_midnight), "Igår");
+        assert_eq!(relative_date(Some(local(2026, 10, 18, 0, 0)), local(2026, 10, 18, 23, 59)), "Idag");
+        assert_eq!(relative_date(Some(local(2026, 10, 16, 23, 0)), just_after_midnight), "2 dagar sedan");
+    }
+
+    #[test]
+    fn local_date_uses_local_time_zone() {
+        assert_eq!(local_date(local(2026, 10, 17, 23, 59)), NaiveDate::from_ymd_opt(2026, 10, 17).unwrap());
+        assert_eq!(local_date(local(2026, 10, 18, 0, 1)), NaiveDate::from_ymd_opt(2026, 10, 18).unwrap());
     }
 
     #[test]

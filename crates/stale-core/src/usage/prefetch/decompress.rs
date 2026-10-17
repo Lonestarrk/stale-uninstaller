@@ -43,12 +43,13 @@ pub fn decompress_mam(data: &[u8]) -> Result<Vec<u8>, String> {
     if status != 0 {
         return Err(format!("RtlGetCompressionWorkSpaceSize failed: {status:#010x}"));
     }
-    // u64 elements keep the workspace 8-byte aligned.
-    let mut workspace = vec![0u64; (buf_ws as usize).div_ceil(8).max(1)];
+    // Sized for the larger of the two requirements; u64 elements keep it 8-byte aligned.
+    let ws_bytes = buf_ws.max(frag_ws) as usize;
+    let mut workspace = vec![0u64; ws_bytes.div_ceil(8).max(1)];
     let mut out = vec![0u8; size as usize];
     let mut final_len = 0u32;
     // SAFETY: `out` holds `size` bytes, `payload` holds `in_len` bytes, and `workspace`
-    // is at least `buf_ws` bytes as requested by ntdll; all outlive the call.
+    // is at least `max(buf_ws, frag_ws)` bytes as requested by ntdll; all outlive the call.
     let status = unsafe {
         RtlDecompressBufferEx(
             COMPRESSION_FORMAT_XPRESS_HUFF,

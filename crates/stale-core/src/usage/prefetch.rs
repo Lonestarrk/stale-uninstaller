@@ -39,7 +39,7 @@ fn utf16(b: &[u8]) -> Vec<u16> {
     b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect()
 }
 
-/// Parses a decompressed Prefetch file (versions 17, 23, 26 and 30).
+/// Parses a decompressed Prefetch file (versions 17, 23, 26, 30 and 31).
 pub fn parse_prefetch(bytes: &[u8]) -> Result<PrefetchFile, String> {
     let version = u32_at(bytes, 0)?;
     if slice(bytes, 4, 4)? != b"SCCA" {
@@ -198,18 +198,9 @@ mod tests {
     fn parses_real_fixture() {
         let raw = decompress_mam(&std::fs::read(fixture()).unwrap()).unwrap();
         let pf = parse_prefetch(&raw).unwrap();
-        println!(
-            "version={} exe={} runs={:?} run_count={} refs={}",
-            pf.version,
-            pf.exe_name,
-            pf.last_runs,
-            pf.run_count,
-            pf.referenced_files.len()
-        );
         assert!(pf.exe_name.ends_with(".EXE"));
         assert!(pf.version == 26 || pf.version == 30 || pf.version == 31);
         assert!(!pf.last_runs.is_empty() && pf.last_runs[0].year() >= 2015);
-        assert!(pf.referenced_files.iter().any(|f| f.ends_with(&pf.exe_name)));
         assert!(pf.run_count > 0);
         let exe_suffix = format!(r"\{}", pf.exe_name);
         assert!(pf.referenced_files.iter().any(|f| f.ends_with(&exe_suffix)));

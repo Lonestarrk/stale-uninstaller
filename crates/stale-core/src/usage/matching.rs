@@ -267,8 +267,10 @@ fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes
         .filter_map(|group| {
             let latest = group.iter().max_by_key(|h| h.last_run)?;
             let main = is_main(&latest.exe_path);
-            // UserAssist records launches by the user, so such an exe always counts.
-            let user_launched = group.iter().any(|h| h.source == UsageSource::UserAssist);
+            // UserAssist records launches by the user, so such an exe counts even when it is not
+            // a main exe or has a background-looking name; running an uninstaller never does.
+            let user_launched =
+                group.iter().any(|h| h.source == UsageSource::UserAssist) && !is_uninstaller(&latest.exe_path);
             Some(ExeUsage {
                 exe_path: latest.exe_path.clone(),
                 last_run: latest.last_run,
@@ -496,6 +498,15 @@ mod tests {
         let r = run(&programs, &hits, &HashSet::new());
         assert_eq!(usage(&r, "Foo").exes[0].excluded, None);
         assert_eq!(usage(&r, "Foo").last_used.when, Some(days_ago(2)));
+    }
+
+    #[test]
+    fn userassist_uninstaller_hit_does_not_count() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\unins000.exe", 2, UsageSource::UserAssist)];
+        let r = run(&programs, &hits, &HashSet::new());
+        assert_eq!(usage(&r, "Foo").exes[0].excluded, Some(ExcludeReason::NamePattern));
+        assert_eq!(usage(&r, "Foo").last_used.when, None);
     }
 
     #[test]

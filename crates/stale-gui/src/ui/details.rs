@@ -32,7 +32,7 @@ fn last_used_text(row: &Row) -> String {
     let (Some(when), Some(source)) = (usage.last_used.when, usage.last_used.source) else {
         return strings::NEVER_SEEN.to_string();
     };
-    let mut text = format!("{} ({})", format::ymd(Some(when.date_naive())), format::source_label(source));
+    let mut text = format!("{} ({})", format::ymd(Some(format::local_date(when))), format::source_label(source));
     if !usage.last_used.confident {
         text.push_str(strings::UNCERTAIN_FILETIME);
     }
@@ -45,7 +45,7 @@ fn exe_file_name(exe: &ExeUsage) -> String {
 
 /// The date, plus the run count when it is known and non-zero (UserAssist often stores 0).
 fn last_run_text(exe: &ExeUsage) -> String {
-    let date = format::ymd(Some(exe.last_run.date_naive()));
+    let date = format::ymd(Some(format::local_date(exe.last_run)));
     match exe.run_count {
         Some(n) if n > 0 => format!("{date} ({n} {})", strings::RUNS),
         _ => date,
