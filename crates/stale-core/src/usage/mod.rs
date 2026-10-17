@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod bam;
 pub mod filetime;
 pub mod userassist;
 

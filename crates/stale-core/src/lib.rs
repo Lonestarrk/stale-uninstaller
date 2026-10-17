@@ -1,3 +1,4 @@
+pub mod devicepath;
 pub mod knownfolders;
 pub mod model;
 pub mod pathutil;
