@@ -66,7 +66,7 @@ pub fn norm(p: &Path) -> String {
 
 /// Folders (normalized) that many programs share; resolved from the environment on each call.
 fn shared_folders() -> Vec<String> {
-    const VARS: [&str; 8] = [
+    const VARS: [&str; 10] = [
         "%ProgramFiles%",
         "%ProgramFiles(x86)%",
         "%ProgramData%",
@@ -74,6 +74,8 @@ fn shared_folders() -> Vec<String> {
         r"%LOCALAPPDATA%\Programs",
         "%APPDATA%",
         "%SystemRoot%",
+        r"%SystemRoot%\System32",
+        r"%SystemRoot%\SysWOW64",
         "%USERPROFILE%",
     ];
     VARS.iter()
@@ -89,13 +91,21 @@ fn users_root() -> Option<String> {
     Some(norm(Path::new(&format!(r"{drive}\Users"))))
 }
 
-/// True for drive roots and for the shared folders that hold many programs (Program Files,
-/// ProgramData, AppData roots, Windows, the Users folder and each profile root). Their
-/// subfolders are not shared roots. An empty path counts as shared so it never claims anything.
+/// `\Program Files`-style folders (normalized, without drive) that are shared on any drive.
+const SHARED_ON_ANY_DRIVE: [&str; 4] =
+    [r"\PROGRAM FILES", r"\PROGRAM FILES (X86)", r"\PROGRAM FILES\COMMON FILES", r"\PROGRAM FILES (X86)\COMMON FILES"];
+
+/// True for drive roots and for the shared folders that hold many programs (Program Files and
+/// its Common Files on any drive, ProgramData, AppData roots, Windows and its System32/SysWOW64,
+/// the Users folder and each profile root). Their subfolders are not shared roots. An empty
+/// path counts as shared so it never claims anything.
 pub fn is_shared_root(p: &Path) -> bool {
     let n = norm(p);
     let is_drive_root = n.len() == 2 && drive_letter(Path::new(&n)).is_some();
     if n.is_empty() || is_drive_root || shared_folders().contains(&n) {
+        return true;
+    }
+    if drive_letter(Path::new(&n)).is_some() && n.get(2..).is_some_and(|rest| SHARED_ON_ANY_DRIVE.contains(&rest)) {
         return true;
     }
     users_root().is_some_and(|users| {
@@ -153,6 +163,24 @@ mod tests {
         assert!(is_shared_root(&users.join("SomeoneElse")));
         assert!(!is_shared_root(&users.join("SomeoneElse").join("Tools")));
         assert!(is_shared_root(Path::new("")));
+    }
+
+    #[test]
+    fn program_files_on_any_drive_and_system_folders_are_shared() {
+        for p in [
+            r"D:\Program Files",
+            r"e:\program files (x86)\",
+            r"C:\Program Files\Common Files",
+            r"D:\Program Files (x86)\Common Files",
+        ] {
+            assert!(is_shared_root(Path::new(p)), "{p}");
+        }
+        let windows = env_path("SystemRoot");
+        assert!(is_shared_root(&windows.join("System32")));
+        assert!(is_shared_root(&windows.join("SysWOW64")));
+        assert!(!is_shared_root(Path::new(r"D:\Program Files\Foo")));
+        assert!(!is_shared_root(Path::new(r"D:\Program Files\Common Files\Foo")));
+        assert!(!is_shared_root(&windows.join("System32").join("Foo")));
     }
 
     #[test]
