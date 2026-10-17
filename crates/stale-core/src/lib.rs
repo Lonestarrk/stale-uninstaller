@@ -1,3 +1,8 @@
+pub mod model;
+pub mod registry;
+
+pub use model::*;
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

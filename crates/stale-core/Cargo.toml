@@ -4,3 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+winreg = "0.56.0"
