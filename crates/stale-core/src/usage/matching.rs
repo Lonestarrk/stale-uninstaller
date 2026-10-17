@@ -200,12 +200,8 @@ fn with_install_drive(exe: &Path, program: &Program) -> PathBuf {
     }
 }
 
-/// Orders hits so that, on equal times, a precise source beats a file timestamp.
-fn recency(last_run: DateTime<Utc>, source: UsageSource) -> (DateTime<Utc>, bool) {
-    (last_run, source != UsageSource::FileTime)
-}
-
-/// One `ExeUsage` per distinct exe (by `norm()`), newest first.
+/// One `ExeUsage` per distinct exe (by `norm()`), newest first. Callers never mix FileTime
+/// hits with other sources in one call (see `summarize`).
 fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes: &HashSet<String>) -> Vec<ExeUsage> {
     let mut groups: BTreeMap<String, Vec<UsageHit>> = BTreeMap::new();
     for hit in hits {
@@ -214,7 +210,7 @@ fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes
     let mut exes: Vec<ExeUsage> = groups
         .into_values()
         .filter_map(|group| {
-            let latest = group.iter().max_by_key(|h| recency(h.last_run, h.source))?;
+            let latest = group.iter().max_by_key(|h| h.last_run)?;
             let main = is_main(&latest.exe_path);
             // UserAssist records launches by the user, so such an exe always counts.
             let user_launched = group.iter().any(|h| h.source == UsageSource::UserAssist);
@@ -232,12 +228,30 @@ fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes
     exes
 }
 
-fn last_used(exes: &[ExeUsage]) -> LastUsed {
-    exes.iter()
+fn last_used<'a>(exes: impl IntoIterator<Item = &'a ExeUsage>) -> LastUsed {
+    exes.into_iter()
         .filter(|e| e.excluded.is_none())
-        .max_by_key(|e| recency(e.last_run, e.source))
+        .max_by_key(|e| e.last_run)
         .map(|e| LastUsed { when: Some(e.last_run), source: Some(e.source), confident: e.source != UsageSource::FileTime })
         .unwrap_or(LastUsed { when: None, source: None, confident: true })
+}
+
+/// Summarizes one program's hits (spec §5). File timestamps are a pure fallback: they never
+/// merge into an exe that has a real source, and they date the program only when it has no
+/// other hits at all (excluded ones included).
+fn summarize(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes: &HashSet<String>) -> ProgramUsage {
+    let (file_times, real): (Vec<UsageHit>, Vec<UsageHit>) = hits.into_iter().partition(|h| h.source == UsageSource::FileTime);
+    let real = group_hits(real, &is_main, service_exes);
+    let real_exes: HashSet<String> = real.iter().map(|e| norm(&e.exe_path)).collect();
+    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, service_exes)
+        .into_iter()
+        .filter(|e| !real_exes.contains(&norm(&e.exe_path)))
+        .collect();
+    let last_used = if real.is_empty() { last_used(&file_times) } else { last_used(&real) };
+    let mut exes = real;
+    exes.extend(file_times);
+    exes.sort_by_key(|e| std::cmp::Reverse(e.last_run));
+    ProgramUsage { last_used, exes }
 }
 
 /// Assigns hits to programs (see `assign_hit`) and summarizes each program's usage.
@@ -258,10 +272,7 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
     let by_program = candidates
         .iter()
         .zip(assigned)
-        .map(|(c, hits)| {
-            let exes = group_hits(hits, |e| c.is_main(e), input.service_exes);
-            (c.program.id.clone(), ProgramUsage { last_used: last_used(&exes), exes })
-        })
+        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), input.service_exes)))
         .collect();
     MatchResult { by_program, unmatched }
 }
@@ -566,5 +577,37 @@ mod tests {
         let r = run(&programs, &hits, &HashSet::new());
         assert_eq!(r.unmatched, hits.to_vec());
         assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true }, exes: vec![] });
+    }
+
+    #[test]
+    fn real_hit_beats_newer_filetime() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\foo.exe", 300, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 1, UsageSource::FileTime)];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(300)), source: Some(UsageSource::Bam), confident: true });
+        assert_eq!(u.exes.len(), 1);
+        assert_eq!((u.exes[0].source, u.exes[0].last_run), (UsageSource::Bam, days_ago(300)));
+    }
+
+    #[test]
+    fn only_updater_hit_plus_filetime_gives_never_seen() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\FooUpdater.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 1, UsageSource::FileTime)];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.when, None);
+        // The file-time row is still listed on its own.
+        assert!(u.exes.iter().any(|e| e.source == UsageSource::FileTime && e.exe_path == Path::new(r"C:\Apps\Foo\foo.exe")));
+    }
+
+    #[test]
+    fn filetime_used_when_no_other_hits() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\foo.exe", 12, UsageSource::FileTime)];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.when, Some(days_ago(12)));
+        assert!(!u.last_used.confident);
     }
 }
