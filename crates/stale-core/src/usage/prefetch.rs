@@ -109,15 +109,17 @@ impl PrefetchProvider {
         parse_prefetch(&decompress_mam(&data)?)
     }
 
-    fn hits_in_dir(&self) -> Result<(Vec<UsageHit>, usize), String> {
+    /// Hits, skipped `.pf` files and total `.pf` files.
+    fn hits_in_dir(&self) -> Result<(Vec<UsageHit>, usize, usize), String> {
         let entries = std::fs::read_dir(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let mut hits = Vec::new();
-        let mut skipped = 0;
+        let (mut skipped, mut total) = (0, 0);
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pf")) {
                 continue;
             }
+            total += 1;
             let Ok(pf) = Self::read_file(&path) else {
                 skipped += 1;
                 continue;
@@ -132,13 +134,13 @@ impl PrefetchProvider {
                 });
             }
         }
-        Ok((hits, skipped))
+        Ok((hits, skipped, total))
     }
 
     /// Hits plus the number of `.pf` files that could not be read or parsed.
     /// An unreadable directory yields no hits and zero skipped files.
     pub fn collect_with_stats(&self) -> (Vec<UsageHit>, usize) {
-        self.hits_in_dir().unwrap_or_default()
+        self.hits_in_dir().map(|(hits, skipped, _)| (hits, skipped)).unwrap_or_default()
     }
 }
 
@@ -148,7 +150,21 @@ impl UsageProvider for PrefetchProvider {
     }
 
     fn collect(&self) -> Result<Vec<UsageHit>, String> {
-        self.hits_in_dir().map(|(hits, _)| hits)
+        self.hits_in_dir().map(|(hits, _, _)| hits)
+    }
+
+    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
+        match self.hits_in_dir() {
+            Ok((hits, skipped, total)) => {
+                let warnings = if skipped > 0 {
+                    vec![format!("Prefetch: {skipped} av {total} filer kunde inte läsas")]
+                } else {
+                    vec![]
+                };
+                (Ok(hits), warnings)
+            }
+            Err(e) => (Err(e), vec![]),
+        }
     }
 }
 
@@ -225,6 +241,18 @@ mod tests {
             assert!(s.ends_with(r"\RSAPPUI.EXE"), "{s}");
         }
         assert_eq!(p.collect().unwrap(), hits);
+        let (with_warnings, warnings) = p.collect_with_warnings();
+        assert_eq!(with_warnings.unwrap(), hits);
+        assert_eq!(warnings, vec!["Prefetch: 1 av 2 filer kunde inte läsas".to_string()]);
+    }
+
+    #[test]
+    fn provider_without_bad_files_has_no_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(fixture(), dir.path().join("RSAPPUI.EXE-F7E40085.pf")).unwrap();
+        let (hits, warnings) = PrefetchProvider { dir: dir.path().to_path_buf() }.collect_with_warnings();
+        assert!(!hits.unwrap().is_empty());
+        assert!(warnings.is_empty());
     }
 
     #[test]

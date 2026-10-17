@@ -28,4 +28,10 @@ pub struct UsageHit {
 pub trait UsageProvider: Send {
     fn name(&self) -> &'static str;
     fn collect(&self) -> Result<Vec<UsageHit>, String>;
+
+    /// Like `collect`, plus warnings about partial results (shown to the user, the hits are
+    /// still used). `Err` still means the provider produced nothing.
+    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
+        (self.collect(), vec![])
+    }
 }

@@ -125,7 +125,12 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
 
     let mut hits = Vec::new();
     for provider in &src.providers {
-        match provider.collect() {
+        let (result, warnings) = provider.collect_with_warnings();
+        for w in warnings {
+            log::warn!("{w}");
+            tx.send(ScanEvent::Warning(w))?;
+        }
+        match result {
             Ok(h) => hits.extend(h),
             Err(e) => {
                 let msg = format!("{}: {}", provider.name(), e);
@@ -183,6 +188,21 @@ mod tests {
     }
 
     struct FixedProvider(Result<Vec<UsageHit>, String>);
+
+    /// Returns no hits and one warning.
+    struct WarningProvider;
+
+    impl UsageProvider for WarningProvider {
+        fn name(&self) -> &'static str {
+            "Warn"
+        }
+        fn collect(&self) -> Result<Vec<UsageHit>, String> {
+            Ok(vec![])
+        }
+        fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
+            (Ok(vec![]), vec!["Prefetch: 2 av 9 filer kunde inte läsas".to_string()])
+        }
+    }
 
     impl UsageProvider for FixedProvider {
         fn name(&self) -> &'static str {
@@ -295,6 +315,16 @@ mod tests {
         let events = run(sources(FixedProvider(Err("boom".into()))));
         assert!(events.iter().any(|e| matches!(e, ScanEvent::Warning(w) if w.contains("boom") && w.contains("Fixed"))));
         assert!(matches!(events.last(), Some(ScanEvent::Done)));
+    }
+
+    #[test]
+    fn provider_warnings_are_sent_before_usage() {
+        let mut src = sources(FixedProvider(Ok(vec![])));
+        src.providers.push(Box::new(WarningProvider));
+        let events = run(src);
+        let kinds: Vec<_> = events.iter().map(kind).collect();
+        assert_eq!(kinds, ["Programs", "Warning", "Usage", "UnmatchedHits", "Sizes", "Done"]);
+        assert!(matches!(&events[1], ScanEvent::Warning(w) if w == "Prefetch: 2 av 9 filer kunde inte läsas"));
     }
 
     #[test]
