@@ -1,0 +1,11 @@
+[package]
+name = "stale-gui"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "stale"
+path = "src/main.rs"
+
+[dependencies]
+stale-core = { path = "../stale-core" }
