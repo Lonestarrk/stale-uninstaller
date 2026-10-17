@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use crate::devicepath::WinDeviceMap;
 use crate::model::{Program, ProgramId};
-use crate::pathutil::is_shared_root;
+use crate::pathutil::{exe_under, is_shared_root};
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
 use crate::services::service_exes;
-use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs};
+use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, ShortcutTarget};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
-use crate::usage::matching::{main_exes, match_usage, MatchInput, ProgramUsage};
+use crate::usage::matching::{arg_exe_names, is_name_excluded, main_exes, match_usage, MatchInput, ProgramUsage};
 use crate::usage::prefetch::PrefetchProvider;
 use crate::usage::userassist::UserAssistProvider;
 use crate::usage::{UsageHit, UsageProvider};
@@ -40,8 +40,10 @@ pub enum ScanEvent {
 pub type ListRootExesFn = Box<dyn Fn(&Path) -> Vec<(PathBuf, u64)> + Send>;
 /// File-time usage hits for the given exes.
 pub type FileTimesFn = Box<dyn Fn(&[PathBuf]) -> Vec<UsageHit> + Send>;
-/// Target exe of a `.lnk` shortcut, if it resolves to one.
-pub type ResolveLnkFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send>;
+/// Target exe (and arguments) of a `.lnk` shortcut, if it resolves to one.
+pub type ResolveLnkFn = Box<dyn Fn(&Path) -> Option<ShortcutTarget> + Send>;
+/// Files named exactly `name` (e.g. `Discord.exe`) under a folder, at most 3 levels deep.
+pub type FindExesFn = Box<dyn Fn(&Path, &str) -> Vec<PathBuf> + Send>;
 
 /// Total size of a folder, `None` when it cannot be measured.
 pub type DirSizeFn = Box<dyn Fn(&Path) -> Option<u64> + Send>;
@@ -50,8 +52,10 @@ pub type DirSizeFn = Box<dyn Fn(&Path) -> Option<u64> + Send>;
 pub struct ScanSources {
     pub reg: Arc<dyn RegistryReader>,
     pub providers: Vec<Box<dyn UsageProvider>>,
-    pub shortcut_targets: Vec<PathBuf>,
+    pub shortcut_targets: Vec<ShortcutTarget>,
     pub list_root_exes: ListRootExesFn,
+    /// Finds the exes named in a Squirrel-style shortcut's arguments.
+    pub find_exes: FindExesFn,
     /// Size of an install folder; `None` when it is missing or unreadable.
     pub dir_size: DirSizeFn,
     /// File-time hits for the given main exes (run after main exes are known).
@@ -77,6 +81,7 @@ impl ScanSources {
             reg,
             shortcut_targets: shortcut_targets(&start_menu_dirs()),
             list_root_exes: Box::new(crate::size::list_root_exes),
+            find_exes: Box::new(crate::size::find_exes),
             dir_size: Box::new(crate::size::dir_size),
             file_times: Box::new(|exes: &[PathBuf]| {
                 FileTimeProvider { exes: exes.to_vec() }.collect().unwrap_or_default()
@@ -93,16 +98,29 @@ fn own_folder(p: &Program) -> Option<&Path> {
 }
 
 /// Replaces each `.lnk` hit's path with the shortcut's target exe; unresolvable ones are dropped.
-fn resolve_lnk_hits(hits: Vec<UsageHit>, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Vec<UsageHit> {
+fn resolve_lnk_hits(hits: Vec<UsageHit>, resolve: &dyn Fn(&Path) -> Option<ShortcutTarget>) -> Vec<UsageHit> {
     hits.into_iter()
         .filter_map(|hit| {
             if !hit.exe_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
                 return Some(hit);
             }
-            let exe_path = resolve(&hit.exe_path)?;
+            let exe_path = resolve(&hit.exe_path)?.path;
             Some(UsageHit { exe_path, ..hit })
         })
         .collect()
+}
+
+/// Exes under `install` named in the arguments of name-excluded shortcut targets there
+/// (Squirrel's `Update.exe --processStart App.exe`).
+fn find_arg_exes(install: &Path, targets: &[ShortcutTarget], find: &dyn Fn(&Path, &str) -> Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut names: Vec<String> = targets
+        .iter()
+        .filter(|t| exe_under(&t.path, install) && is_name_excluded(&t.path))
+        .flat_map(|t| arg_exe_names(&t.arguments))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.iter().flat_map(|n| find(install, n)).collect()
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -119,11 +137,19 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
         .iter()
         .filter_map(|p| Some((p.id.clone(), (src.list_root_exes)(own_folder(p)?))))
         .collect();
+    let arg_exes: HashMap<ProgramId, Vec<PathBuf>> = programs
+        .iter()
+        .filter_map(|p| {
+            let found = find_arg_exes(own_folder(p)?, &src.shortcut_targets, &*src.find_exes);
+            (!found.is_empty()).then(|| (p.id.clone(), found))
+        })
+        .collect();
     let mains: Vec<PathBuf> = programs
         .iter()
         .flat_map(|p| {
             let roots = root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
-            main_exes(p, &src.shortcut_targets, roots)
+            let args = arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
+            main_exes(p, &src.shortcut_targets, roots, args)
         })
         .collect();
 
@@ -152,6 +178,7 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
         hits: &hits,
         shortcut_targets: &src.shortcut_targets,
         root_exes: &root_exes,
+        arg_exes: &arg_exes,
         service_exes: &services,
     });
     tx.send(ScanEvent::Usage(result.by_program))?;
@@ -239,6 +266,7 @@ mod tests {
             providers: vec![Box::new(provider)],
             shortcut_targets: vec![],
             list_root_exes: Box::new(|dir: &Path| vec![(dir.join("main.exe"), 100)]),
+            find_exes: Box::new(|_: &Path, _: &str| vec![]),
             dir_size: Box::new(|_: &Path| Some(1234)),
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
@@ -305,7 +333,7 @@ mod tests {
         let mut src = sources(FixedProvider(Ok(vec![lnk.clone(), gone])));
         src.reg = Arc::new(reg);
         src.resolve_lnk =
-            Box::new(|p: &Path| p.ends_with("Foo.lnk").then(|| PathBuf::from(r"C:\Apps\Foo\foo.exe")));
+            Box::new(|p: &Path| p.ends_with("Foo.lnk").then(|| ShortcutTarget::new(r"C:\Apps\Foo\foo.exe")));
         let events = run(src);
         let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
         let foo = usage.keys().find(|id| id.0.ends_with("Foo")).expect("Foo has usage");
@@ -315,6 +343,38 @@ mod tests {
         assert_eq!((exes[0].last_run, exes[0].source, exes[0].run_count), (lnk.last_run, lnk.source, lnk.run_count));
         let ScanEvent::UnmatchedHits(unmatched) = &events[2] else { unreachable!() };
         assert!(unmatched.is_empty(), "unresolvable .lnk hit is dropped: {unmatched:?}");
+    }
+
+    #[test]
+    fn squirrel_shortcut_arguments_pick_main_exe_via_find_exes() {
+        let mut reg = FakeRegistry::new();
+        add_program(&mut reg, "Discord", r"C:\Users\X\AppData\Local\Discord", false);
+        let main = PathBuf::from(r"C:\Users\X\AppData\Local\Discord\app-1.0\Discord.exe");
+        let mut src = sources(FixedProvider(Ok(vec![hit(main.to_str().unwrap())])));
+        src.reg = Arc::new(reg);
+        src.shortcut_targets = vec![ShortcutTarget {
+            path: PathBuf::from(r"C:\Users\X\AppData\Local\Discord\Update.exe"),
+            arguments: "--processStart Discord.exe".into(),
+        }];
+        let (tx_find, rx_find) = channel();
+        let found = main.clone();
+        src.find_exes = Box::new(move |dir: &Path, name: &str| {
+            tx_find.send((dir.to_path_buf(), name.to_string())).unwrap();
+            vec![found.clone()]
+        });
+        let (tx_exes, rx_exes) = channel();
+        src.file_times = Box::new(move |exes: &[PathBuf]| {
+            tx_exes.send(exes.to_vec()).unwrap();
+            vec![]
+        });
+        let events = run(src);
+        let calls: Vec<_> = rx_find.try_iter().collect();
+        assert_eq!(calls, [(PathBuf::from(r"C:\Users\X\AppData\Local\Discord"), "DISCORD.EXE".to_string())]);
+        assert_eq!(rx_exes.recv().unwrap(), std::slice::from_ref(&main));
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let discord = usage.keys().find(|id| id.0.ends_with("Discord")).unwrap();
+        assert_eq!(usage[discord].last_used.source, Some(UsageSource::Bam));
+        assert!(usage[discord].exes[0].is_main);
     }
 
     #[test]

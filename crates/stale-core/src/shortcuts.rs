@@ -44,31 +44,58 @@ impl Drop for ComGuard {
     }
 }
 
-/// The shortcut's target exactly as stored (may contain `%VAR%`); empty if it has none.
-fn raw_target(lnk: &Path) -> windows::core::Result<String> {
+/// An `.exe` a shortcut starts, with its command-line arguments (Squirrel apps point their
+/// shortcuts at `Update.exe --processStart App.exe`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutTarget {
+    pub path: PathBuf,
+    pub arguments: String,
+}
+
+impl ShortcutTarget {
+    /// A target without arguments.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        ShortcutTarget { path: path.into(), arguments: String::new() }
+    }
+}
+
+fn from_wide(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// The shortcut's target exactly as stored (may contain `%VAR%`; empty if it has none) and
+/// its arguments.
+fn raw_target(lnk: &Path) -> windows::core::Result<(String, String)> {
     let wide: Vec<u16> = lnk.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut buf = [0u16; 1024];
+    let mut path = [0u16; 1024];
+    let mut args = [0u16; 2048];
     // SAFETY: COM is initialized by the caller; `wide` is NUL-terminated and outlives `Load`;
-    // `GetPath` writes at most `buf.len()` UTF-16 units and accepts a null find-data pointer.
+    // `GetPath`/`GetArguments` write at most `buf.len()` UTF-16 units; `GetPath` accepts a
+    // null find-data pointer.
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.cast::<IPersistFile>()?.Load(PCWSTR(wide.as_ptr()), STGM_READ)?;
-        link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
+        link.GetPath(&mut path, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
+        // Arguments only refine matching; a link without readable ones still has a target.
+        let _ = link.GetArguments(&mut args);
     }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Ok(String::from_utf16_lossy(&buf[..len]))
+    Ok((from_wide(&path), from_wide(&args)))
 }
 
 /// Resolves a `.lnk` to its target; `None` unless the target is an `.exe`. The target does
 /// not have to exist.
-pub fn resolve_lnk(lnk: &Path) -> Option<PathBuf> {
+pub fn resolve_lnk(lnk: &Path) -> Option<ShortcutTarget> {
     let _com = ComGuard::init();
-    let target = PathBuf::from(expand_env(&raw_target(lnk).ok()?));
-    target.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")).then_some(target)
+    let (path, arguments) = raw_target(lnk).ok()?;
+    let path = PathBuf::from(expand_env(&path));
+    let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    is_exe.then(|| ShortcutTarget { path, arguments: arguments.trim().to_string() })
 }
 
-/// Every `.exe` target of the `*.lnk` files under `dirs` (recursive), deduped case-insensitively.
-pub fn shortcut_targets(dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// Every `.exe` target of the `*.lnk` files under `dirs` (recursive), deduped by path
+/// (case-insensitively) and arguments.
+pub fn shortcut_targets(dirs: &[PathBuf]) -> Vec<ShortcutTarget> {
     // Held across the walk so each `resolve_lnk` only bumps COM's init count.
     let _com = ComGuard::init();
     let mut lnks = Vec::new();
@@ -76,7 +103,10 @@ pub fn shortcut_targets(dirs: &[PathBuf]) -> Vec<PathBuf> {
         collect_lnks(dir, &mut lnks);
     }
     let mut seen = HashSet::new();
-    lnks.iter().filter_map(|l| resolve_lnk(l)).filter(|t| seen.insert(norm(t))).collect()
+    lnks.iter()
+        .filter_map(|l| resolve_lnk(l))
+        .filter(|t| seen.insert((norm(&t.path), t.arguments.to_lowercase())))
+        .collect()
 }
 
 /// Recursively gathers `*.lnk` files; unreadable folders are skipped, symlinks not followed.
@@ -130,6 +160,6 @@ mod tests {
         let targets = shortcut_targets(&start_menu_dirs());
         println!("{} exe targets, e.g. {:?}", targets.len(), targets.iter().take(5).collect::<Vec<_>>());
         assert!(!targets.is_empty());
-        assert!(targets.iter().all(|t| t.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))));
+        assert!(targets.iter().all(|t| t.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))));
     }
 }
