@@ -299,6 +299,51 @@ Restsökning ska också kunna köras fristående via knappen *Sök rester* för 
 program som redan är borta ur listan men lämnat spår. I det läget anges namn
 och eventuell mapp manuellt.
 
+### 6.3 Spökprogram: avinstallerade program som lämnat rester
+
+Tillagt 2026-10-17 efter samtal. Ingår i version 1 (plan 2).
+
+Ett program som redan avinstallerats saknar Uninstall-nyckel, så det syns inte
+i programlistan. Ändå ligger ofta mappar och registernycklar kvar och tar
+plats. Stale ska hitta dem automatiskt, utan att användaren behöver ange namn.
+
+**Spår som avslöjar att ett program funnits, och var:**
+
+1. Registernycklar under `HKLM\SOFTWARE\<Utgivare>\<Program>`,
+   `HKLM\SOFTWARE\WOW6432Node\...` och `HKCU\Software\...` som inte matchar
+   något installerat program. Värden som `InstallPath`, `InstallDir`,
+   `InstallLocation`, `Path` eller liknande ger installationsmappen.
+2. Hängande referenser: `Run`/`RunOnce`, `App Paths`, `Software\Classes`
+   (CLSID, filtyper, URL-protokoll), tjänster, schemalagda uppgifter och
+   genvägar i Startmenyn/skrivbordet vars mål inte längre finns på disk.
+   Sökvägen i referensen pekar ut var programmet låg.
+3. Körningsspår i Prefetch, BAM och UserAssist för exe-filer som inte längre
+   finns. Ger både programnamn, mapp och när det senast kördes.
+4. Mappar i `Program Files`, `Program Files (x86)`, `ProgramData`,
+   `%APPDATA%`, `%LOCALAPPDATA%` och `%LOCALAPPDATA%\Programs` (för alla
+   profiler under `C:\Users`) som inte hör till något installerat program.
+
+**Hur det presenteras.** En egen vy, *Spökprogram*, bredvid programlistan.
+Spåren grupperas till en post per troligt program (på mappnamn, nyckelnamn
+och exe-namn, normaliserade som i restsökningen). Varje post visar namn,
+utgivare om känd, de mappar och nycklar som hittats med storlek, senast
+använd från körningsspåren, och en bedömning:
+
+| Bedömning | Regel |
+|---|---|
+| Troligen avinstallerat | Hängande referenser eller körningsspår för exe som saknas, och ingen matchande Uninstall-nyckel |
+| Rester utan installation | Bara mappar/nycklar hittade, inga körningsspår |
+| Osäker | Enbart en mapp i AppData med generiskt namn, eller namn som matchar ett installerat program delvis |
+
+Användaren bockar i vad som ska bort; samma förtroendenivåer och samma
+karantän som i avsnitt 6.1 och 7 gäller. Mappar i användarens dokumentmappar
+visas aldrig här. Poster kan märkas *Behåll*, vilket sparas i samma
+viktig-lista som skräpletaren (avsnitt 9) så de inte visas igen.
+
+**Krav på plan 1 från detta:** körningsspår ska sparas även när exe-filen
+inte matchar något installerat program, så att spökvyn kan läsa dem utan ny
+skanning.
+
 ## 7. Karantän och ångra
 
 Inget som Stale tar bort raderas direkt. I stället:
