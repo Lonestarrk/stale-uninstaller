@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod bam;
 pub mod filetime;
+pub mod prefetch;
 pub mod userassist;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
