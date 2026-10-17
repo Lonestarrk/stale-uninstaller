@@ -23,13 +23,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_and_malformed_guids_are_none() {
-        assert!(resolve("{00000000-0000-0000-0000-000000000000}").is_none());
+    fn malformed_guid_is_none_without_shell_call() {
         assert!(resolve("not a guid").is_none());
+        assert!(resolve("{not-a-guid}").is_none());
     }
 
     #[test]
-    fn program_files_resolves() {
+    #[ignore]
+    fn live_known_folders_resolve() {
+        assert!(resolve("{00000000-0000-0000-0000-000000000000}").is_none());
         let p = resolve("{6D809377-6AF0-444B-8957-A3773F02200E}").unwrap();
         assert!(p.to_string_lossy().contains("Program Files"));
     }
