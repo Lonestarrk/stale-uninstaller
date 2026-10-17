@@ -16,18 +16,48 @@ pub const UNINSTALL_ROOTS: [(Hive, &str, Scope); 3] = [
     (Hive::CurrentUser, r"Software\Microsoft\Windows\CurrentVersion\Uninstall", Scope::CurrentUser),
 ];
 
-/// Never fails; unreadable roots or keys are skipped.
+/// Per-user Uninstall key, relative to a user hive (`HKCU` or `HKU\<SID>`).
+const USER_UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+
+/// Never fails; unreadable roots or keys are skipped. Besides the machine and current-user
+/// roots, reads every other loaded user hive under `HKU` (`Scope::OtherUser`).
 pub fn enumerate_programs(reg: &dyn RegistryReader) -> Vec<Program> {
     let mut programs = Vec::new();
     for (hive, root, scope) in UNINSTALL_ROOTS {
-        let Ok(subkeys) = reg.subkeys(&key(hive, root)) else { continue };
-        for sub in subkeys {
-            let path = key(hive, &format!(r"{root}\{sub}"));
-            let Ok(values) = reg.values(&path) else { continue };
-            programs.extend(program_from_values(path, scope, &values));
-        }
+        read_root(reg, hive, root, scope, &mut programs);
+    }
+    for sid in other_user_sids(reg) {
+        read_root(reg, Hive::Users, &format!(r"{sid}\{USER_UNINSTALL}"), Scope::OtherUser, &mut programs);
     }
     programs
+}
+
+fn read_root(reg: &dyn RegistryReader, hive: Hive, root: &str, scope: Scope, out: &mut Vec<Program>) {
+    let Ok(subkeys) = reg.subkeys(&key(hive, root)) else { return };
+    for sub in subkeys {
+        let path = key(hive, &format!(r"{root}\{sub}"));
+        let Ok(values) = reg.values(&path) else { continue };
+        out.extend(program_from_values(path, scope, &values));
+    }
+}
+
+/// Lowercased, sorted subkey names of a user's Uninstall key (empty when missing).
+fn uninstall_key_names(reg: &dyn RegistryReader, hive: Hive, path: &str) -> Vec<String> {
+    let mut names: Vec<String> = reg.subkeys(&key(hive, path)).unwrap_or_default().iter().map(|n| n.to_lowercase()).collect();
+    names.sort();
+    names
+}
+
+/// SIDs under `HKU` other than `.DEFAULT`, `*_Classes` and the current user. The current user
+/// is recognized by an Uninstall key with exactly the same subkey names as `HKCU`'s.
+fn other_user_sids(reg: &dyn RegistryReader) -> Vec<String> {
+    let current = uninstall_key_names(reg, Hive::CurrentUser, USER_UNINSTALL);
+    reg.subkeys(&key(Hive::Users, ""))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sid| !sid.eq_ignore_ascii_case(".DEFAULT") && !sid.to_lowercase().ends_with("_classes"))
+        .filter(|sid| uninstall_key_names(reg, Hive::Users, &format!(r"{sid}\{USER_UNINSTALL}")) != current)
+        .collect()
 }
 
 fn find<'a>(values: &'a [(String, RegValue)], name: &str) -> Option<&'a RegValue> {
@@ -285,5 +315,22 @@ mod tests {
         assert_eq!(progs[0].scope, Scope::Machine);
         assert_eq!(progs[1].scope, Scope::CurrentUser);
         assert_ne!(progs[0].id, progs[1].id);
+    }
+
+    #[test]
+    fn enumerate_reads_other_users_but_not_the_current_one_twice() {
+        let mut reg = FakeRegistry::new();
+        let name = |n: &str| Str(n.into());
+        reg.set(key(Hive::CurrentUser, &format!(r"{USER_UNINSTALL}\A")), "DisplayName", name("A"));
+        // The current user's own hive, also loaded under HKU: same key names as HKCU.
+        reg.set(key(Hive::Users, &format!(r"S-1-5-21-1\{USER_UNINSTALL}\A")), "DisplayName", name("A"));
+        reg.set(key(Hive::Users, &format!(r"S-1-5-21-2\{USER_UNINSTALL}\B")), "DisplayName", name("B"));
+        reg.set(key(Hive::Users, &format!(r".DEFAULT\{USER_UNINSTALL}\D")), "DisplayName", name("D"));
+        reg.set(key(Hive::Users, &format!(r"S-1-5-21-2_Classes\{USER_UNINSTALL}\C")), "DisplayName", name("C"));
+        let progs = enumerate_programs(&reg);
+        let found: Vec<(&str, Scope)> = progs.iter().map(|p| (p.name.as_str(), p.scope)).collect();
+        assert_eq!(found, [("A", Scope::CurrentUser), ("B", Scope::OtherUser)]);
+        assert_eq!(progs[1].key.hive, Hive::Users);
+        assert_eq!(progs[1].id.0, format!(r"Users\S-1-5-21-2\{USER_UNINSTALL}\B"));
     }
 }

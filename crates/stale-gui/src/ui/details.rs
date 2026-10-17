@@ -3,7 +3,7 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use stale_core::usage::matching::{ExcludeReason, ExeUsage};
-use stale_core::Hive;
+use stale_core::{Hive, Scope};
 
 use crate::app::Row;
 use crate::{format, strings};
@@ -58,7 +58,10 @@ pub fn details_panel(ui: &mut egui::Ui, row: &Row) {
     let or_dash = |s: Option<String>| s.unwrap_or_else(|| strings::UNKNOWN_VALUE.to_string());
     egui::Grid::new("details_grid").num_columns(2).show(ui, |ui| {
         let location = p.install_location.as_ref().map(|l| l.display().to_string());
-        let key = format!("{}\\{}", hive_label(p.key.hive), p.key.path);
+        let mut key = format!("{}\\{}", hive_label(p.key.hive), p.key.path);
+        if p.scope == Scope::OtherUser {
+            key.push_str(strings::OTHER_USER_SUFFIX);
+        }
         for (label, value) in [
             (strings::DETAIL_LOCATION, or_dash(location)),
             (strings::DETAIL_UNINSTALLER, or_dash(p.uninstall_string.clone())),

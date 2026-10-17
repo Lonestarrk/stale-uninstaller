@@ -56,6 +56,8 @@ pub const NO_SELECTION: &str = "Inget program valt";
 pub const DETAIL_LOCATION: &str = "Plats";
 pub const DETAIL_UNINSTALLER: &str = "Avinstallerare";
 pub const DETAIL_REGISTRY_KEY: &str = "Registernyckel";
+/// Appended to the registry key of a program installed for another account.
+pub const OTHER_USER_SUFFIX: &str = " (annan användare)";
 pub const DETAIL_LAST_USED: &str = "Senast använd";
 pub const UNCERTAIN_FILETIME: &str = " – osäker (filtid)";
 pub const COL_FILE: &str = "Fil";
