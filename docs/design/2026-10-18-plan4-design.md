@@ -1,7 +1,7 @@
 # Stale Uninstaller – design för plan 4
 
 Datum: 2026-10-18
-Status: utkast för godkännande. Licens: MIT (beslutat 2026-10-18).
+Status: godkänd 2026-10-18. Licens: MIT.
 Bygger på: `docs/design/2026-10-17-stale-uninstaller-design.md` (huvuddesignen, plan 1–3 är byggda), `docs/research/2026-10-18-junk-file-catalogue.md` (skräpkatalog med mätningar), `docs/research/2026-10-18-parallel-fs-scan.md`.
 
 ## 1. Avsikt och varför
