@@ -77,6 +77,10 @@ pub struct QueueEntry {
     pub account: Option<String>,
     /// The program's uninstaller executable, from its uninstall command.
     pub uninstall_path: Option<String>,
+    /// Set when other programs probably rely on this one (reason key from the core).
+    pub dependency: Option<&'static str>,
+    /// The user ticked "Jag förstår" for a dependency; reset whenever the dialog opens.
+    pub acknowledged: bool,
 }
 
 /// The summary dialog's state before a queue starts.
@@ -384,8 +388,17 @@ impl StaleApp {
                         .as_deref()
                         .and_then(first_path_in_command)
                         .map(|p| p.display().to_string()),
+                    dependency: stale_core::dependencies::is_shared_dependency(&r.program),
+                    acknowledged: false,
                 },
-                None => QueueEntry { name: id.0.clone(), scope: Scope::Machine, account: None, uninstall_path: None },
+                None => QueueEntry {
+                    name: id.0.clone(),
+                    scope: Scope::Machine,
+                    account: None,
+                    uninstall_path: None,
+                    dependency: None,
+                    acknowledged: false,
+                },
             })
             .collect();
         self.pending =
@@ -400,6 +413,10 @@ impl StaleApp {
     /// Starts the pending queue on a worker thread and closes the summary dialog.
     pub fn start_queue(&mut self) {
         let Some(pending) = self.pending.take() else { return };
+        let flagged: Vec<(bool, bool)> = pending.entries.iter().map(|e| (e.dependency.is_some(), e.acknowledged)).collect();
+        if !crate::flow::dependencies_acknowledged(&flagged) {
+            return;
+        }
         let programs: Vec<Program> = pending
             .ids
             .iter()
@@ -1098,6 +1115,25 @@ mod tests {
         assert_eq!(pending.ids, vec![ProgramId("keep".into())]);
         assert_eq!(pending.mode, UninstallMode::Normal);
         assert!(pending.restore_point && pending.run_vendor);
+    }
+
+    #[test]
+    fn dependency_needs_acknowledgement_also_when_forced_and_resets_on_reopen() {
+        let mut app = StaleApp::empty(Settings::default());
+        let mut git = program("g", false);
+        git.name = "Git".into();
+        app.apply_event(ScanEvent::Programs(vec![program("m", false), git]));
+        app.open_queue_dialog_for(vec![ProgramId("m".into()), ProgramId("g".into())], UninstallMode::Forced);
+        let mut pending = app.pending.take().expect("dialog opened");
+        assert_eq!(pending.entries[0].dependency, None);
+        assert_eq!(pending.entries[1].dependency, Some("toolchain"));
+        pending.entries[1].acknowledged = true;
+        app.pending = Some(pending);
+        app.open_queue_dialog_for(vec![ProgramId("g".into())], UninstallMode::Forced);
+        assert!(!app.pending.as_ref().unwrap().entries[0].acknowledged);
+        // Starting without the acknowledgement does nothing.
+        app.start_queue();
+        assert!(app.flow.is_none());
     }
 
     #[test]

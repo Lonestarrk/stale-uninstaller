@@ -2,6 +2,7 @@
 compile_error!("e2e-overrides is a debug-only feature");
 
 pub mod acl;
+pub mod dependencies;
 pub mod devicepath;
 pub mod fsys;
 pub mod ghosts;

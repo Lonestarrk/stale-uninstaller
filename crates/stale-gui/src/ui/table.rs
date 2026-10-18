@@ -76,7 +76,13 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                     }
                 });
                 table_row.col(|ui| {
-                    ui.label(&row.program.name);
+                    ui.horizontal(|ui| {
+                        ui.label(&row.program.name);
+                        if let Some(reason) = stale_core::dependencies::is_shared_dependency(&row.program) {
+                            ui.small(egui::RichText::new(strings::t().dependency_badge).color(STALE_COLOR))
+                                .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
+                        }
+                    });
                 });
                 table_row.col(|ui| {
                     ui.label(row.program.publisher.as_deref().unwrap_or(strings::t().unknown_value));

@@ -6,6 +6,12 @@ use stale_core::ProgramId;
 
 use crate::warning::{Msg, Warning};
 
+/// True when every flagged item (`(is_dependency, acknowledged)`) has been acknowledged, which
+/// is what enables Starta in the summary dialog.
+pub fn dependencies_acknowledged(items: &[(bool, bool)]) -> bool {
+    items.iter().all(|&(dependency, acknowledged)| !dependency || acknowledged)
+}
+
 /// The queue's current phase, shown as the dialog's step indicator.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
@@ -120,6 +126,15 @@ impl FlowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starta_disabled_until_dependency_acknowledged() {
+        assert!(dependencies_acknowledged(&[]));
+        assert!(dependencies_acknowledged(&[(false, false)]));
+        assert!(!dependencies_acknowledged(&[(false, false), (true, false)]));
+        assert!(!dependencies_acknowledged(&[(true, true), (true, false)]));
+        assert!(dependencies_acknowledged(&[(true, true), (false, false)]));
+    }
 
     fn flow(n: usize) -> FlowState {
         let items: Vec<(ProgramId, String)> =

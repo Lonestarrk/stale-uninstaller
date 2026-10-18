@@ -177,6 +177,14 @@ fn dump_usage(name: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("deps") {
+        for p in enumerate_programs(&WinRegistry) {
+            if let Some(key) = stale_core::dependencies::is_shared_dependency(&p) {
+                println!("{key:9} | {}", p.name);
+            }
+        }
+        return;
+    }
     if args.first().map(String::as_str) == Some("ghosts") {
         dump_ghosts();
         return;

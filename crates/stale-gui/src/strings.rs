@@ -182,6 +182,14 @@ pub struct Strings {
     pub opt_run_vendor: &'static str,
     pub cancel: &'static str,
     pub start: &'static str,
+    /// Badge on a runtime/SDK/developer tool that other programs probably rely on.
+    pub dependency_badge: &'static str,
+    pub dependency_warning: &'static str,
+    /// Per-item acknowledgement checkbox for such a program.
+    pub dependency_understand: &'static str,
+    pub dependency_runtime: &'static str,
+    pub dependency_sdk: &'static str,
+    pub dependency_toolchain: &'static str,
     pub step_restore_point: &'static str,
     pub step_vendor: &'static str,
     pub step_leftovers: &'static str,
@@ -424,6 +432,12 @@ pub static SV: Strings = Strings {
     opt_run_vendor: "Kör programmens egna avinstallerare",
     cancel: "Avbryt",
     start: "Starta",
+    dependency_badge: "används av andra program",
+    dependency_warning: "Detta program används troligen av andra program. Avinstallera bara om du vet att inget behöver det.",
+    dependency_understand: "Jag förstår",
+    dependency_runtime: "körmiljö",
+    dependency_sdk: "utvecklingspaket",
+    dependency_toolchain: "utvecklingsverktyg",
     step_restore_point: "Återställningspunkt",
     step_vendor: "Egen avinstallerare",
     step_leftovers: "Rester",
@@ -644,6 +658,12 @@ pub static EN: Strings = Strings {
     opt_run_vendor: "Run the programs' own uninstallers",
     cancel: "Cancel",
     start: "Start",
+    dependency_badge: "used by other programs",
+    dependency_warning: "Other programs probably rely on this. Only uninstall it if you know nothing needs it.",
+    dependency_understand: "I understand",
+    dependency_runtime: "runtime",
+    dependency_sdk: "SDK",
+    dependency_toolchain: "developer tool",
     step_restore_point: "Restore point",
     step_vendor: "Program's uninstaller",
     step_leftovers: "Leftovers",
@@ -956,6 +976,16 @@ pub fn evidence_key(key: &str) -> String {
     match lang() {
         Lang::Sv => format!("Nyckel: {key}"),
         Lang::En => format!("Key: {key}"),
+    }
+}
+
+/// The hover text for a dependency reason key from `stale_core::dependencies`.
+pub fn dependency_reason_in(lang: Lang, key: &str) -> &'static str {
+    let s = texts(lang);
+    match key {
+        "sdk" => s.dependency_sdk,
+        "toolchain" => s.dependency_toolchain,
+        _ => s.dependency_runtime,
     }
 }
 

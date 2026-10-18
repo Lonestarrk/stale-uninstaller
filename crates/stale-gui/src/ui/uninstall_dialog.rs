@@ -7,7 +7,7 @@ use stale_core::uninstall::{RestorePointStatus, UninstallMode};
 use stale_core::{ProgramId, Scope};
 
 use crate::app::{PendingQueue, StaleApp, View};
-use crate::flow::{FlowState, ItemState, Step};
+use crate::flow::{dependencies_acknowledged, FlowState, ItemState, Step};
 use crate::strings;
 
 /// What a click in the window asks for, applied after drawing.
@@ -53,12 +53,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 /// The summary before starting: names, options, Avbryt / Starta.
 fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-        for entry in &pending.entries {
+        for entry in &mut pending.entries {
             if entry.scope == Scope::OtherUser {
                 ui.label(strings::other_account_item(&entry.name, entry.account.as_deref()));
                 ui.weak(entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
             } else {
                 ui.label(&entry.name);
+            }
+            if let Some(reason) = entry.dependency {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(0xd0, 0x80, 0x20), strings::t().dependency_warning)
+                        .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
+                });
+                ui.checkbox(&mut entry.acknowledged, strings::t().dependency_understand);
             }
         }
     });
@@ -79,7 +86,8 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
         if ui.button(strings::t().cancel).clicked() {
             action = Some(Action::Cancel);
         }
-        if ui.button(strings::t().start).clicked() {
+        let flagged: Vec<(bool, bool)> = pending.entries.iter().map(|e| (e.dependency.is_some(), e.acknowledged)).collect();
+        if ui.add_enabled(dependencies_acknowledged(&flagged), egui::Button::new(strings::t().start)).clicked() {
             action = Some(Action::Start);
         }
     });
