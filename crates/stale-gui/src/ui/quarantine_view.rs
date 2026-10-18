@@ -107,7 +107,7 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
                 row.col(|ui| {
                     ui.label(format::drive_sizes(&m.size_per_drive()));
                 });
-                row.col(|ui| status(ui, &m.failures));
+                row.col(|ui| status(ui, m));
                 row.col(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new(strings::RESTORE)).clicked() {
                         *action = Some(Action::Restore(m.id.clone()));
@@ -120,18 +120,23 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
         });
 }
 
-/// "ok", or "{n} fel" in the warning colour with the failures on hover.
-fn status(ui: &mut egui::Ui, failures: &[Failure]) {
-    if failures.is_empty() {
+/// "ok", or "{n} fel" / "{n} ofullständiga" in the warning colour with the failures on hover.
+fn status(ui: &mut egui::Ui, m: &QuarantineManifest) {
+    if m.failures.is_empty() && m.pending.is_empty() {
         ui.label(strings::STATUS_OK);
         return;
     }
-    let text = failures.iter().map(failure_text).collect::<Vec<_>>().join("\n");
-    ui.colored_label(STALE_COLOR, strings::error_count(failures.len())).on_hover_text(text);
+    if !m.failures.is_empty() {
+        let text = m.failures.iter().map(failure_text).collect::<Vec<_>>().join("\n");
+        ui.colored_label(STALE_COLOR, strings::error_count(m.failures.len())).on_hover_text(text);
+    }
+    if !m.pending.is_empty() {
+        ui.colored_label(STALE_COLOR, strings::incomplete_count(m.pending.len()));
+    }
 }
 
 fn failure_text(f: &Failure) -> String {
-    format!("{}: {}", f.what, f.error)
+    format!("{}: {}", f.what, strings::core_error(&f.error))
 }
 
 /// What the last partial restore could not put back.

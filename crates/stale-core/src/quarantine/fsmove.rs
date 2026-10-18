@@ -55,6 +55,9 @@ pub trait FileMover: Send + Sync {
     fn is_reparse(&self, p: &Path) -> bool;
     /// Deletes a file or folder tree; a missing path is not an error.
     fn remove_all(&self, p: &Path) -> Result<(), String>;
+    /// Deletes the empty folders of the tree at `p`, bottom-up, never following a link (a link or
+    /// any file keeps its folders). True when `p` is gone (or was missing).
+    fn remove_empty_dirs(&self, p: &Path) -> Result<bool, String>;
     /// Whether `<drive>:\` is a writable NTFS volume that can hold a payload root (else use C:).
     fn volume_ok(&self, drive: char) -> bool;
 }
@@ -131,6 +134,27 @@ fn verify_copy(from: &Path, to: &Path) -> Result<(), MoveError> {
     Ok(())
 }
 
+/// See [`FileMover::remove_empty_dirs`].
+fn prune_empty(p: &Path) -> std::io::Result<bool> {
+    let md = match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        r => r?,
+    };
+    if is_reparse(&md) || !md.is_dir() {
+        return Ok(false);
+    }
+    let mut empty = true;
+    for entry in std::fs::read_dir(p)? {
+        if !prune_empty(&entry?.path())? {
+            empty = false;
+        }
+    }
+    if empty {
+        std::fs::remove_dir(p)?;
+    }
+    Ok(empty)
+}
+
 fn remove_any(p: &Path) -> std::io::Result<()> {
     let md = std::fs::symlink_metadata(p)?;
     if md.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
@@ -205,6 +229,10 @@ impl FileMover for RealFileMover {
         }
     }
 
+    fn remove_empty_dirs(&self, p: &Path) -> Result<bool, String> {
+        prune_empty(p).map_err(|e| format!("remove {}: {e}", p.display()))
+    }
+
     fn volume_ok(&self, drive: char) -> bool {
         use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
         use windows::core::PCWSTR;
@@ -241,7 +269,7 @@ pub struct FakeFileMover {
     reparse: Mutex<BTreeMap<String, PathBuf>>,
     /// norm(path) of sources whose move copies but cannot delete the source.
     partial: Mutex<BTreeMap<String, PathBuf>>,
-    /// `"move <from> -> <to>"`, `"remove <p>"`, `"ensure <root>"`.
+    /// `"move <from> -> <to>"`, `"remove <p>"`, `"prune <p>"`, `"ensure <root>"`.
     pub log: Mutex<Vec<String>>,
 }
 
@@ -357,6 +385,21 @@ impl FileMover for FakeFileMover {
         let base = norm(p);
         self.entries.lock().unwrap().retain(|k, _| !under(k, &base));
         Ok(())
+    }
+
+    fn remove_empty_dirs(&self, p: &Path) -> Result<bool, String> {
+        self.log.lock().unwrap().push(format!("prune {}", p.display()));
+        let base = norm(p);
+        let reparse = self.reparse.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap();
+        // Files and links keep every folder above them.
+        let keepers: Vec<String> = entries
+            .iter()
+            .filter(|(k, (_, size))| under(k, &base) && (size.is_some() || reparse.contains_key(*k)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        entries.retain(|k, _| !under(k, &base) || keepers.iter().any(|f| under(f, k)));
+        Ok(keepers.is_empty())
     }
 
     fn volume_ok(&self, drive: char) -> bool {
@@ -560,6 +603,30 @@ mod tests {
         assert_eq!(move_by_copy(&link, &dest), Err(MoveError::LinkInTree(link.clone())));
         assert!(!dest.exists());
         assert!(link.exists());
+    }
+
+    #[test]
+    fn remove_empty_dirs_keeps_files_and_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("id");
+        std::fs::create_dir_all(root.join("C").join("a").join("b")).unwrap();
+        std::fs::create_dir_all(root.join("D").join("x")).unwrap();
+        std::fs::write(root.join("D").join("x").join("keep.txt"), b"k").unwrap();
+        let m = RealFileMover;
+        assert_eq!(m.remove_empty_dirs(&root), Ok(false));
+        assert!(!root.join("C").exists(), "empty branch removed");
+        assert!(root.join("D").join("x").join("keep.txt").exists());
+        std::fs::remove_file(root.join("D").join("x").join("keep.txt")).unwrap();
+        assert_eq!(m.remove_empty_dirs(&root), Ok(true));
+        assert!(!root.exists());
+        assert_eq!(m.remove_empty_dirs(&root), Ok(true), "missing is gone");
+
+        let fake = FakeFileMover::new();
+        fake.add_dir(r"C:\Q\id\C\empty\deeper");
+        fake.add_file(r"C:\Q\id\D\stray.bin", 1);
+        assert_eq!(fake.remove_empty_dirs(Path::new(r"C:\Q\id")), Ok(false));
+        assert!(!fake.exists(Path::new(r"C:\Q\id\C")));
+        assert!(fake.exists(Path::new(r"C:\Q\id\D\stray.bin")));
     }
 
     #[test]

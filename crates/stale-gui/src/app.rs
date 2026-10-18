@@ -845,6 +845,7 @@ mod tests {
             tasks: vec![],
             failures: vec![],
             notes: vec![],
+            pending: vec![],
         }
     }
 

@@ -13,7 +13,8 @@ use chrono::{DateTime, Duration, Utc};
 use super::fsmove::{stored_path_for, FileMover, MoveError, RealFileMover};
 use super::store::{list_trusted_manifests, new_id, owned_by_admins, save_manifest, valid_id};
 use super::{
-    ExportedKey, Failure, MovedItem, QuarantineId, QuarantineManifest, RemovedService, RemovedTask, RemovedValue,
+    ExportedKey, Failure, MovedItem, PendingItem, PendingKind, QuarantineId, QuarantineManifest, RemovedService,
+    RemovedTask, RemovedValue,
 };
 use crate::fsys::{FsReader, RealFs};
 use crate::leftovers::{Leftover, LeftoverKind};
@@ -24,6 +25,10 @@ use crate::registry::{key, RegistryReader, WinRegistry};
 use crate::regwrite::{RegistryWriter, WinRegistryWriter};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+
+/// `Failure::error` for a payload `<id>` folder that still holds files no manifest entry accounts
+/// for after a restore or purge; the folder and the manifest are kept.
+pub const UNKNOWN_CONTENT_LEFT: &str = "unknown-content-left";
 
 /// A system command run on a service or task name.
 pub type NameCommand = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -103,7 +108,7 @@ impl QuarantineOps {
 pub enum QuarantineProgress {
     /// About to handle item `done` (0-based) of `total`.
     Item { done: usize, total: usize, what: String },
-    Finished(QuarantineManifest),
+    Finished(Box<QuarantineManifest>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -170,6 +175,8 @@ struct Run<'a> {
     progress: &'a dyn Fn(QuarantineProgress),
     /// Payload root per target drive, prepared once.
     roots: BTreeMap<char, Result<PathBuf, String>>,
+    /// A save failed: nothing more is touched.
+    broken: bool,
 }
 
 impl Run<'_> {
@@ -182,15 +189,42 @@ impl Run<'_> {
         self.m.failures.push(Failure { what: what.into(), error: error.into() });
     }
 
-    /// Saves the manifest; on failure records `manifest-save-failed` and returns false.
+    /// Saves the manifest; on the first failure records `manifest-save-failed`, and from then on
+    /// returns false without touching anything.
     fn save(&mut self) -> bool {
+        if self.broken {
+            return false;
+        }
         match save_manifest(&self.ops.manifest_dir, &self.m) {
             Ok(()) => true,
             Err(e) => {
+                self.broken = true;
                 self.fail("manifest", format!("manifest-save-failed: {e}"));
                 false
             }
         }
+    }
+
+    /// Records `kind` as pending and saves, before its destructive step runs; false (the step
+    /// must not run) when that save fails.
+    fn begin(&mut self, kind: PendingKind) -> bool {
+        if self.broken {
+            return false;
+        }
+        self.m.pending.push(PendingItem { kind, started: Utc::now() });
+        if self.save() {
+            true
+        } else {
+            self.m.pending.pop();
+            false
+        }
+    }
+
+    /// The step begun last is over: drops its pending record, lets `record` add the outcome, saves.
+    fn end(&mut self, record: impl FnOnce(&mut QuarantineManifest)) {
+        self.m.pending.pop();
+        record(&mut self.m);
+        self.save();
     }
 
     /// Export the service key, then stop and delete the service.
@@ -203,15 +237,19 @@ impl Run<'_> {
                 continue;
             }
             let file = self.folder.join(format!("service-{}.reg", file_safe(name)));
-            let k = key(Hive::LocalMachine, &format!(r"{SERVICES_KEY}\{name}"));
+            let k = service_key(name);
             if let Err(e) = self.ops.regw.export_key(&k, &file) {
                 self.fail(name, e);
                 continue;
             }
-            match (self.ops.stop_service)(name) {
-                Ok(()) => self.m.services.push(RemovedService { name: name.clone(), reg_file: file }),
-                Err(e) => self.fail(name, e),
+            if !self.begin(PendingKind::ServiceExport { name: name.clone(), reg_file: file.clone() }) {
+                continue;
             }
+            let stopped = (self.ops.stop_service)(name);
+            self.end(|m| match stopped {
+                Ok(()) => m.services.push(RemovedService { name: name.clone(), reg_file: file }),
+                Err(error) => m.failures.push(Failure { what: name.clone(), error }),
+            });
         }
     }
 
@@ -235,10 +273,14 @@ impl Run<'_> {
                 self.fail(name, e);
                 continue;
             }
-            match (self.ops.delete_task)(name) {
-                Ok(()) => self.m.tasks.push(RemovedTask { name: name.clone(), xml_backup: backup, original_xml: xml.clone() }),
-                Err(e) => self.fail(name, e),
+            if !self.begin(PendingKind::TaskBackup { name: name.clone(), xml_backup: backup.clone() }) {
+                continue;
             }
+            let deleted = (self.ops.delete_task)(name);
+            self.end(|m| match deleted {
+                Ok(()) => m.tasks.push(RemovedTask { name: name.clone(), xml_backup: backup, original_xml: xml.clone() }),
+                Err(error) => m.failures.push(Failure { what: name.clone(), error }),
+            });
         }
     }
 
@@ -264,10 +306,15 @@ impl Run<'_> {
                     self.fail(what, e);
                     continue;
                 }
-                match self.ops.regw.delete_value(k, name) {
-                    Ok(()) => self.m.values.push(RemovedValue { key: k.clone(), name: name.to_string(), reg_file: file.clone() }),
-                    Err(e) => self.fail(what, e),
+                let pending = PendingKind::ValueExport { key: k.clone(), name: name.to_string(), reg_file: file.clone() };
+                if !self.begin(pending) {
+                    continue;
                 }
+                let deleted = self.ops.regw.delete_value(k, name);
+                self.end(|m| match deleted {
+                    Ok(()) => m.values.push(RemovedValue { key: k.clone(), name: name.to_string(), reg_file: file.clone() }),
+                    Err(error) => m.failures.push(Failure { what, error }),
+                });
             }
         }
     }
@@ -285,10 +332,14 @@ impl Run<'_> {
                 self.fail(what, e);
                 continue;
             }
-            match self.ops.regw.delete_key(key) {
-                Ok(()) => self.m.keys.push(ExportedKey { key: key.clone(), reg_file: file }),
-                Err(e) => self.fail(what, e),
+            if !self.begin(PendingKind::KeyExport { key: key.clone(), reg_file: file.clone() }) {
+                continue;
             }
+            let deleted = self.ops.regw.delete_key(key);
+            self.end(|m| match deleted {
+                Ok(()) => m.keys.push(ExportedKey { key: key.clone(), reg_file: file }),
+                Err(error) => m.failures.push(Failure { what, error }),
+            });
         }
     }
 
@@ -349,14 +400,18 @@ impl Run<'_> {
         }
         let size = self.ops.mover.size_of(original);
         let original = original.to_path_buf();
-        match self.ops.mover.move_path(&original, &stored) {
-            Ok(()) => self.m.moved.push(MovedItem { original, stored, is_dir, size }),
-            Err(MoveError::PartialMove { stored, detail }) => {
-                self.m.moved.push(MovedItem { original, stored, is_dir, size });
-                self.fail(what, format!("partial move: {detail}"));
-            }
-            Err(e) => self.fail(what, e.to_string()),
+        if !self.begin(PendingKind::Move { original: original.clone(), stored: stored.clone() }) {
+            return;
         }
+        let moved = self.ops.mover.move_path(&original, &stored);
+        self.end(|m| match moved {
+            Ok(()) => m.moved.push(MovedItem { original, stored, is_dir, size }),
+            Err(MoveError::PartialMove { stored, detail }) => {
+                m.moved.push(MovedItem { original, stored, is_dir, size });
+                m.failures.push(Failure { what, error: format!("partial move: {detail}") });
+            }
+            Err(e) => m.failures.push(Failure { what, error: e.to_string() }),
+        });
     }
 }
 
@@ -402,8 +457,9 @@ fn check_trusted(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), String> {
 }
 
 /// Quarantines `items` in the order services, tasks, registry values, registry keys, shortcuts,
-/// files/folders. Every failure is recorded in the manifest and the rest continues; the manifest
-/// is saved before anything is touched and after each group (a failed save stops further groups).
+/// files/folders. Every failure is recorded in the manifest and the rest continues. The manifest
+/// is saved before anything is touched, with a pending record before each destructive step and
+/// with its outcome after it; a failed save stops everything after it.
 /// Files, folders and shortcuts inside a listed folder go along with that folder.
 pub fn quarantine(
     ops: &QuarantineOps,
@@ -427,15 +483,24 @@ pub fn quarantine(
         tasks: vec![],
         failures: vec![],
         notes: vec![],
+        pending: vec![],
     };
-    let mut run =
-        Run { ops, m, folder: ops.manifest_dir.join(&id.0), done: 0, total: items.len(), progress, roots: BTreeMap::new() };
+    let mut run = Run {
+        ops,
+        m,
+        folder: ops.manifest_dir.join(&id.0),
+        done: 0,
+        total: items.len(),
+        progress,
+        roots: BTreeMap::new(),
+        broken: false,
+    };
     if let Err(e) = secure_manifest_dir(ops).and_then(|()| save_manifest(&ops.manifest_dir, &run.m)) {
         // Without a manifest nothing could be restored, so nothing is touched.
         for it in items {
             run.fail(describe(&it.kind), format!("manifest could not be saved: {e}"));
         }
-        progress(QuarantineProgress::Finished(run.m.clone()));
+        progress(QuarantineProgress::Finished(Box::new(run.m.clone())));
         return run.m;
     }
     let covered = covered_by_listed_dir(items);
@@ -460,7 +525,7 @@ pub fn quarantine(
             break;
         }
     }
-    progress(QuarantineProgress::Finished(run.m.clone()));
+    progress(QuarantineProgress::Finished(Box::new(run.m.clone())));
     run.m
 }
 
@@ -605,9 +670,11 @@ fn restore_services(
     kept
 }
 
-/// Puts a quarantine back: files/shortcuts, then registry keys/values, tasks, services. Items that
-/// cannot go back stay in the (re-saved) manifest; once nothing is left the manifest folder and the
-/// payload folders are deleted. A full restore drops the manifest, so callers that want to say
+/// Puts a quarantine back: files/shortcuts, then registry keys/values, tasks, services (pending
+/// steps included, see [`adopt_pending`]). Items that cannot go back stay in the (re-saved)
+/// manifest; once nothing is left the known payload paths, the payload folders left empty and the
+/// manifest folder are deleted (a payload folder holding anything unknown keeps the manifest and
+/// is reported as [`UNKNOWN_CONTENT_LEFT`]). A full restore drops the manifest, so callers that want to say
 /// "restored services need a reboot" look at `m.services`. A quarantine folder not owned by
 /// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
 pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
@@ -617,6 +684,7 @@ pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
     if let Err(error) = secure_manifest_dir(ops).and_then(|()| check_trusted(ops, &m.id)) {
         return RestoreOutcome::Partial(vec![Failure { what: "manifest".to_string(), error }]);
     }
+    let m = &adopt_pending(ops, m);
     let mut failures = Vec::new();
     let mut left = m.clone();
     left.moved = restore_moved(ops, &m.id, &m.moved, &mut failures);
@@ -631,15 +699,19 @@ pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
         && left.tasks.is_empty()
         && left.services.is_empty();
     if nothing_left {
-        for dir in payload_dirs(ops, &m.id) {
-            if let Err(e) = ops.mover.remove_all(&dir) {
-                log::warn!("quarantine {}: removing {}: {e}", m.id.0, dir.display());
+        // Copies left behind by a partial move back are known; anything else stays.
+        let known: Vec<PathBuf> = m.moved.iter().map(|i| i.stored.clone()).collect();
+        let left_over = clean_payload(ops, &m.id, &known);
+        if left_over.is_empty() {
+            if let Err(e) = remove_manifest_folder(ops, &m.id) {
+                log::warn!("quarantine {}: {e}", m.id.0);
             }
+            return if failures.is_empty() { RestoreOutcome::Restored } else { RestoreOutcome::Partial(failures) };
         }
-        if let Err(e) = remove_manifest_folder(ops, &m.id) {
-            log::warn!("quarantine {}: {e}", m.id.0);
-        }
-    } else if let Err(error) = save_manifest(&ops.manifest_dir, &left) {
+        add_new(&mut left.failures, &left_over);
+        failures.extend(left_over);
+    }
+    if let Err(error) = save_manifest(&ops.manifest_dir, &left) {
         failures.push(Failure { what: "manifest".to_string(), error });
     }
     if failures.is_empty() { RestoreOutcome::Restored } else { RestoreOutcome::Partial(failures) }
@@ -654,9 +726,11 @@ fn remove_manifest_folder(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), 
     }
 }
 
-/// Deletes the payload folders and then the manifest folder for good. If a payload folder cannot
-/// be deleted the manifest is kept, so nothing is orphaned and the purge can be retried. A quarantine
-/// folder not owned by Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
+/// Deletes the known stored paths (moved items and pending moves), the payload folders left empty,
+/// and then the manifest folder for good. If anything cannot be deleted, or a payload folder holds
+/// anything unknown ([`UNKNOWN_CONTENT_LEFT`], recorded in the manifest), the manifest is kept, so
+/// nothing is orphaned and the purge can be retried. A quarantine folder not owned by
+/// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
 pub fn purge(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
     secure_manifest_dir(ops)?;
     purge_secured(ops, m)
@@ -667,11 +741,100 @@ fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), Stri
         return Err(format!("invalid quarantine id {:?}", m.id.0));
     }
     check_trusted(ops, &m.id)?;
-    let errors: Vec<String> = payload_dirs(ops, &m.id).iter().filter_map(|d| ops.mover.remove_all(d).err()).collect();
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
+    let mut kept = adopt_pending(ops, m);
+    let known: Vec<PathBuf> = kept.moved.iter().map(|i| i.stored.clone()).collect();
+    let left_over = clean_payload(ops, &m.id, &known);
+    if !left_over.is_empty() {
+        // What was deleted is no longer listed.
+        kept.moved.retain(|i| ops.mover.exists(&i.stored));
+        add_new(&mut kept.failures, &left_over);
+        if let Err(e) = save_manifest(&ops.manifest_dir, &kept) {
+            log::warn!("quarantine {}: {e}", m.id.0);
+        }
+        return Err(left_over.iter().map(|f| format!("{}: {}", f.error, f.what)).collect::<Vec<_>>().join("; "));
     }
     remove_manifest_folder(ops, &m.id)
+}
+
+/// Appends each of `new` that `list` does not hold yet.
+fn add_new(list: &mut Vec<Failure>, new: &[Failure]) {
+    for f in new {
+        if !list.contains(f) {
+            list.push(f.clone());
+        }
+    }
+}
+
+/// `m` with its pending steps turned into ordinary entries wherever the step may have happened:
+/// a move whose stored path exists is a moved item; a key, value or service export whose backup
+/// exists while the key/value/service is gone is an exported item; a task backup that exists is
+/// a removed task. Pending steps that cannot have happened are dropped.
+fn adopt_pending(ops: &QuarantineOps, m: &QuarantineManifest) -> QuarantineManifest {
+    let mut out = m.clone();
+    out.pending.clear();
+    for p in &m.pending {
+        match &p.kind {
+            PendingKind::Move { original, stored } if ops.mover.exists(stored) => out.moved.push(MovedItem {
+                original: original.clone(),
+                stored: stored.clone(),
+                is_dir: false,
+                size: ops.mover.size_of(stored),
+            }),
+            PendingKind::KeyExport { key, reg_file } if reg_file.is_file() && !ops.reg.key_exists(key) => {
+                out.keys.push(ExportedKey { key: key.clone(), reg_file: reg_file.clone() })
+            }
+            PendingKind::ValueExport { key, name, reg_file } if reg_file.is_file() && !value_exists(ops, key, name) => {
+                out.values.push(RemovedValue { key: key.clone(), name: name.clone(), reg_file: reg_file.clone() })
+            }
+            PendingKind::ServiceExport { name, reg_file } if reg_file.is_file() && !service_exists(ops, name) => {
+                out.services.push(RemovedService { name: name.clone(), reg_file: reg_file.clone() })
+            }
+            PendingKind::TaskBackup { name, xml_backup } if xml_backup.is_file() => out.tasks.push(RemovedTask {
+                name: name.clone(),
+                xml_backup: xml_backup.clone(),
+                original_xml: PathBuf::new(),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn value_exists(ops: &QuarantineOps, k: &RegKeyPath, name: &str) -> bool {
+    ops.reg.values(k).is_ok_and(|vals| vals.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)))
+}
+
+fn service_key(name: &str) -> RegKeyPath {
+    key(Hive::LocalMachine, &format!(r"{SERVICES_KEY}\{name}"))
+}
+
+fn service_exists(ops: &QuarantineOps, name: &str) -> bool {
+    ops.reg.key_exists(&service_key(name))
+}
+
+/// Removes the `known` stored paths below each payload `<id>` folder (never through a link), then
+/// the folders left empty bottom-up. Returns one [`UNKNOWN_CONTENT_LEFT`] failure per payload
+/// folder that still holds anything (it is kept), and any removal error.
+fn clean_payload(ops: &QuarantineOps, id: &QuarantineId, known: &[PathBuf]) -> Vec<Failure> {
+    let mut failures = Vec::new();
+    for dir in payload_dirs(ops, id) {
+        let root = dir.parent().unwrap_or(&dir);
+        for k in known.iter().filter(|k| is_under(k, &dir) && ops.mover.exists(k)) {
+            if let Some(p) = reparse_in_chain(ops.mover.as_ref(), root, k) {
+                log::warn!("quarantine {}: not removing {}: reparse point {}", id.0, k.display(), p.display());
+                continue;
+            }
+            if let Err(error) = ops.mover.remove_all(k) {
+                failures.push(Failure { what: k.display().to_string(), error });
+            }
+        }
+        match ops.mover.remove_empty_dirs(&dir) {
+            Ok(true) => {}
+            Ok(false) => failures.push(Failure { what: dir.display().to_string(), error: UNKNOWN_CONTENT_LEFT.to_string() }),
+            Err(error) => failures.push(Failure { what: dir.display().to_string(), error }),
+        }
+    }
+    failures
 }
 
 /// Purges every quarantine created more than `days` days before `now`; `0` turns this off.
@@ -706,6 +869,7 @@ mod tests {
     use crate::model::Hive;
     use crate::quarantine::fsmove::FakeFileMover;
     use crate::quarantine::store::{list_manifests, new_id};
+    use crate::quarantine::{PendingItem, PendingKind};
     use crate::quarantine::{ExportedKey, MovedItem, RemovedService, RemovedTask, RemovedValue};
     use crate::registry::{key, FakeRegistry};
     use crate::regwrite::FakeRegistryWriter;
@@ -998,7 +1162,7 @@ mod tests {
                 ensure_manifest_dir(&e),
                 format!(r"move {} -> C:\Apps\Foo", stored('C', &m, r"C\Apps\Foo").display()),
                 format!(r"move {} -> C:\Users\A\Desktop\Foo.lnk", stored('C', &m, r"C\Users\A\Desktop\Foo.lnk").display()),
-                format!(r"remove C:\Stale Uninstaller\quarantine\{}", m.id.0),
+                format!(r"prune C:\Stale Uninstaller\quarantine\{}", m.id.0),
             ]
         );
         let import = |f: &str| format!("import {}", mdir.join(f).display());
@@ -1033,8 +1197,6 @@ mod tests {
         e.mover.add_file(r"D:\Games\Foo\a.pak", 5);
         e.mover.add_file(r"C:\Apps\Foo\b.dll", 1);
         let m = run(&e, &[dir_item(r"D:\Games\Foo"), dir_item(r"C:\Apps\Foo"), key_item(r"SOFTWARE\Foo")]);
-        // A payload folder on a drive the manifest does not mention is purged too.
-        e.mover.add_file(&format!(r"F:\Stale Uninstaller\quarantine\{}\stray.bin", m.id.0), 1);
         e.mover.log.lock().unwrap().clear();
 
         purge(&e.ops, &m).unwrap();
@@ -1042,9 +1204,10 @@ mod tests {
             *e.mover.log.lock().unwrap(),
             vec![
                 ensure_manifest_dir(&e),
-                format!(r"remove C:\Stale Uninstaller\quarantine\{}", m.id.0),
-                format!(r"remove D:\Stale Uninstaller\quarantine\{}", m.id.0),
-                format!(r"remove F:\Stale Uninstaller\quarantine\{}", m.id.0),
+                format!(r"remove {}", stored('C', &m, r"C\Apps\Foo").display()),
+                format!(r"prune C:\Stale Uninstaller\quarantine\{}", m.id.0),
+                format!(r"remove {}", stored('D', &m, r"D\Games\Foo").display()),
+                format!(r"prune D:\Stale Uninstaller\quarantine\{}", m.id.0),
             ]
         );
         assert!(m.moved.iter().all(|i| !e.mover.exists(&i.stored) && !e.mover.exists(&i.original)));
@@ -1288,5 +1451,90 @@ mod tests {
         assert!(!e.mover.exists(&old.moved[0].stored));
         assert!(e.mover.exists(&planted.moved[0].stored), "untrusted quarantine is left alone");
         assert_eq!(list_manifests(e.dir.path()), vec![planted]);
+    }
+
+    #[test]
+    fn crash_between_move_and_record_is_recoverable() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\a.dll", 4);
+        let done = run(&e, &[dir_item(r"C:\Apps\Foo")]);
+        // As if the process died after the move but before its outcome was saved.
+        let mut crashed = done.clone();
+        let item = crashed.moved.pop().unwrap();
+        crashed.pending.push(PendingItem {
+            kind: PendingKind::Move { original: item.original.clone(), stored: item.stored.clone() },
+            started: now(),
+        });
+        // A pending move that never happened (nothing stored) is simply dropped.
+        crashed.pending.push(PendingItem {
+            kind: PendingKind::Move { original: PathBuf::from(r"C:\Apps\Bar"), stored: stored('C', &done, r"C\Apps\Bar") },
+            started: now(),
+        });
+        save_manifest(e.dir.path(), &crashed).unwrap();
+        assert_eq!(list_manifests(e.dir.path())[0].pending.len(), 2, "pending survives a reload");
+
+        assert_eq!(restore(&e.ops, &crashed), RestoreOutcome::Restored);
+        assert!(exists(&e, r"C:\Apps\Foo\a.dll"));
+        assert!(!e.mover.exists(&item.stored));
+        assert!(list_manifests(e.dir.path()).is_empty());
+    }
+
+    #[test]
+    fn pending_record_is_saved_before_each_destructive_step() {
+        let mut e = env(FakeFs::new());
+        let dir = e.dir.path().to_path_buf();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        e.ops.stop_service = Box::new(move |_| {
+            seen2.lock().unwrap().extend(list_manifests(&dir).into_iter().flat_map(|m| m.pending));
+            Ok(())
+        });
+        let m = run(&e, &[service_item("FooSvc")]);
+        let reg_file = e.dir.path().join(&m.id.0).join("service-FooSvc.reg");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, PendingKind::ServiceExport { name: "FooSvc".to_string(), reg_file });
+        assert!(m.pending.is_empty());
+        assert!(list_manifests(e.dir.path())[0].pending.is_empty(), "the outcome replaces the pending record");
+        assert_eq!(m.services.len(), 1);
+    }
+
+    #[test]
+    fn purge_keeps_unknown_payload() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\a.dll", 4);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
+        let dir = PathBuf::from(format!(r"C:\Stale Uninstaller\quarantine\{}", m.id.0));
+        e.mover.add_file(dir.join("stray.bin").to_str().unwrap(), 1);
+
+        let err = purge(&e.ops, &m).unwrap_err();
+        assert_eq!(err, format!("{UNKNOWN_CONTENT_LEFT}: {}", dir.display()));
+        assert!(!e.mover.exists(&m.moved[0].stored), "the known payload is gone");
+        assert!(e.mover.exists(&dir.join("stray.bin")), "the unknown file is untouched");
+        assert!(!e.mover.log.lock().unwrap().iter().any(|l| *l == format!("remove {}", dir.display())), "never removed wholesale");
+        let kept = list_manifests(e.dir.path());
+        assert_eq!(kept.len(), 1, "manifest kept");
+        assert_eq!(kept[0].failures, vec![fail(&dir.display().to_string(), UNKNOWN_CONTENT_LEFT)]);
+
+        // A retry reports it again without piling up failures; a restore keeps it too.
+        assert!(purge(&e.ops, &kept[0]).is_err());
+        assert_eq!(list_manifests(e.dir.path())[0].failures.len(), 1);
+        assert_eq!(
+            restore(&e.ops, &kept[0]),
+            RestoreOutcome::Partial(vec![fail(&dir.display().to_string(), UNKNOWN_CONTENT_LEFT)])
+        );
+        assert!(e.mover.exists(&dir.join("stray.bin")));
+        assert_eq!(list_manifests(e.dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn failed_export_skips_delete() {
+        let e = env(FakeFs::new());
+        e.regw.fail_on.lock().unwrap().push(r"export HKLM\SOFTWARE\Foo".to_string());
+        e.regw.fail_on.lock().unwrap().push(format!(r"export HKCU\{RUN}"));
+        let m = run(&e, &[key_item(r"SOFTWARE\Foo"), value_item("Foo")]);
+        assert!(!e.regw.log.lock().unwrap().iter().any(|l| l.starts_with("delete")), "{:?}", e.regw.log.lock().unwrap());
+        assert!(m.keys.is_empty() && m.values.is_empty() && m.pending.is_empty());
+        assert_eq!(m.failures.len(), 2, "{:?}", m.failures);
     }
 }

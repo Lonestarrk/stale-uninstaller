@@ -189,3 +189,48 @@ pub fn purge_all_confirm(size: &str) -> String {
 pub fn error_count(n: usize) -> String {
     format!("{n} fel")
 }
+
+pub const UNKNOWN_CONTENT_LEFT: &str = "Okänt innehåll kvar i karantänmappen – lämnas orört";
+
+/// A quarantine's status column: "1 ofullständiga" (steps started but never recorded as done).
+pub fn incomplete_count(n: usize) -> String {
+    format!("{n} ofullständiga")
+}
+
+/// A core error code (a quarantine `Failure::error`) in Swedish; other text as it is.
+pub fn core_error(error: &str) -> String {
+    match error {
+        stale_core::quarantine::UNKNOWN_CONTENT_LEFT => UNKNOWN_CONTENT_LEFT.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A purge error: each `"; "`-separated `"<code>: <what>"` part with a known code becomes
+/// `"<what>: <text>"`; other parts stay as they are.
+pub fn purge_error(e: &str) -> String {
+    e.split("; ")
+        .map(|part| match part.split_once(": ") {
+            Some((code, what)) if code == stale_core::quarantine::UNKNOWN_CONTENT_LEFT => {
+                format!("{what}: {UNKNOWN_CONTENT_LEFT}")
+            }
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_error_translates_known_codes() {
+        assert_eq!(
+            purge_error(r"unknown-content-left: C:\Stale Uninstaller\quarantine\x; access denied"),
+            format!(r"C:\Stale Uninstaller\quarantine\x: {UNKNOWN_CONTENT_LEFT}; access denied")
+        );
+        assert_eq!(core_error("unknown-content-left"), UNKNOWN_CONTENT_LEFT);
+        assert_eq!(core_error("something else"), "something else");
+        assert_eq!(incomplete_count(2), "2 ofullständiga");
+    }
+}

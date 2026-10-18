@@ -177,7 +177,12 @@ pub fn spawn_purge(ids: Vec<QuarantineId>) -> Receiver<QuarantineAdminEvent> {
                     }
                     Err(e) => {
                         log::warn!("purge of quarantine {}: {e}", id.0);
-                        QuarantineAdminEvent::Failed(format!("{} ({}): {e}", strings::PURGE_FAILED, m.program_name))
+                        QuarantineAdminEvent::Failed(format!(
+                            "{} ({}): {}",
+                            strings::PURGE_FAILED,
+                            m.program_name,
+                            strings::purge_error(&e)
+                        ))
                     }
                 },
                 None => QuarantineAdminEvent::Failed(format!("{}: {}", strings::QUARANTINE_ENTRY_MISSING, id.0)),

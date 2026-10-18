@@ -4,7 +4,7 @@ pub mod fsmove;
 pub mod ops;
 pub mod store;
 
-pub use ops::{auto_purge, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
+pub use ops::{auto_purge, UNKNOWN_CONTENT_LEFT, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
 pub use store::{list_manifests, list_trusted_manifests, manifest_path, new_id, owned_by_admins};
 
 use std::collections::BTreeMap;
@@ -65,6 +65,29 @@ pub struct Failure {
     pub error: String,
 }
 
+/// A destructive step that was about to run when the manifest was last saved.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PendingKind {
+    /// A file, folder or shortcut being moved from `original` to `stored`.
+    Move { original: PathBuf, stored: PathBuf },
+    /// A key exported to `reg_file`, being deleted.
+    KeyExport { key: RegKeyPath, reg_file: PathBuf },
+    /// Value `name` of `key` (whose export is `reg_file`), being deleted.
+    ValueExport { key: RegKeyPath, name: String, reg_file: PathBuf },
+    /// A service exported to `reg_file`, being stopped and deleted.
+    ServiceExport { name: String, reg_file: PathBuf },
+    /// A task backed up to `xml_backup`, being deleted.
+    TaskBackup { name: String, xml_backup: PathBuf },
+}
+
+/// Recorded (and saved) before a destructive step and replaced by its outcome after it, so a
+/// crash in between leaves a trace that restore and purge can act on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingItem {
+    pub kind: PendingKind,
+    pub started: DateTime<Utc>,
+}
+
 /// Everything one quarantine did, enough to restore or purge it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QuarantineManifest {
@@ -80,6 +103,9 @@ pub struct QuarantineManifest {
     /// Language-free notes for the GUI, e.g. `"service-needs-reboot:<name>"` after a restore.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Steps started but not recorded as done or failed (a crash or a failed save in between).
+    #[serde(default)]
+    pub pending: Vec<PendingItem>,
 }
 
 impl QuarantineManifest {
@@ -130,6 +156,7 @@ mod tests {
             tasks: vec![],
             failures: vec![],
             notes: vec![],
+            pending: vec![],
         };
         let per = m.size_per_drive();
         assert_eq!(per.into_iter().collect::<Vec<_>>(), vec![('C', 25), ('D', 100), ('E', 7)]);
