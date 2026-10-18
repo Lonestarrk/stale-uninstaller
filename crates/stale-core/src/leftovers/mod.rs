@@ -2,6 +2,7 @@
 
 pub mod fs_scan;
 pub mod names;
+pub mod reg_scan;
 
 use crate::model::{Program, RegKeyPath};
 use serde::{Deserialize, Serialize};
