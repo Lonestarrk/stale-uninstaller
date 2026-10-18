@@ -63,10 +63,9 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
                 ui.label(&entry.name);
             }
             if let Some(reason) = entry.dependency {
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(0xd0, 0x80, 0x20), strings::t().dependency_warning)
-                        .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
-                });
+                // Wraps in the window's width; the table badge's warning colour.
+                ui.add(egui::Label::new(egui::RichText::new(strings::t().dependency_warning).color(STALE_COLOR)).wrap())
+                    .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
                 ui.checkbox(&mut entry.acknowledged, strings::t().dependency_understand);
             }
         }

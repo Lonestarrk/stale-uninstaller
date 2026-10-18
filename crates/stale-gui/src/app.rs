@@ -480,11 +480,13 @@ impl StaleApp {
 
     /// Starts the pending queue on a worker thread and closes the summary dialog.
     pub fn start_queue(&mut self) {
-        let Some(pending) = self.pending.take() else { return };
+        // Checked before taking it: a refused start leaves the dialog open.
+        let Some(pending) = self.pending.as_ref() else { return };
         let flagged: Vec<(bool, bool)> = pending.entries.iter().map(|e| (e.dependency.is_some(), e.acknowledged)).collect();
         if !crate::flow::dependencies_acknowledged(&flagged) {
             return;
         }
+        let Some(pending) = self.pending.take() else { return };
         let programs: Vec<Program> = pending
             .ids
             .iter()
@@ -1298,9 +1300,10 @@ mod tests {
         app.pending = Some(pending);
         app.open_queue_dialog_for(vec![ProgramId("g".into())], UninstallMode::Forced);
         assert!(!app.pending.as_ref().unwrap().entries[0].acknowledged);
-        // Starting without the acknowledgement does nothing.
+        // Starting without the acknowledgement does nothing, and the dialog stays open.
         app.start_queue();
         assert!(app.flow.is_none());
+        assert!(app.pending.is_some(), "a rejected start keeps the dialog");
     }
 
     #[test]
