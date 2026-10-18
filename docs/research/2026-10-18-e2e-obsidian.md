@@ -199,3 +199,137 @@ no `%LOCALAPPDATA%\Programs\Obsidian`, no shortcuts, no ProgIDs. Still on disk:
    `name_matches_exact` (`fs_scan.rs:119`) does not accept `<name>-updater`.
 3. Extension keys whose default value names a ProgID that was removed (`.canvas` → `Obsidian Canvas`)
    are not reported (`reg_scan.rs:222` only matches keys whose command refers to the program).
+
+## Run 3: `e2e Obsidian --vendor-silent` after Task 6c
+
+Task 6c closed the three gaps: `ProgramHint::effective_install_dir` derives the install folder
+from the uninstaller's folder when `InstallLocation` is missing (gap 1), `name_matches_suffixed`
+lists `<name>-updater`-style folders as Medium `suffix-match` (gap 2), and registry rule (c) lists
+extension keys whose ProgID's first token (split at `.` and whitespace) names the program as
+Medium `progid-of-program` (gap 3). Obsidian was reinstalled with
+`winget install --id Obsidian.Obsidian -e --scope user` and the example run with
+`cargo run -p stale-core --features e2e-overrides --example e2e -- Obsidian --vendor-silent`
+(same overrides as above). Full log:
+
+```
+data dir: C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data
+manifest dir: C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine
+payload root C: C:\Stale Uninstaller\quarantine
+
+== 1. enumerate programs
+  name: Obsidian
+  key: HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\bd400747-f0c1-5638-a859-982036102edf (scope CurrentUser)
+  install_location: None
+  uninstall_string: Some("\"C:\\Users\\Jimmy\\AppData\\Local\\Programs\\Obsidian\\Uninstall Obsidian.exe\" /currentuser")
+  => 1 enumerate: PASS Obsidian
+
+== 2. leftover scan (before uninstall)
+  [x] High   Dir      C:\Users\Jimmy\AppData\Local\Programs\Obsidian | 387.6 MB | 
+  [x] High   RegKey   HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\bd400747-f0c1-5638-a859-982036102edf | - | 
+  [x] High   RegKey   HKCU\Software\Classes\Markdown | - | 
+  [x] High   RegKey   HKCU\Software\Classes\Obsidian Base | - | 
+  [x] High   RegKey   HKCU\Software\Classes\Obsidian Canvas | - | 
+  [x] High   RegKey   HKCU\Software\Classes\PDF | - | 
+  [x] High   Shortcut C:\Users\Jimmy\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Obsidian.lnk -> C:\Users\Jimmy\AppData\Local\Programs\Obsidian\Obsidian.exe | - | 
+  [x] High   Shortcut C:\Users\Jimmy\Desktop\Obsidian.lnk -> C:\Users\Jimmy\AppData\Local\Programs\Obsidian\Obsidian.exe | - | 
+  [x] Medium Dir      C:\Users\Jimmy\AppData\Local\obsidian-updater | 325.5 MB | suffix-match
+  [x] Medium RegKey   HKCU\Software\Classes\.base | - | progid-of-program
+  [x] Medium RegKey   HKCU\Software\Classes\.canvas | - | progid-of-program
+  --- 8 High, 3 Medium, 0 Low
+  => 2 scan before: PASS 11 items
+
+== plan
+  3. run vendor uninstaller: Some(["C:\\Users\\Jimmy\\AppData\\Local\\Programs\\Obsidian\\Uninstall Obsidian.exe", "/currentuser", "/S"])
+  4. scan again; 5. quarantine the default-checked items; 6. verify;
+  7. restore + verify; 8. quarantine again + purge + verify
+  starting in 3 s ...
+
+== 3. vendor uninstaller
+  exit: Ok(0); Uninstalled
+  => 3 vendor: PASS Uninstalled, exit Ok(0)
+
+== 4. leftover scan (after uninstall)
+  [x] Medium Dir      C:\Users\Jimmy\AppData\Local\obsidian-updater | 325.5 MB | suffix-match
+  [x] Medium RegKey   HKCU\Software\Classes\.base | - | progid-of-program
+  [x] Medium RegKey   HKCU\Software\Classes\.canvas | - | progid-of-program
+  --- 0 High, 3 Medium, 0 Low
+  => 4 scan after: PASS 3 items, 3 default-checked
+
+== 5. quarantine
+  finished: 1 moved, 0 failures
+  manifest 20261018-081514-499d for "Obsidian"
+  manifest path: C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081514-499d\manifest.json
+  moved (1):
+    C:\Users\Jimmy\AppData\Local\obsidian-updater -> C:\Stale Uninstaller\quarantine\20261018-081514-499d\C\Users\Jimmy\AppData\Local\obsidian-updater (dir, 325.5 MB)
+  keys (2):
+    HKCU\Software\Classes\.base -> C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081514-499d\key-0.reg
+    HKCU\Software\Classes\.canvas -> C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081514-499d\key-1.reg
+  values (0):
+  services: 0, tasks: 0, pending: 0
+  failures (0):
+  size on C: 325.5 MB
+  => 5 quarantine: PASS 1 moved, 2 keys, 0 values, 0 failures
+
+== 6. verify quarantine
+  => 6 verify quarantine: PASS 0 problems
+
+== 7. restore
+  outcome: Restored
+  => 7 restore: PASS 0 problems
+
+== 8. quarantine again + purge
+  3 of 3 items still exist
+  finished: 1 moved, 0 failures
+  manifest 20261018-081515-6cd3 for "Obsidian"
+  manifest path: C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081515-6cd3\manifest.json
+  moved (1):
+    C:\Users\Jimmy\AppData\Local\obsidian-updater -> C:\Stale Uninstaller\quarantine\20261018-081515-6cd3\C\Users\Jimmy\AppData\Local\obsidian-updater (dir, 325.5 MB)
+  keys (2):
+    HKCU\Software\Classes\.base -> C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081515-6cd3\key-0.reg
+    HKCU\Software\Classes\.canvas -> C:\Users\Jimmy\AppData\Local\Temp\stale-e2e-data\quarantine\20261018-081515-6cd3\key-1.reg
+  values (0):
+  services: 0, tasks: 0, pending: 0
+  failures (0):
+  size on C: 325.5 MB
+  purge: Ok(())
+  => 8 quarantine+purge: PASS 0 problems
+
+== result
+PASS 1 enumerate: Obsidian
+PASS 2 scan before: 11 items
+PASS 3 vendor: Uninstalled, exit Ok(0)
+PASS 4 scan after: 3 items, 3 default-checked
+PASS 5 quarantine: 1 moved, 2 keys, 0 values, 0 failures
+PASS 6 verify quarantine: 0 problems
+PASS 7 restore: 0 problems
+PASS 8 quarantine+purge: 0 problems
+```
+
+The first scan now lists the install folder as High (from the uninstaller's folder), both
+`Obsidian.lnk` as High, `obsidian-updater` (325.5 MB) as Medium and `.canvas`/`.base` as Medium.
+The NSIS uninstaller again removed the folder, the shortcuts and the four ProgIDs itself, so the
+second scan holds `obsidian-updater`, `.canvas` and `.base`; all three went through quarantine,
+restore, quarantine and purge.
+
+Not found, by design: `.md` (default `Markdown`) and `.pdf` (default `PDF`). Their ProgIDs are
+generic names that do not name Obsidian, and once the uninstaller has removed the ProgIDs nothing
+ties the extensions to it. `.md` also holds `shellex\{8895b1c6-…}` = `{45769bcc-…}`, a preview
+handler registered by another program (PowerToys' Markdown preview), so removing the whole key
+would have broken that program; it is left alone.
+
+After run 3: `winget list --id Obsidian.Obsidian` → "No installed package found"; no uninstall
+key, no `%LOCALAPPDATA%\Programs\Obsidian`, no `%LOCALAPPDATA%\obsidian-updater`, no shortcuts, no
+`Markdown`/`PDF`/`Obsidian Canvas`/`Obsidian Base` ProgIDs, no `.canvas`/`.base`; `.md` and `.pdf`
+remain (see above). The manifest and payload folders were purged;
+`%LOCALAPPDATA%\Temp\stale-e2e-data` was deleted afterwards.
+
+| Step | Run 3 (vendor `/S`, Task 6c) |
+|---|---|
+| 1 enumerate | PASS |
+| 2 scan before | PASS (11 items: 8 High incl. folder + 2 shortcuts, 3 Medium) |
+| 3 vendor uninstaller | PASS (Uninstalled, exit 0) |
+| 4 scan after | PASS (3 Medium: `obsidian-updater`, `.base`, `.canvas`) |
+| 5 quarantine | PASS (1 dir 325.5 MB, 2 keys, 0 failures) |
+| 6 verify quarantine | PASS |
+| 7 restore + verify | PASS (Restored) |
+| 8 quarantine again + purge + verify | PASS |
