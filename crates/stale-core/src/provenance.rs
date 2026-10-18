@@ -55,8 +55,27 @@ pub const OS_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
 /// Publishers whose programs come preinstalled on their machines.
 const OEM_PUBLISHERS: [&str; 10] = ["asus", "asustek", "dell", "hp", "lenovo", "acer", "msi", "micro-star", "gigabyte", "razer"];
-/// Publishers whose programs are driver packages.
+/// Hardware vendors; their programs are drivers only when named like one (see [`is_driver`]).
 const DRIVER_PUBLISHERS: [&str; 6] = ["nvidia", "amd", "advanced micro devices", "intel", "realtek", "creative"];
+/// Lowercased name fragments that make any program a driver package.
+const DRIVER_WORDS: [&str; 4] = ["driver", "drivrutin", "treiber", "pilote"];
+/// Lowercased name fragments that make a hardware vendor's program a driver package.
+const VENDOR_DRIVER_WORDS: [&str; 14] = [
+    "chipset",
+    "audio",
+    "graphics",
+    "grafik",
+    "ethernet",
+    "wireless",
+    "wi-fi",
+    "bluetooth",
+    "management engine",
+    "serial io",
+    "rapid storage",
+    "physx",
+    "control panel",
+    "usb 3",
+];
 /// How close (days) to the OS install date an OEM program must be installed.
 const OEM_WINDOW_DAYS: i64 = 30;
 
@@ -141,11 +160,22 @@ pub fn install_source(p: &Program, reg: &dyn RegistryReader) -> InstallSource {
             return InstallSource::Oem;
         }
     }
-    let name = p.name.to_lowercase();
-    if name.contains("driver") || name.contains("drivrutin") || publisher_is(publisher, &DRIVER_PUBLISHERS) {
+    if is_driver(&p.name, publisher) {
         return InstallSource::Driver;
     }
     InstallSource::Unknown
+}
+
+/// A driver package: named like one in any language we know, or a hardware vendor's program
+/// named after a device class ("NVIDIA PhysX", "Realtek Ethernet …"). AMD Software (the
+/// Adrenalin driver UI) counts; vendor tools such as GeForce Experience do not.
+fn is_driver(name: &str, publisher: &str) -> bool {
+    let name = name.to_lowercase();
+    if DRIVER_WORDS.iter().any(|w| name.contains(w)) {
+        return true;
+    }
+    publisher_is(publisher, &DRIVER_PUBLISHERS)
+        && (VENDOR_DRIVER_WORDS.iter().any(|w| name.contains(w)) || name.starts_with("amd software"))
 }
 
 /// Everything the details panel shows about where `p` came from. Without a main exe the
@@ -169,14 +199,17 @@ pub const TRUST_E_EXPLICIT_DISTRUST: i32 = 0x800B_0111_u32 as i32;
 pub const TRUST_E_BAD_DIGEST: i32 = 0x8009_6010_u32 as i32;
 pub const TRUST_E_NO_SIGNER_CERT: i32 = 0x8009_6002_u32 as i32;
 pub const TRUST_E_CERT_SIGNATURE: i32 = 0x8009_6004_u32 as i32;
+pub const CRYPT_E_FILE_ERROR: i32 = 0x8009_2003_u32 as i32;
 
 /// Maps a `WinVerifyTrust` status to a [`Signature`]. Invalid reasons are short codes:
 /// `bad-digest`, `expired`, `untrusted-root`, `revoked`, `distrusted`, `bad-certificate`, or
-/// `error:0x<hresult>`. Win32 error HRESULTs (the file could not be read) are `Unknown`.
+/// `error:0x<hresult>`. Win32 error HRESULTs and `CRYPT_E_FILE_ERROR` (the file could not be
+/// read) are `Unknown`.
 pub fn signature_from_status(status: i32, signer: Option<String>) -> Signature {
     let reason = match status {
         0 => return Signature::Valid { signer: signer.unwrap_or_default() },
         TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN | TRUST_E_PROVIDER_UNKNOWN => return Signature::Unsigned,
+        CRYPT_E_FILE_ERROR => return Signature::Unknown,
         s if (s as u32) & 0xFFFF_0000 == 0x8007_0000 => return Signature::Unknown,
         TRUST_E_BAD_DIGEST => "bad-digest".to_string(),
         CERT_E_EXPIRED => "expired".to_string(),
@@ -332,6 +365,7 @@ mod win {
             CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut len, None, None).ok()?;
             let mut hash = vec![0u8; len as usize];
             CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut len, Some(hash.as_mut_ptr()), None).ok()?;
+            hash.truncate(len as usize);
             guard.cat = CryptCATAdminEnumCatalogFromHash(admin, &hash, None, None);
             if guard.cat == 0 {
                 return None;
@@ -427,6 +461,13 @@ mod win {
         }
     }
 
+    /// True when `bytes` bytes from `ptr` lie inside `block`.
+    pub(super) fn in_block(block: &[u8], ptr: *const c_void, bytes: usize) -> bool {
+        let (start, end) = (block.as_ptr() as usize, block.as_ptr() as usize + block.len());
+        let p = ptr as usize;
+        !ptr.is_null() && p >= start && p.checked_add(bytes).is_some_and(|e| e <= end)
+    }
+
     /// `(FileDescription, CompanyName)` from the version resource, in its first translation.
     pub fn version_strings(exe: &Path) -> (Option<String>, Option<String>) {
         let path = wide(exe);
@@ -441,17 +482,18 @@ mod win {
             if GetFileVersionInfoW(PCWSTR(path.as_ptr()), None, size, block.as_mut_ptr() as *mut c_void).is_err() {
                 return (None, None);
             }
-            let query = |sub: &str| -> Option<(*mut c_void, u32)> {
+            // `len` is in bytes for `\VarFileInfo\Translation` and in UTF-16 units for strings.
+            let query = |sub: &str, unit: usize| -> Option<(*mut c_void, u32)> {
                 let sub = wide(sub);
                 let mut ptr: *mut c_void = std::ptr::null_mut();
                 let mut len = 0u32;
-                VerQueryValueW(block.as_ptr() as *const c_void, PCWSTR(sub.as_ptr()), &mut ptr, &mut len)
-                    .as_bool()
-                    .then_some((ptr, len))
-                    .filter(|(p, l)| !p.is_null() && *l > 0)
+                if !VerQueryValueW(block.as_ptr() as *const c_void, PCWSTR(sub.as_ptr()), &mut ptr, &mut len).as_bool() {
+                    return None;
+                }
+                in_block(&block, ptr, len as usize * unit).then_some((ptr, len)).filter(|(_, l)| *l > 0)
             };
             let mut langs: Vec<String> = Vec::new();
-            if let Some((ptr, len)) = query(r"\VarFileInfo\Translation") {
+            if let Some((ptr, len)) = query(r"\VarFileInfo\Translation", 1) {
                 let pairs = std::slice::from_raw_parts(ptr as *const u16, (len as usize) / 2);
                 langs.extend(pairs.as_chunks::<2>().0.iter().map(|[lang, cp]| format!("{lang:04x}{cp:04x}")));
             }
@@ -459,7 +501,7 @@ mod win {
             langs.extend(["040904b0", "040904e4", "04090000"].map(String::from));
             let read = |field: &str| -> Option<String> {
                 langs.iter().find_map(|lang| {
-                    let (ptr, len) = query(&format!(r"\StringFileInfo\{lang}\{field}"))?;
+                    let (ptr, len) = query(&format!(r"\StringFileInfo\{lang}\{field}"), 2)?;
                     let chars = std::slice::from_raw_parts(ptr as *const u16, len as usize);
                     let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
                     let text = String::from_utf16_lossy(&chars[..end]).trim().to_string();
@@ -612,6 +654,26 @@ mod tests {
             InstallSource::Driver
         );
         assert_eq!(install_source(&program("e", "Foo", Some("Intellicorp"), None), &reg), InstallSource::Unknown);
+        let nvidia = Some("NVIDIA Corporation");
+        let cases = [
+            ("NVIDIA Graphics Driver 551.52", nvidia, InstallSource::Driver),
+            ("NVIDIA PhysX systemprogramvara", nvidia, InstallSource::Driver),
+            ("Drucker Treiber", None, InstallSource::Driver),
+            ("Pilote d'imprimante", None, InstallSource::Driver),
+            ("AMD Software", Some("Advanced Micro Devices, Inc."), InstallSource::Driver),
+            ("Intel(R) Serial IO", Some("Intel Corporation"), InstallSource::Driver),
+            ("Realtek Ethernet Controller", Some("Realtek"), InstallSource::Driver),
+            // Vendor tools that are not drivers.
+            ("NVIDIA GeForce Experience 3.25", nvidia, InstallSource::Unknown),
+            ("NVIDIA NodeJS", nvidia, InstallSource::Unknown),
+            ("AMD Product Verification Tool", Some("Advanced Micro Devices, Inc."), InstallSource::Unknown),
+            ("Intel Unison", Some("Intel Corporation"), InstallSource::Unknown),
+            // A driver-like word from a non-vendor publisher is no driver.
+            ("Foo Audio Recorder", Some("Foo"), InstallSource::Unknown),
+        ];
+        for (name, publisher, want) in cases {
+            assert_eq!(install_source(&program("x", name, publisher, None), &reg), want, "{name}");
+        }
     }
 
     #[test]
@@ -669,6 +731,19 @@ mod tests {
         );
         // A file that cannot be read (Win32 error HRESULTs) is unknown, not invalid.
         assert_eq!(signature_from_status(0x8007_0002_u32 as i32, None), Signature::Unknown);
+        assert_eq!(signature_from_status(0x8009_2003_u32 as i32, None), Signature::Unknown, "CRYPT_E_FILE_ERROR");
+    }
+
+    #[test]
+    fn version_values_must_lie_inside_the_block() {
+        let block = [0u8; 16];
+        let at = |i: usize| block[i..].as_ptr() as *const std::ffi::c_void;
+        assert!(win::in_block(&block, at(0), 16));
+        assert!(win::in_block(&block, at(8), 8));
+        assert!(!win::in_block(&block, at(8), 9));
+        assert!(!win::in_block(&block, std::ptr::null(), 0));
+        let outside = [0u8; 4];
+        assert!(!win::in_block(&block, outside.as_ptr() as *const std::ffi::c_void, 1));
     }
 
     #[test]

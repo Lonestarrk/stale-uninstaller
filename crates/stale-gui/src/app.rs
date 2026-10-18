@@ -32,6 +32,9 @@ use crate::warning::{Msg, Warning};
 use crate::worker::{GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
 use crate::{strings, worker};
 
+/// Provenance probes allowed in flight at once; clicking through the list never starts more.
+pub const MAX_PROVENANCE_PROBES: usize = 4;
+
 pub struct Row {
     pub program: Program,
     pub usage: Option<ProgramUsage>,
@@ -284,7 +287,8 @@ impl StaleApp {
     }
 
     /// Starts reading the selected program's provenance on a worker thread, once its main exe
-    /// is known (usage has arrived) and unless it is cached or already being read.
+    /// is known (usage has arrived), unless it is cached or already being read, and only while
+    /// fewer than [`MAX_PROVENANCE_PROBES`] probes run.
     fn request_provenance(&mut self) {
         self.request_provenance_with(worker::spawn_provenance);
     }
@@ -292,6 +296,10 @@ impl StaleApp {
     fn request_provenance_with(&mut self, spawn: impl FnOnce(Program, Option<PathBuf>) -> Receiver<Provenance>) {
         let Some(id) = self.selected.as_ref() else { return };
         if self.provenance.contains_key(id) || self.provenance_rx.contains_key(id) {
+            return;
+        }
+        // Runs every frame: the current selection is probed as soon as a slot frees.
+        if self.provenance_rx.len() >= MAX_PROVENANCE_PROBES {
             return;
         }
         let Some(row) = self.rows.iter().find(|r| &r.program.id == id) else { return };
@@ -1102,6 +1110,38 @@ mod tests {
         app.clear_scan_data();
         assert!(app.provenance_for(&ProgramId("a".into())).is_none());
         assert!(app.provenance_rx.is_empty());
+    }
+
+    #[test]
+    fn at_most_four_provenance_probes_run_at_once() {
+        use std::sync::mpsc::{channel, Sender};
+        let mut app = StaleApp::empty(Settings::default());
+        let ids: Vec<String> = (0..6).map(|i| format!("p{i}")).collect();
+        app.apply_event(ScanEvent::Programs(ids.iter().map(|id| program(id, false)).collect()));
+        app.apply_event(ScanEvent::Usage(ids.iter().map(|id| (ProgramId(id.clone()), usage())).collect()));
+        let mut senders: Vec<Sender<Provenance>> = Vec::new();
+        let mut spawned: Vec<ProgramId> = Vec::new();
+        // The user clicks through six programs while no probe finishes.
+        for id in &ids {
+            app.selected = Some(ProgramId(id.clone()));
+            app.request_provenance_with(|p, _| {
+                spawned.push(p.id);
+                let (tx, rx) = channel();
+                senders.push(tx);
+                rx
+            });
+        }
+        assert_eq!(spawned.len(), MAX_PROVENANCE_PROBES);
+        assert_eq!(app.provenance_rx.len(), MAX_PROVENANCE_PROBES);
+        // One finishes: the next frame probes the current selection.
+        senders[0].send(unknown_provenance()).unwrap();
+        app.drain_provenance();
+        app.request_provenance_with(|p, _| {
+            spawned.push(p.id);
+            channel().1
+        });
+        assert_eq!(spawned.last(), Some(&ProgramId("p5".into())));
+        assert_eq!(spawned.len(), MAX_PROVENANCE_PROBES + 1);
     }
 
     #[test]

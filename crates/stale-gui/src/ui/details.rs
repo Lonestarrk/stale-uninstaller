@@ -246,6 +246,9 @@ mod tests {
         };
         let en: Vec<String> = provenance_rows_in(Lang::En, Some(&none)).into_iter().map(|(_, v)| v).collect();
         assert_eq!(en, ["–", "–", "–", "–", "Preinstalled (manufacturer)"]);
+        let nameless = Signature::Valid { signer: String::new() };
+        assert_eq!(strings::signature_text_in(Lang::Sv, &nameless), "okänd utgivare ✓");
+        assert_eq!(strings::signature_text_in(Lang::En, &nameless), "unknown publisher ✓");
         let unsigned = provenance_with(Signature::Unsigned);
         assert_eq!(provenance_rows_in(Lang::Sv, Some(&unsigned))[0].1, "osignerad");
         // While the probe runs every row waits.

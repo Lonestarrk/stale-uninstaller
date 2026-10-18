@@ -161,6 +161,8 @@ pub struct Strings {
     pub detail_installed: &'static str,
     pub detail_install_source: &'static str,
     pub signature_unsigned: &'static str,
+    /// A valid signature whose signer name could not be read.
+    pub signature_unknown_signer: &'static str,
     /// `{reason}` is replaced by the translated reason.
     pub signature_invalid: &'static str,
     pub sig_bad_digest: &'static str,
@@ -441,6 +443,7 @@ pub static SV: Strings = Strings {
     detail_installed: "Installerad",
     detail_install_source: "Källa",
     signature_unsigned: "osignerad",
+    signature_unknown_signer: "okänd utgivare",
     signature_invalid: "ogiltig signatur: {reason}",
     sig_bad_digest: "filen har ändrats efter signeringen",
     sig_expired: "certifikatet har gått ut",
@@ -692,6 +695,7 @@ pub static EN: Strings = Strings {
     detail_installed: "Installed",
     detail_install_source: "Source",
     signature_unsigned: "unsigned",
+    signature_unknown_signer: "unknown publisher",
     signature_invalid: "invalid signature: {reason}",
     sig_bad_digest: "the file changed after signing",
     sig_expired: "the certificate has expired",
@@ -1087,7 +1091,8 @@ pub fn signature_reason_in(lang: Lang, code: &str) -> String {
 pub fn signature_text_in(lang: Lang, signature: &Signature) -> String {
     let s = texts(lang);
     match signature {
-        Signature::Valid { signer } => format!("{signer} ✓").trim_start().to_string(),
+        Signature::Valid { signer } if signer.trim().is_empty() => format!("{} ✓", s.signature_unknown_signer),
+        Signature::Valid { signer } => format!("{signer} ✓"),
         Signature::Invalid { reason, .. } => s.signature_invalid.replace("{reason}", &signature_reason_in(lang, reason)),
         Signature::Unsigned => s.signature_unsigned.to_string(),
         Signature::Unknown => s.unknown_value.to_string(),

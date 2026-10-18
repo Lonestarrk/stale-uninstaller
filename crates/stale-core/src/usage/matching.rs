@@ -64,8 +64,9 @@ pub struct ProgramUsage {
     pub last_used: LastUsed,
     /// Sorted by `last_run`, newest first.
     pub exes: Vec<ExeUsage>,
-    /// The first of the program's main exes ([`program_main_exes`]), whether or not it ran:
-    /// the exe the details panel reads the signature and version info from.
+    /// One of the program's main exes ([`program_main_exes`]), whether or not it ran: the one
+    /// the display icon names, else the most recently used, else the first. The details panel
+    /// reads the signature and version info from it.
     #[serde(default)]
     pub main_exe: Option<PathBuf>,
 }
@@ -347,8 +348,8 @@ struct Candidate<'a> {
     install: Option<String>,
     /// `norm()`ed main exes, Squirrel `app-<version>` folders removed ([`squirrel_neutral`]).
     main: HashSet<String>,
-    /// The first main exe as found on disk (see [`ProgramUsage::main_exe`]).
-    first_main: Option<PathBuf>,
+    /// The main exes as found on disk, in rule order (see [`Candidate::main_exe`]).
+    mains: Vec<PathBuf>,
     /// Without an install folder: uppercased display-icon exe name (counts as main).
     icon_name: Option<String>,
     /// Without an install folder: uppercased uninstaller exe name (never MsiExec).
@@ -361,7 +362,6 @@ impl<'a> Candidate<'a> {
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
         let mains = program_main_exes(program, input.shortcut_targets, roots, args, input.service_exes).0;
-        let first_main = mains.first().cloned();
         let main = mains
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
@@ -385,7 +385,24 @@ impl<'a> Candidate<'a> {
         } else {
             None
         };
-        Candidate { program, install, main, first_main, icon_name, uninstaller_name }
+        Candidate { program, install, main, mains, icon_name, uninstaller_name }
+    }
+
+    /// The one main exe provenance reads ([`ProgramUsage::main_exe`]): the one the display icon
+    /// names, else the most recently used one (`exes` is newest first), else the first.
+    fn main_exe(&self, exes: &[ExeUsage]) -> Option<PathBuf> {
+        let neutral = |p: &Path| squirrel_neutral(&norm(p), self.install.as_deref().unwrap_or_default());
+        let icon = self.program.display_icon.as_deref().map(|i| norm(&strip_icon_index(i)));
+        if let Some(icon) = icon {
+            if let Some(m) = self.mains.iter().find(|m| norm(m) == icon) {
+                return Some(m.clone());
+            }
+        }
+        let used = exes.iter().filter(|e| e.is_main).find_map(|e| {
+            let hit = neutral(&e.exe_path);
+            self.mains.iter().find(|m| neutral(m) == hit)
+        });
+        used.or(self.mains.first()).cloned()
     }
 
     fn is_main(&self, exe: &Path) -> bool {
@@ -561,7 +578,7 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
         .zip(assigned)
         .map(|(c, hits)| {
             let usage = summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes, input.autostart_exes);
-            (c.program.id.clone(), ProgramUsage { main_exe: c.first_main.clone(), ..usage })
+            (c.program.id.clone(), ProgramUsage { main_exe: c.main_exe(&usage.exes), ..usage })
         })
         .collect();
     MatchResult { by_program, unmatched }
@@ -966,6 +983,31 @@ mod tests {
         let services: HashSet<String> = [norm(Path::new(r"C:\Apps\Foo\foo.exe"))].into();
         let r = run(&programs[..1], &[], &services);
         assert_eq!(usage(&r, "Foo").main_exe, None);
+    }
+
+    #[test]
+    fn provenance_main_exe_prefers_the_icon_then_the_newest_used() {
+        let shortcuts = targets(&[r"C:\VS\Common7\IDE\Blend.exe", r"C:\VS\Common7\IDE\devenv.exe"]);
+        let (roots, args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let main_exe = |p: &Program, hits: &[UsageHit]| {
+            let programs = [p.clone()];
+            let r = match_usage(&input(&programs, hits, &shortcuts, &roots, &args, &services));
+            usage(&r, &p.id.0).main_exe.clone()
+        };
+        let mut vs = prog("VS", Some(r"C:\VS"));
+        // Without icon or usage: the first main exe.
+        assert_eq!(main_exe(&vs, &[]), Some(PathBuf::from(r"C:\VS\Common7\IDE\Blend.exe")));
+        // The newest used main exe beats the first.
+        let used = [hit(r"C:\VS\Common7\IDE\Blend.exe", 9, UsageSource::Bam), hit(r"C:\VS\Common7\IDE\devenv.exe", 2, UsageSource::Bam)];
+        assert_eq!(main_exe(&vs, &used), Some(PathBuf::from(r"C:\VS\Common7\IDE\devenv.exe")));
+        // The display icon beats both.
+        vs.display_icon = Some(PathBuf::from(r"c:\vs\common7\ide\DEVENV.EXE,0"));
+        let blend_newer = [hit(r"C:\VS\Common7\IDE\Blend.exe", 1, UsageSource::Bam)];
+        assert_eq!(main_exe(&vs, &blend_newer), Some(PathBuf::from(r"C:\VS\Common7\IDE\devenv.exe")));
+        // Matching itself is unchanged: both shortcut targets are main exes.
+        let programs = [vs.clone()];
+        let r = match_usage(&input(&programs, &used, &shortcuts, &roots, &args, &services));
+        assert!(usage(&r, "VS").exes.iter().all(|e| e.is_main));
     }
 
     #[test]
