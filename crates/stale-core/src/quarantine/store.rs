@@ -192,6 +192,7 @@ mod tests {
     #[test]
     #[ignore]
     fn junction_to_trusted_folder_is_not_trusted_live() {
+        let _env = crate::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let m = manifest("j-1", Utc::now());
@@ -212,6 +213,7 @@ mod tests {
     #[test]
     #[ignore]
     fn owned_by_admins_live() {
+        let _env = crate::env_lock();
         let programdata = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
         assert_eq!(owned_by_admins(Path::new(&programdata)), Some(true), "ProgramData is owned by SYSTEM");
         let dir = tempfile::tempdir().unwrap();

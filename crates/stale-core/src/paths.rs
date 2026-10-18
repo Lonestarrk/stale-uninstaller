@@ -124,6 +124,7 @@ mod tests {
     #[cfg(not(feature = "e2e-overrides"))]
     #[test]
     fn data_dir_override_env_is_ignored_without_the_feature() {
+        let _env = crate::env_lock();
         let expected = program_data_dir().join("Stale Uninstaller");
         std::env::set_var("STALE_E2E_DATA_DIR", r"C:\e2e-should-be-ignored");
         let got = data_dir_path();

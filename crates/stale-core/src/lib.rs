@@ -34,6 +34,17 @@ pub use model::*;
 /// `cargo build --all-features`.
 pub const E2E_OVERRIDES: bool = cfg!(feature = "e2e-overrides");
 
+/// Serialises the tests that change `SystemRoot` (or another variable the crate reads) with the
+/// tests that read `SystemRoot`/`ProgramData` through the environment.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`ENV_LOCK`]; a test that panicked while holding it does not poison the others.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

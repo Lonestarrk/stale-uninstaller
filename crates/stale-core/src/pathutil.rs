@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn shared_roots_are_detected() {
+        let _env = crate::env_lock();
         assert!(is_shared_root(Path::new(r"C:\")));
         assert!(is_shared_root(Path::new("d:")));
         let vars = ["ProgramFiles", "ProgramFiles(x86)", "ProgramData", "LOCALAPPDATA", "APPDATA", "SystemRoot", "USERPROFILE"];
@@ -229,6 +230,7 @@ mod tests {
 
     #[test]
     fn program_files_on_any_drive_and_system_folders_are_shared() {
+        let _env = crate::env_lock();
         for p in [
             r"D:\Program Files",
             r"e:\program files (x86)\",

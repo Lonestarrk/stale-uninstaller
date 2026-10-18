@@ -360,6 +360,7 @@ mod tests {
 
     #[test]
     fn system32_service_is_skipped() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         svc(&mut reg, "Drv", r"System32\drivers\gone.sys");
         svc(&mut reg, "Host", r"%SystemRoot%\System32\svchost.exe -k netsvcs");

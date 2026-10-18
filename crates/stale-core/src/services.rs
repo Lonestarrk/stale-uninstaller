@@ -71,6 +71,7 @@ mod tests {
 
     #[test]
     fn service_exes_normalizes_image_paths() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         let svc = |name: &str| key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}"));
         reg.set(svc("Quoted"), "ImagePath", RegValue::Str(r#""C:\Program Files\Foo\FooSvc.exe" -k run"#.into()));

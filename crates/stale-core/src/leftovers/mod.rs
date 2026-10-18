@@ -379,6 +379,7 @@ mod tests {
 
     #[test]
     fn effective_install_dir_rejects_msiexec_and_system32() {
+        let _env = crate::env_lock();
         let sys = std::env::var("SystemRoot").unwrap();
         assert_eq!(hint_with(None, Some("MsiExec.exe /X{ABC}"), None).effective_install_dir(), None);
         assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\MsiExec.exe /X{{ABC}}")), None).effective_install_dir(), None);
@@ -388,6 +389,7 @@ mod tests {
 
     #[test]
     fn effective_install_dir_rejects_temp_caches_and_user_folders() {
+        let _env = crate::env_lock();
         let drive = std::env::var("SystemDrive").unwrap();
         let down = format!(r#""{drive}\Users\A\Downloads\Obsidian\Uninstall Obsidian.exe" /S"#);
         assert_eq!(hint_with(None, Some(&down), None).effective_install_dir(), None);

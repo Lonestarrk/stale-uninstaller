@@ -136,6 +136,7 @@ mod tests {
 
     #[test]
     fn start_menu_dirs_are_the_two_programs_folders() {
+        let _env = crate::env_lock();
         let dirs = start_menu_dirs();
         let suffix = Path::new("Microsoft").join("Windows").join("Start Menu").join("Programs");
         assert_eq!(dirs.len(), 2);

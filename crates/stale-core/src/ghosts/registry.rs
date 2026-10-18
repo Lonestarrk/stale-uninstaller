@@ -384,6 +384,7 @@ mod tests {
 
     #[test]
     fn dangling_run_value_is_evidence() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         let run = key(Hive::CurrentUser, RUN);
         reg.set(run.clone(), "Gone", s(r#""C:\Gone Tray\tray.exe" --minimized"#));
