@@ -290,6 +290,7 @@ pub(crate) fn note_text(note: &str) -> &str {
         g::REASON_PUBLISHER_OF_INSTALLED => strings::t().note_publisher_of_installed,
         g::REASON_IN_USE => strings::t().note_in_use,
         g::REASON_LAUNCHER_LIBRARY => strings::t().note_launcher_library,
+        g::NOTE_PARTLY_LIVE => strings::t().note_partly_live,
         other => other,
     }
 }
@@ -316,10 +317,18 @@ mod tests {
             ("publisher-of-installed", strings::t().note_publisher_of_installed),
             ("in-use", strings::t().note_in_use),
             ("launcher-library", strings::t().note_launcher_library),
+            ("partly-live", strings::t().note_partly_live),
         ] {
             assert_eq!(note_text(key), text, "{key}");
         }
         assert_eq!(note_text("something-new"), "something-new");
+    }
+
+    #[test]
+    fn partly_live_note_is_worded_in_both_languages() {
+        use crate::strings::{texts, Lang};
+        assert_eq!(texts(Lang::Sv).note_partly_live, "kör också något som finns kvar");
+        assert_eq!(texts(Lang::En).note_partly_live, "also runs something that is still there");
     }
 
     #[test]

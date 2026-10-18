@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(ghosts.len(), 1, "{ghosts:?}");
         let g = &ghosts[0];
         assert_eq!((g.name.as_str(), g.assessment), ("Old Tool", Assessment::LeftoversOnly));
-        assert!(g.evidence.contains(&Evidence::RegKeyOrphan { key: hkcu(r"Software\OldTool") }), "{g:?}");
+        assert!(g.evidence.contains(&Evidence::RegKeyOrphan { key: hkcu(r"Software\OldTool"), shared: false }), "{g:?}");
         let key_item = to_leftovers(g, Path::new(r"C:\T"))
             .items
             .into_iter()
@@ -259,6 +259,47 @@ mod tests {
         let ghosts = scan_ghosts(&src);
         let g = by_name(&ghosts, "Lumina Studio");
         assert_eq!((g.assessment, g.reasons.clone()), (Assessment::Uncertain, vec![REASON_IN_USE.to_string()]));
+    }
+
+    /// A task that also runs an existing program is not the ghost's alone: Low, never pre-checked.
+    #[test]
+    fn task_with_live_command_is_low() {
+        let tasks = r"C:\Windows\System32\Tasks";
+        let fs = base_fs()
+            .file(r"C:\Program Files\Old Tool\data.bin", 30)
+            .text(&format!(r"{tasks}\Old Tool Update"), r#"<Command>"C:\Program Files\Old Tool\up.exe"</Command><Command>C:\Tools\live.exe</Command>"#)
+            .file(r"C:\Tools\live.exe", 1);
+        let ghosts = scan_ghosts(&sources(fs, FakeRegistry::new()));
+        let g = by_name(&ghosts, "Old Tool");
+        let task = to_leftovers(g, Path::new(tasks))
+            .items
+            .into_iter()
+            .find(|l| matches!(l.kind, crate::leftovers::LeftoverKind::ScheduledTask { .. }))
+            .unwrap_or_else(|| panic!("no task item in {g:?}"));
+        assert_eq!((task.confidence, task.note.as_deref()), (Confidence::Low, Some(crate::ghosts::group::NOTE_PARTLY_LIVE)));
+        assert_eq!(crate::ghosts::group::NOTE_PARTLY_LIVE, "partly-live");
+    }
+
+    /// Removing a vendor key would take an installed program's subkey with it: Low.
+    #[test]
+    fn vendor_key_with_installed_subkey_is_low() {
+        let fs = base_fs().file(r"C:\Program Files\Old Tool\data.bin", 5);
+        let mut reg = FakeRegistry::new();
+        let hkcu = |p: &str| key(Hive::CurrentUser, p);
+        reg.set(hkcu(r"Software\OldTool"), "Theme", RegValue::Str("dark".into()));
+        reg.set(hkcu(r"Software\OldTool\Bar Player"), "Volume", RegValue::Dword(3));
+        let mut src = sources(fs, reg);
+        src.leftovers.reg_roots.software = vec![hkcu("Software")];
+        src.programs = vec![program("bar", "Bar Player")];
+        let ghosts = scan_ghosts(&src);
+        let mut g = by_name(&ghosts, "Old Tool").clone();
+        g.assessment = Assessment::ProbablyUninstalled;
+        let key_item = to_leftovers(&g, Path::new(r"C:\T"))
+            .items
+            .into_iter()
+            .find(|l| matches!(l.kind, crate::leftovers::LeftoverKind::RegKey { .. }))
+            .unwrap();
+        assert_eq!((key_item.confidence, key_item.note.as_deref()), (Confidence::Low, Some("shared-publisher-key")));
     }
 
     #[test]

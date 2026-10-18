@@ -221,7 +221,7 @@ fn evidence_line(e: &Evidence) -> String {
         Evidence::RegKeyMissingPath { key, path, .. } => {
             strings::evidence_key_missing_path(&key_text(key), &path.display().to_string())
         }
-        Evidence::RegKeyOrphan { key } => strings::evidence_key(&key_text(key)),
+        Evidence::RegKeyOrphan { key, .. } => strings::evidence_key(&key_text(key)),
         Evidence::DanglingRef { kind, location, target, .. } => {
             let location = parse_location(location).map_or_else(|| location.clone(), |k| key_text(&k));
             strings::evidence_ref(ref_label(*kind), &location, &target.display().to_string())
@@ -257,14 +257,15 @@ mod tests {
             holds_user_data: false,
         };
         assert_eq!(evidence_line(&folder), strings::evidence_folder(r"C:\Program Files\Foo", "3 MB"));
-        let missing = Evidence::RegKeyMissingPath { key: key.clone(), value_name: "Path".into(), path: r"D:\Foo".into() };
+        let missing = Evidence::RegKeyMissingPath { key: key.clone(), value_name: "Path".into(), path: r"D:\Foo".into(), shared: false };
         assert_eq!(evidence_line(&missing), strings::evidence_key_missing_path(r"HKCU\Software\Foo", r"D:\Foo"));
-        assert_eq!(evidence_line(&Evidence::RegKeyOrphan { key }), strings::evidence_key(r"HKCU\Software\Foo"));
+        assert_eq!(evidence_line(&Evidence::RegKeyOrphan { key, shared: false }), strings::evidence_key(r"HKCU\Software\Foo"));
         let run = Evidence::DanglingRef {
             kind: RefKind::Run,
             location: r"LocalMachine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
             target: r"C:\Foo\foo.exe".into(),
             value_name: Some("Foo".into()),
+            partly_live: false,
         };
         assert_eq!(
             evidence_line(&run),
@@ -275,6 +276,7 @@ mod tests {
             location: r"Vendor\Updater".into(),
             target: r"C:\Foo\up.exe".into(),
             value_name: None,
+            partly_live: false,
         };
         assert_eq!(evidence_line(&task), strings::evidence_ref(strings::t().ref_task, r"Vendor\Updater", r"C:\Foo\up.exe"));
         let when = DateTime::from_timestamp(1_792_000_000, 0).unwrap();

@@ -793,7 +793,7 @@ impl StaleApp {
         for e in &ghost.evidence {
             match e {
                 Evidence::Folder { path, .. } => self.keep.keep_path(path.clone()),
-                Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => self.keep.keep_key(key.clone()),
+                Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key, .. } => self.keep.keep_key(key.clone()),
                 Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } => {}
             }
         }
@@ -1579,12 +1579,13 @@ mod tests {
         let path = dir.path().join("important.json");
         let mut alpha = ghost("Alpha", Assessment::ProbablyUninstalled, 100);
         let missing = RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Alpha".into() };
-        alpha.evidence.push(Evidence::RegKeyMissingPath { key: missing.clone(), value_name: "Path".into(), path: r"D:\Alpha".into() });
+        alpha.evidence.push(Evidence::RegKeyMissingPath { key: missing.clone(), value_name: "Path".into(), path: r"D:\Alpha".into(), shared: false });
         alpha.evidence.push(Evidence::DanglingRef {
             kind: RefKind::Run,
             location: r"LocalMachine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
             target: r"C:\Program Files\Alpha.exe".into(),
             value_name: Some("Alpha".into()),
+            partly_live: false,
         });
         let mut app = StaleApp::empty(Settings::default());
         app.ghosts = Some(GhostSelection::new(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));

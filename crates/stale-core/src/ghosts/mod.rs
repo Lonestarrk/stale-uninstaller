@@ -31,10 +31,31 @@ pub enum Evidence {
         #[serde(default)]
         holds_user_data: bool,
     },
-    RegKeyMissingPath { key: RegKeyPath, value_name: String, path: PathBuf },
-    RegKeyOrphan { key: RegKeyPath },
+    /// `shared`: the key also holds an installed program's subkey, so removing it is never sure.
+    RegKeyMissingPath {
+        key: RegKeyPath,
+        value_name: String,
+        path: PathBuf,
+        #[serde(default)]
+        shared: bool,
+    },
+    /// `shared` as for [`Evidence::RegKeyMissingPath`].
+    RegKeyOrphan {
+        key: RegKeyPath,
+        #[serde(default)]
+        shared: bool,
+    },
     /// `location` is the key path, `.lnk` path, service name or task name holding the reference.
-    DanglingRef { kind: RefKind, location: String, target: PathBuf, value_name: Option<String> },
+    /// `partly_live`: the holder also references targets that still exist (a scheduled task with
+    /// another command that is there), so removing it is never sure.
+    DanglingRef {
+        kind: RefKind,
+        location: String,
+        target: PathBuf,
+        value_name: Option<String>,
+        #[serde(default)]
+        partly_live: bool,
+    },
     UsageTrace { exe: PathBuf, last_run: DateTime<Utc>, source: UsageSource },
 }
 

@@ -79,11 +79,11 @@ fn dump_ghosts() {
                 Evidence::Folder { path, size, root_kind, .. } => {
                     format!("Folder {:?} {} ({})", root_kind, path.display(), size.map_or("-".to_string(), mb))
                 }
-                Evidence::RegKeyMissingPath { key, value_name, path } => {
+                Evidence::RegKeyMissingPath { key, value_name, path, .. } => {
                     format!(r"RegKeyMissingPath {:?}\{} [{value_name}] -> {}", key.hive, key.path, path.display())
                 }
-                Evidence::RegKeyOrphan { key } => format!(r"RegKeyOrphan {:?}\{}", key.hive, key.path),
-                Evidence::DanglingRef { kind, location, target, value_name } => {
+                Evidence::RegKeyOrphan { key, .. } => format!(r"RegKeyOrphan {:?}\{}", key.hive, key.path),
+                Evidence::DanglingRef { kind, location, target, value_name, .. } => {
                     let value = value_name.as_deref().map_or(String::new(), |v| format!(" [{v}]"));
                     format!("{kind:?} {location}{value} -> {}", target.display())
                 }

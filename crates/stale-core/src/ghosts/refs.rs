@@ -58,7 +58,7 @@ fn gate<'a>(
 }
 
 fn dangling(kind: RefKind, location: String, target: PathBuf) -> Evidence {
-    Evidence::DanglingRef { kind, location, target, value_name: None }
+    Evidence::DanglingRef { kind, location, target, value_name: None, partly_live: false }
 }
 
 /// [`service_collect`]'s evidence.
@@ -151,17 +151,24 @@ pub fn task_collect(
     let mut out = Collected::default();
     for file in files {
         let Some(xml) = fs.read_text(&file) else { continue };
-        let mut dead = None;
+        let (mut dead, mut partly_live) = (None, false);
         for command in task_commands(&xml) {
             if g.is_live(&command) {
                 out.live_targets.push(command);
+                partly_live = true;
             } else if dead.is_none() && g.is_dead(&command) {
                 dead = Some(command);
             }
         }
         let (Some(target), Ok(rel)) = (dead, file.strip_prefix(tasks_root)) else { continue };
         let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
-        out.evidence.push(dangling(RefKind::ScheduledTask, name, target));
+        out.evidence.push(Evidence::DanglingRef {
+            kind: RefKind::ScheduledTask,
+            location: name,
+            target,
+            value_name: None,
+            partly_live,
+        });
     }
     out
 }
@@ -362,7 +369,15 @@ mod tests {
         let (i, k) = none();
         let tasks = task_collect(&fs, Path::new(root), &i, &k, &all);
         assert_eq!(tasks.live_targets, vec![PathBuf::from(r"C:\Live\up.exe")]);
-        assert_eq!(tasks.evidence, vec![dang(RefKind::ScheduledTask, r"Vendor\Updater", r"C:\Gone\b.exe")]);
+        // The task also runs a live command: partly live.
+        let partly = Evidence::DanglingRef {
+            kind: RefKind::ScheduledTask,
+            location: r"Vendor\Updater".into(),
+            target: PathBuf::from(r"C:\Gone\b.exe"),
+            value_name: None,
+            partly_live: true,
+        };
+        assert_eq!(tasks.evidence, vec![partly]);
         let links = shortcut_collect(&fs, &[lnk(r"C:\Menu\Live.lnk", r"C:\Live\app.exe")], &i, &k, &all);
         assert_eq!((links.evidence, links.live_targets), (vec![], vec![PathBuf::from(r"C:\Live\app.exe")]));
         let hits = [hit(r"\RAN\RAN.EXE", 1, UsageSource::Prefetch), hit(r"C:\Live\app.exe", 1, UsageSource::Bam)];
@@ -372,7 +387,7 @@ mod tests {
     }
 
     fn dang(kind: RefKind, location: &str, target: &str) -> Evidence {
-        Evidence::DanglingRef { kind, location: location.into(), target: PathBuf::from(target), value_name: None }
+        Evidence::DanglingRef { kind, location: location.into(), target: PathBuf::from(target), value_name: None, partly_live: false }
     }
 
     #[test]
