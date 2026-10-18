@@ -1,5 +1,6 @@
 //! Embeds the Windows resources for StaleUninstaller.exe: the application
-//! manifest (requireAdministrator, per-monitor DPI) and the version info that
+//! manifest (requireAdministrator, per-monitor DPI, Common Controls 6), the
+//! icon (`stale.ico`, made by `assets/make-icon.ps1`) and the version info that
 //! UAC and Task Manager show as the program name.
 
 fn main() {
@@ -7,6 +8,7 @@ fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut res = winresource::WindowsResource::new();
         res.set_manifest_file("StaleUninstaller.exe.manifest")
+            .set_icon("stale.ico")
             .set("ProductName", "Stale Uninstaller")
             .set("FileDescription", "Stale Uninstaller")
             .set("InternalName", "StaleUninstaller")
@@ -17,4 +19,5 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=StaleUninstaller.exe.manifest");
+    println!("cargo:rerun-if-changed=stale.ico");
 }

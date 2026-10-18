@@ -27,6 +27,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputBaseFilename=StaleUninstaller-Setup-{#AppVersion}
 LicenseFile=..\LICENSE
+SetupIconFile=..\crates\stale-gui\stale.ico
 UninstallDisplayIcon={app}\StaleUninstaller.exe
 UninstallDisplayName=Stale Uninstaller
 ; A running Stale Uninstaller holds this mutex (main.rs, INSTANCE_MUTEX): setup and uninstall

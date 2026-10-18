@@ -10,6 +10,9 @@ use stale_gui::app::StaleApp;
 use stale_gui::logging;
 use stale_gui::strings::{self, t};
 
+/// The window icon: the 256 px image of `stale.ico`, made by `assets/make-icon.ps1`.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+
 /// Name of the machine-wide mutex that marks a running Stale Uninstaller.
 const INSTANCE_MUTEX: &str = r"Global\StaleUninstaller";
 
@@ -82,8 +85,13 @@ fn main() -> eframe::Result {
     strings::set_lang(strings::startup_lang(settings.language.as_deref()));
     log::info!("language: {}", strings::lang().code());
     spawn_auto_purge(settings.quarantine_days);
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(t().app_title);
+    match eframe::icon_data::from_png_bytes(WINDOW_ICON_PNG) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => log::warn!("could not decode the window icon: {e}"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(t().app_title),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))

@@ -23,6 +23,10 @@ cargo clippy --workspace --all-targets
 cargo build -p stale-gui --release
 ```
 
+`build.rs` embeds `crates/stale-gui/stale.ico` as the exe icon and the setup uses it too
+(`SetupIconFile`). It is generated: only if the design changes, edit and rerun
+`crates/stale-gui/assets/make-icon.ps1`, look at its previews and commit the regenerated files.
+
 ## 3. Installer
 
 Inno Setup 6 is needed once. Install it with
