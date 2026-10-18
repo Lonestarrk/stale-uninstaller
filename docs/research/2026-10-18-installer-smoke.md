@@ -59,3 +59,22 @@ folders), so there was nothing of those two to restore.
   junction pointing outside the folder and checks that its target survives.
 - The interactive setup wizard, its language choice (English or Swedish by the Windows language)
   and Inno's interactive confirmation.
+
+## Final build (new exe manifest and icon)
+
+A third run of the same job against the final setup, after the exe manifest and icon changed.
+
+- Setup: `installer\Output\StaleUninstaller-Setup-0.1.0.exe`, 5 861 074 bytes,
+  SHA-256 `803CD099DFE8B9AC58764EB808481C536DF102D5977293EACFA0A89FD5C05362` (checked against the
+  expected value before anything ran).
+- Data folder protection as before: 0 quarantine manifests, backup with
+  `robocopy /E /B /COPY:DATSO /DCOPY:DAT /XJ` (exit code 1, 4 entries) and the folder's SDDL saved.
+
+| Step | Result |
+|---|---|
+| `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=…` | Exit code 0. Exe, `unins000.exe`, uninstall key (DisplayVersion 0.1.0) and Start-menu shortcut present. |
+| Launch the installed exe | Started elevated with no side-by-side error (no SideBySide events in the Application log), main window found, program list of 287 programs shown. The title-bar icon is the new one: a dark rounded square with a light trash bin and an amber clock badge. Screenshot `.superpowers/elevated/shots/installer-final.png`. |
+| `ExtractAssociatedIcon` on the installed exe | 32x32 icon, saved as `.superpowers/elevated/shots/installer-final-icon.png`; it shows the same new icon. |
+| `--uninstall-cleanup --ask --silent` | Exit code 10 (no manifests); the data folder still existed afterwards. |
+| `unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=…` | Exit code 0. Log: `--ask` exit code 10, then `--apply remove` exit code 0, then the uninstall and the file deletions. Afterwards the program folder, the uninstall key, the Start-menu shortcut and `%ProgramData%\Stale Uninstaller` were gone, and no `C:\Stale Uninstaller` folder existed. |
+| Restore | `robocopy` back with the same flags (exit code 1), SDDL identical, 4 of 4 entries back. The folder held no `settings.json` or `important.json`, so there was nothing of those to restore. |
