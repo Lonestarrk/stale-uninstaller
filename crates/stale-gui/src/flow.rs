@@ -4,6 +4,8 @@ use stale_core::leftovers::LeftoverReport;
 use stale_core::uninstall::{RestorePointStatus, UninstallEvent, VendorResult};
 use stale_core::ProgramId;
 
+use crate::strings;
+
 /// The queue's current phase, shown as the dialog's step indicator.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
@@ -79,6 +81,10 @@ impl FlowState {
             UninstallEvent::NotUninstalled { index, exit_code } => {
                 self.set_state(index, ItemState::NotUninstalled { exit_code })
             }
+            UninstallEvent::NoUninstaller { index } => {
+                let name = self.items.get(index).map_or("", |(_, name, _)| name.as_str());
+                self.warnings.push(strings::no_uninstaller(name));
+            }
             UninstallEvent::Warning(w) => self.warnings.push(w),
             UninstallEvent::QueueDone => self.finish(),
         }
@@ -146,6 +152,7 @@ mod tests {
         f.apply(UninstallEvent::Started { index: 2 });
         f.apply(UninstallEvent::Vendor { index: 2, result: VendorResult::NoUninstaller });
         assert_eq!(f.items[2].2, ItemState::Running, "no uninstaller: leftovers still to come");
+        f.apply(UninstallEvent::NoUninstaller { index: 2 });
         f.apply(UninstallEvent::Warning("w".into()));
         f.apply(UninstallEvent::Leftovers { index: 2, report: LeftoverReport::default() });
         assert_eq!(f.items[2].2, ItemState::Forced, "removed without its uninstaller");
@@ -154,7 +161,8 @@ mod tests {
         f.apply(UninstallEvent::QueueDone);
         assert!(f.finished);
         assert_eq!(f.step, Step::Done);
-        assert_eq!(f.warnings, vec!["w".to_string()]);
+        assert_eq!(f.warnings, vec![strings::no_uninstaller("App 2"), "w".to_string()]);
+        assert_eq!(f.warnings[0], "App 2: ingen avinstallerare hittades, tvingad borttagning");
         assert_eq!(f.reports.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(f.items[3].2, ItemState::Skipped, "never started");
     }

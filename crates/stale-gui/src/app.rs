@@ -314,8 +314,12 @@ impl StaleApp {
         loop {
             match rx.try_recv() {
                 Ok(ev) => {
-                    if let UninstallEvent::Warning(w) = &ev {
-                        log::warn!("{w}");
+                    match &ev {
+                        UninstallEvent::Warning(w) => log::warn!("{w}"),
+                        UninstallEvent::NoUninstaller { index } => {
+                            log::warn!("queue item {index}: no uninstaller, forced removal")
+                        }
+                        _ => {}
                     }
                     flow.apply(ev);
                     if flow.finished {

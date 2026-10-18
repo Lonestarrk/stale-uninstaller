@@ -107,6 +107,11 @@ pub const STATE_NOT_UNINSTALLED: &str = "Inte avinstallerat";
 pub const EXIT_CODE: &str = "kod";
 pub const STATE_SKIPPED: &str = "Hoppades över";
 pub const STOP_WAITING: &str = "Sluta vänta";
+
+/// A queued program without a runnable uninstaller: "Foo: ingen avinstallerare hittades, tvingad borttagning".
+pub fn no_uninstaller(name: &str) -> String {
+    format!("{name}: ingen avinstallerare hittades, tvingad borttagning")
+}
 pub const STOP_WAITING_TIP: &str = "Fortsätter nu, utan att vänta på avinstallerarens kvarvarande processer";
 pub const SHOW_LEFTOVERS: &str = "Visa rester";
 pub const RETRY: &str = "Försök igen";

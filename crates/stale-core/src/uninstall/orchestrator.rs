@@ -33,6 +33,8 @@ pub enum UninstallEvent {
     Vendor { index: usize, result: VendorResult },
     Leftovers { index: usize, report: LeftoverReport },
     NotUninstalled { index: usize, exit_code: Option<i32> },
+    /// Item `index` has no uninstaller that can be run: it falls back to a forced removal.
+    NoUninstaller { index: usize },
     Warning(String),
     QueueDone,
 }
@@ -102,8 +104,7 @@ pub fn run_queue(src: &UninstallSources, items: &[QueueItem], opts: &QueueOption
                     continue;
                 }
                 VendorResult::NoUninstaller => {
-                    let warning = format!("{}: ingen avinstallerare hittades, tvingad borttagning", item.program.name);
-                    if tx.send(UninstallEvent::Warning(warning)).is_err() {
+                    if tx.send(UninstallEvent::NoUninstaller { index }).is_err() {
                         return;
                     }
                 }
@@ -229,6 +230,7 @@ mod tests {
                 UninstallEvent::Vendor { index, .. } => format!("vendor{index}"),
                 UninstallEvent::Leftovers { index, .. } => format!("leftovers{index}"),
                 UninstallEvent::NotUninstalled { index, .. } => format!("notuninstalled{index}"),
+                UninstallEvent::NoUninstaller { index } => format!("nouninstaller{index}"),
                 UninstallEvent::Warning(_) => "warning".into(),
                 UninstallEvent::QueueDone => "done".into(),
             })
@@ -272,11 +274,7 @@ mod tests {
     fn no_uninstaller_falls_to_forced_with_warning() {
         let (src, runner) = sources(RestorePointStatus::Created(1));
         let events = collect(&src, &[item("Gamma", None)], &normal());
-        assert_eq!(tags(&events), ["restore", "started0", "vendor0", "warning", "leftovers0", "done"]);
-        match &events[3] {
-            UninstallEvent::Warning(w) => assert_eq!(w, "Gamma: ingen avinstallerare hittades, tvingad borttagning"),
-            e => panic!("{e:?}"),
-        }
+        assert_eq!(tags(&events), ["restore", "started0", "vendor0", "nouninstaller0", "leftovers0", "done"]);
         assert!(runner.0.lock().unwrap().is_empty());
     }
 
