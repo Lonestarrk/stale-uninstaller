@@ -5,7 +5,7 @@ use super::names::{
 };
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::model::{Hive, RegKeyPath};
-use crate::pathutil::{exe_under, expand_env, first_path_in_command, is_shared_root};
+use crate::pathutil::{exe_under, expand_env, first_path_in_command};
 use crate::programs::other_user_sids;
 use crate::registry::{key, RegValue, RegistryReader};
 use std::collections::HashSet;
@@ -62,8 +62,8 @@ const GENERIC_EXE_STEMS: [&str; 6] = ["unins", "uninstall", "setup", "install", 
 impl Target {
     /// `None` when there is nothing to match on.
     fn from_hint(hint: &ProgramHint) -> Option<Target> {
-        if let Some(dir) = hint.install_location.as_deref().filter(|p| !is_shared_root(p)) {
-            return Some(Target::Install(dir.to_path_buf()));
+        if let Some(dir) = hint.effective_install_dir() {
+            return Some(Target::Install(dir));
         }
         let uninstall_exe = hint.uninstall_string.as_deref().and_then(first_path_in_command);
         let mut names: Vec<String> = [hint.display_icon.as_deref(), uninstall_exe.as_deref()]
@@ -409,6 +409,26 @@ mod tests {
         reg.set(key(Hive::CurrentUser, RUN), "Msi", s(r"C:\Windows\System32\msiexec.exe /fa {123}"));
         let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
         assert_eq!(found(&out), vec![(format!(r"CurrentUser\{HKCU_RUN}:FooStudio"), Confidence::High, None)]);
+    }
+
+    #[test]
+    fn hint_without_install_location_uses_the_uninstaller_folder() {
+        let dir = r"C:\Users\A\AppData\Local\Programs\Obsidian";
+        let mut reg = FakeRegistry::new();
+        reg.set(key(Hive::CurrentUser, RUN), "Obsidian", s(&format!(r#""{dir}\Obsidian.exe" --hidden"#)));
+        reg.set(key(Hive::CurrentUser, r"Software\Classes\obsidian\shell\open\command"), "", s(&format!(r#""{dir}\Obsidian.exe" "%1""#)));
+        reg.set(key(Hive::CurrentUser, &format!(r"{APP_PATHS}\Obsidian.exe")), "", s(&format!(r"{dir}\Obsidian.exe")));
+        let mut h = hint("Obsidian", None, None);
+        h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
+        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        assert_eq!(
+            found(&out),
+            vec![
+                (r"CurrentUser\Software\Classes\obsidian".to_string(), Confidence::High, None),
+                (format!(r"CurrentUser\{HKCU_APP_PATHS}\Obsidian.exe"), Confidence::High, None),
+                (format!(r"CurrentUser\{HKCU_RUN}:Obsidian"), Confidence::High, None),
+            ]
+        );
     }
 
     #[test]

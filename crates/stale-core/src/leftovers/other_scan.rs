@@ -3,15 +3,16 @@
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::fsys::FsReader;
 use crate::model::Hive;
-use crate::pathutil::{exe_under, expand_env, is_shared_root};
+use crate::pathutil::{exe_under, expand_env};
 use crate::registry::{key, RegValue, RegistryReader};
 use crate::services::{normalize_image_path, SERVICES_ROOT};
 use crate::shortcuts::ShortcutTarget;
 use std::path::{Path, PathBuf};
 
-/// The install folder to match against; `None` when absent or too broad to claim anything.
-fn install_dir(hint: &ProgramHint) -> Option<&Path> {
-    hint.install_location.as_deref().filter(|p| !is_shared_root(p))
+/// The install folder to match against ([`ProgramHint::effective_install_dir`]); `None` when
+/// unknown or too broad to claim anything.
+fn install_dir(hint: &ProgramHint) -> Option<PathBuf> {
+    hint.effective_install_dir()
 }
 
 fn high(kind: LeftoverKind) -> Leftover {
@@ -30,7 +31,7 @@ pub fn scan_services(reg: &dyn RegistryReader, hint: &ProgramHint) -> Vec<Leftov
                 RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ImagePath") => Some(s),
                 _ => None,
             })?;
-            let image = normalize_image_path(&raw).filter(|p| exe_under(p, install))?;
+            let image = normalize_image_path(&raw).filter(|p| exe_under(p, &install))?;
             Some(high(LeftoverKind::Service { name, image }))
         })
         .collect()
@@ -78,7 +79,7 @@ pub fn scan_tasks(fs: &dyn FsReader, tasks_root: &Path, hint: &ProgramHint) -> V
     files
         .into_iter()
         .filter_map(|file| {
-            let command = task_commands(&fs.read_text(&file)?).into_iter().find(|c| exe_under(c, install))?;
+            let command = task_commands(&fs.read_text(&file)?).into_iter().find(|c| exe_under(c, &install))?;
             let rel = file.strip_prefix(tasks_root).ok()?;
             let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
             Some(high(LeftoverKind::ScheduledTask { name, xml: file, command }))
@@ -92,7 +93,7 @@ pub fn scan_shortcuts(targets: &[ShortcutTarget], desktop_dirs_targets: &[Shortc
     targets
         .iter()
         .chain(desktop_dirs_targets)
-        .filter(|t| exe_under(&t.path, install))
+        .filter(|t| exe_under(&t.path, &install))
         .map(|t| high(LeftoverKind::Shortcut { lnk: t.lnk.clone(), target: t.path.clone() }))
         .collect()
 }
@@ -192,6 +193,26 @@ mod tests {
         };
         assert_eq!(out, vec![want(r"C:\SM\Foo.lnk", r"C:\Apps\Foo\foo.exe"), want(r"C:\Users\A\Desktop\Foo.lnk", r"C:\Apps\Foo\sub\foo2.exe")]);
         assert!(scan_shortcuts(&start, &desk, &hint(None)).is_empty());
+    }
+
+    #[test]
+    fn hint_without_install_location_uses_the_uninstaller_folder() {
+        let dir = r"C:\Users\A\AppData\Local\Programs\Obsidian";
+        let mut h = ProgramHint::manual("Obsidian", None);
+        h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
+        let t = |lnk: &str, path: &str| ShortcutTarget { lnk: lnk.into(), ..ShortcutTarget::new(path) };
+        let start = [t(r"C:\SM\Obsidian.lnk", &format!(r"{dir}\Obsidian.exe"))];
+        let desk = [t(r"C:\Users\A\Desktop\Obsidian.lnk", &format!(r"{dir}\Obsidian.exe"))];
+        assert_eq!(scan_shortcuts(&start, &desk, &h).len(), 2);
+
+        let mut reg = FakeRegistry::new();
+        let svc = key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\ObsSvc"));
+        reg.set(svc, "ImagePath", RegValue::Str(format!(r"{dir}\svc.exe")));
+        assert_eq!(scan_services(&reg, &h).len(), 1);
+
+        let root = r"C:\Windows\System32\Tasks";
+        let fs = FakeFs::new().text(&format!(r"{root}\ObsUpdate"), &format!(r"<Command>{dir}\Obsidian.exe</Command>"));
+        assert_eq!(scan_tasks(&fs, Path::new(root), &h).len(), 1);
     }
 
     #[test]

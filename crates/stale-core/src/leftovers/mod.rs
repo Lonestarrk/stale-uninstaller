@@ -10,6 +10,7 @@ pub use scan::{mark_safe, scan_leftovers, LeftoverSources};
 
 use crate::model::{Program, ProgramId, RegKeyPath};
 use crate::pathutil::{drive_letter, first_path_in_command, is_shared_root, norm, normed_under};
+use names::name_matches;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -88,6 +89,39 @@ impl ProgramHint {
         self
     }
 
+    /// The folder the program is installed in: `install_location` unless it is empty or a shared
+    /// root; else the folder of the uninstaller from `uninstall_string`, else the folder of
+    /// `display_icon`, each only when [`Self::exe_dir`] accepts it. Many per-user installers
+    /// (electron-builder, Squirrel) write no `InstallLocation`.
+    pub fn effective_install_dir(&self) -> Option<PathBuf> {
+        if let Some(loc) = self.install_location.as_deref().filter(|p| !p.as_os_str().is_empty() && !is_shared_root(p)) {
+            return Some(loc.to_path_buf());
+        }
+        let uninstaller = self.uninstall_string.as_deref().and_then(first_path_in_command);
+        uninstaller
+            .as_deref()
+            .and_then(|exe| self.exe_dir(exe))
+            .or_else(|| self.display_icon.as_deref().and_then(|exe| self.exe_dir(exe)))
+    }
+
+    /// `exe`'s folder when `exe` has a drive letter, is not `msiexec` or inside `%SystemRoot%`,
+    /// the folder is not a shared root, and either the exe is named like an uninstaller
+    /// ([`UNINSTALLER_STEMS`]) or the folder is named like the program.
+    fn exe_dir(&self, exe: &Path) -> Option<PathBuf> {
+        let stem = exe.file_stem()?.to_string_lossy().to_lowercase();
+        let dir = exe.parent()?;
+        if drive_letter(exe).is_none()
+            || stem == "msiexec"
+            || normed_under(&norm(exe), &system_root_norm())
+            || is_shared_root(dir)
+        {
+            return None;
+        }
+        let named_like_uninstaller = UNINSTALLER_STEMS.iter().any(|u| stem.starts_with(u));
+        let dir_named_like_program = dir.file_name().is_some_and(|d| name_matches(&d.to_string_lossy(), &self.name));
+        (named_like_uninstaller || dir_named_like_program).then(|| dir.to_path_buf())
+    }
+
     pub fn manual(name: &str, dir: Option<PathBuf>) -> ProgramHint {
         ProgramHint {
             name: name.to_string(),
@@ -100,6 +134,10 @@ impl ProgramHint {
         }
     }
 }
+
+/// Lowercase file-name prefixes of uninstallers (`unins000`, `Uninstall Obsidian`, `uninst`,
+/// `setup`, `install`): such an exe sits in the program's own folder.
+const UNINSTALLER_STEMS: [&str; 5] = ["unins", "uninstall", "uninst", "setup", "install"];
 
 /// `%SystemRoot%` [`norm`]ed (`C:\WINDOWS` when unset).
 pub(crate) fn system_root_norm() -> String {
@@ -225,6 +263,50 @@ mod tests {
             hidden,
             scope: Scope::Machine,
         }
+    }
+
+    fn hint_with(install: Option<&str>, uninstall: Option<&str>, icon: Option<&str>) -> ProgramHint {
+        let mut h = ProgramHint::manual("Obsidian", install.map(PathBuf::from));
+        h.uninstall_string = uninstall.map(str::to_string);
+        h.display_icon = icon.map(PathBuf::from);
+        h
+    }
+
+    #[test]
+    fn effective_install_dir_from_uninstall_string() {
+        let obsidian = r#""C:\Users\Jimmy\AppData\Local\Programs\Obsidian\Uninstall Obsidian.exe" /currentuser"#;
+        let want = Some(PathBuf::from(r"C:\Users\Jimmy\AppData\Local\Programs\Obsidian"));
+        assert_eq!(hint_with(None, Some(obsidian), None).effective_install_dir(), want);
+        // An InstallLocation that is a shared root falls through to the uninstaller too.
+        let pf = std::env::var("ProgramFiles").unwrap();
+        assert_eq!(hint_with(Some(&pf), Some(obsidian), None).effective_install_dir(), want);
+        // A real InstallLocation wins.
+        assert_eq!(hint_with(Some(r"D:\Obs"), Some(obsidian), None).effective_install_dir(), Some(PathBuf::from(r"D:\Obs")));
+        // Display icon: only in a folder named like the program.
+        assert_eq!(
+            hint_with(None, None, Some(r"D:\Apps\Obsidian\Obsidian.exe")).effective_install_dir(),
+            Some(PathBuf::from(r"D:\Apps\Obsidian"))
+        );
+        assert_eq!(hint_with(None, None, Some(r"D:\Apps\Bin\Obsidian.exe")).effective_install_dir(), None);
+        // An uninstaller without an uninstaller name, in a folder not named like the program.
+        assert_eq!(hint_with(None, Some(r#""D:\Cache\{X}\bundle.exe" /uninstall"#), None).effective_install_dir(), None);
+    }
+
+    #[test]
+    fn effective_install_dir_rejects_msiexec_and_system32() {
+        let sys = std::env::var("SystemRoot").unwrap();
+        assert_eq!(hint_with(None, Some("MsiExec.exe /X{ABC}"), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\MsiExec.exe /X{{ABC}}")), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\Obsidian\uninstall.exe")), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, None, Some(&format!(r"{sys}\Installer\{{X}}\setup.exe"))).effective_install_dir(), None);
+    }
+
+    #[test]
+    fn effective_install_dir_rejects_shared_root_parent() {
+        assert_eq!(hint_with(None, Some(r#""C:\Program Files\unins000.exe" /SILENT"#), None).effective_install_dir(), None);
+        let local = std::env::var("LOCALAPPDATA").unwrap();
+        assert_eq!(hint_with(None, Some(&format!(r"{local}\Programs\uninstall.exe")), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(r"C:\unins000.exe"), None).effective_install_dir(), None);
     }
 
     #[test]

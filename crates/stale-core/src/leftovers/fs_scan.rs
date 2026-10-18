@@ -80,7 +80,8 @@ fn holds_user_data(fs: &dyn FsReader, dir: &Path) -> bool {
 }
 
 pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
-    let install = hint.install_location.as_deref().filter(|p| !p.as_os_str().is_empty());
+    let install_dir = hint.effective_install_dir();
+    let install = install_dir.as_deref();
     let install_norm = install.map(norm);
     let is_install = |p: &Path| install_norm.as_deref() == Some(norm(p).as_str());
     let mut seen: HashSet<String> = HashSet::new();
@@ -272,6 +273,16 @@ mod tests {
         let out = scan_folders(&fs, &roots(), &hint("Unity Hub", None, Some(r"c:\program files\unity hub")));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, Confidence::High);
+    }
+
+    #[test]
+    fn install_folder_from_uninstall_string_is_high() {
+        let dir = r"C:\Users\A\AppData\Local\Programs\Obsidian";
+        let fs = FakeFs::new().dir(dir, 7).profile(r"C:\Users\A");
+        let mut h = hint("Obsidian", None, None);
+        h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
+        let out = scan_folders(&fs, &roots(), &h);
+        assert_eq!(dirs(&out), vec![(dir.to_string(), Confidence::High)]);
     }
 
     #[test]
