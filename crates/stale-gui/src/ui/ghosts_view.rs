@@ -40,6 +40,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
             ui.spinner();
             ui.label(strings::GHOSTS_SCANNING);
         });
+    } else if app.ghosts.is_none() {
+        ui.label(strings::GHOSTS_NOT_SCANNED);
     } else if let Some(sel) = app.ghosts.as_mut() {
         if sel.ghosts.is_empty() {
             ui.label(strings::GHOSTS_EMPTY);

@@ -61,6 +61,11 @@ pub fn keep_list_path() -> PathBuf {
     data_dir().join("important.json")
 }
 
+/// `%SystemRoot%\System32\Tasks`, where scheduled task files live.
+pub fn tasks_root() -> PathBuf {
+    PathBuf::from(env_or("SystemRoot", r"C:\Windows")).join("System32").join("Tasks")
+}
+
 /// `data_dir()\logs`, created on demand (creation errors are ignored).
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");

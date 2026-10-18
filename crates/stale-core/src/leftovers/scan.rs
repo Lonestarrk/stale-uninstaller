@@ -29,11 +29,10 @@ impl LeftoverSources {
     pub fn live() -> LeftoverSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
         let fs: Arc<dyn FsReader> = Arc::new(RealFs);
-        let system_root = fs.env("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string());
         LeftoverSources {
             fs_roots: FsScanRoots::from_env(&*fs),
             reg_roots: RegScanRoots::standard(&*reg),
-            tasks_root: PathBuf::from(system_root).join("System32").join("Tasks"),
+            tasks_root: crate::paths::tasks_root(),
             start_menu_targets: shortcut_targets(&start_menu_dirs()),
             desktop_targets: shortcut_targets(&desktop_dirs(&*fs)),
             keep: KeepList::load_from(&crate::paths::keep_list_path()),

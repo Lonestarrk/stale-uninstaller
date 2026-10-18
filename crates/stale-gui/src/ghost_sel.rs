@@ -1,7 +1,5 @@
 //! Which ghost programs the user has checked (no egui).
 
-use std::path::PathBuf;
-
 use stale_core::ghosts::{to_leftovers, Assessment, Ghost};
 use stale_core::leftovers::LeftoverReport;
 
@@ -21,7 +19,7 @@ impl GhostSelection {
 
     /// `(name, leftovers)` of each checked ghost, for the leftovers view.
     pub fn checked_reports(&self) -> Vec<(String, LeftoverReport)> {
-        let tasks_root = tasks_root();
+        let tasks_root = stale_core::paths::tasks_root();
         self.checked_ghosts().map(|g| (g.name.clone(), to_leftovers(g, &tasks_root))).collect()
     }
 
@@ -42,12 +40,6 @@ impl GhostSelection {
     fn checked_ghosts(&self) -> impl Iterator<Item = &Ghost> {
         self.ghosts.iter().zip(&self.checked).filter(|(_, c)| **c).map(|(g, _)| g)
     }
-}
-
-/// `%SystemRoot%\System32\Tasks`, where scheduled task files live (as `LeftoverSources::live`).
-fn tasks_root() -> PathBuf {
-    let system_root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    system_root.join("System32").join("Tasks")
 }
 
 #[cfg(test)]

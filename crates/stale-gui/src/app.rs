@@ -686,7 +686,8 @@ impl StaleApp {
 
     /// Starts a ghost scan over the installed programs, unless one runs or the program scan has
     /// not finished (without the full list every installed program would look like a ghost).
-    /// While the program scan runs, the ghost scan starts once it is done.
+    /// While the program scan runs, the ghost scan starts once it is done; with no programs at
+    /// all (the scan was aborted) it is refused with a warning.
     pub fn refresh_ghosts(&mut self) {
         if self.ghost_scan_running() {
             return;
@@ -696,7 +697,20 @@ impl StaleApp {
             return;
         }
         self.ghost_scan_waiting = false;
+        if self.programs.is_empty() {
+            log::warn!("ghost scan refused: no installed programs known");
+            self.warnings.push(strings::GHOSTS_NEED_PROGRAMS.to_string());
+            return;
+        }
         self.ghost_rx = Some(worker::spawn_ghost_scan(self.programs.clone(), self.unmatched_hits.clone()));
+    }
+
+    /// Starts (or refuses, see [`Self::refresh_ghosts`]) a ghost scan that waited for the
+    /// program scan, once that is done.
+    fn start_waiting_ghost_scan(&mut self) {
+        if self.ghost_scan_waiting && !self.scanning {
+            self.refresh_ghosts();
+        }
     }
 
     /// True while a ghost scan runs or waits for the program scan.
@@ -757,9 +771,7 @@ impl eframe::App for StaleApp {
         self.drain_leftover_scan();
         self.drain_quarantine_admin();
         self.drain_ghost_scan();
-        if self.ghost_scan_waiting && !self.scanning {
-            self.refresh_ghosts();
-        }
+        self.start_waiting_ghost_scan();
         if self.scanning
             || self.ghost_scan_running()
             || self.queue_running()
@@ -1210,6 +1222,30 @@ mod tests {
         app.flow = Some(FlowState::new(&[]));
         app.open_leftovers_from_flow();
         assert_eq!(app.leftovers_origin, View::Programs, "the uninstall flow's leftovers return to the list");
+    }
+
+    #[test]
+    fn refresh_ghosts_refuses_without_programs() {
+        let mut app = StaleApp::empty(Settings::default());
+        app.refresh_ghosts();
+        assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy());
+        assert_eq!(app.warnings, vec![strings::GHOSTS_NEED_PROGRAMS.to_string()]);
+    }
+
+    #[test]
+    fn ghost_scan_waits_while_scanning() {
+        let mut app = StaleApp::empty(Settings::default());
+        app.scanning = true;
+        app.show_ghosts();
+        assert_eq!(app.view, View::Ghosts);
+        assert!(app.ghost_scan_busy() && app.ghost_rx.is_none(), "waits for the program scan");
+        // The program scan ends without programs: the waiting scan is refused, not started.
+        app.start_waiting_ghost_scan();
+        assert!(app.ghost_scan_busy(), "still scanning: keeps waiting");
+        app.apply_event(ScanEvent::Done);
+        app.start_waiting_ghost_scan();
+        assert!(!app.ghost_scan_busy() && app.ghost_rx.is_none());
+        assert_eq!(app.warnings, vec![strings::GHOSTS_NEED_PROGRAMS.to_string()]);
     }
 
     #[test]
