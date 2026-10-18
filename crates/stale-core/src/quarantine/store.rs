@@ -44,16 +44,21 @@ pub fn save_manifest(dir: &Path, m: &QuarantineManifest) -> Result<(), String> {
 
 /// Every readable manifest below `dir`, newest first; unreadable or mismatching ones are skipped.
 pub fn list_manifests(dir: &Path) -> Vec<QuarantineManifest> {
-    list_trusted_manifests(dir, &|_| Some(true))
+    list_trusted_manifests(dir, &|_| Some(true), &|_| false)
 }
 
-/// Like [`list_manifests`], but only `<id>` folders for which `trusted` returns `Some(true)`
-/// (in production [`owned_by_admins`]), so a manifest planted by an unprivileged user is ignored.
-pub fn list_trusted_manifests(dir: &Path, trusted: &dyn Fn(&Path) -> Option<bool>) -> Vec<QuarantineManifest> {
+/// Like [`list_manifests`], but only `<id>` folders that are not reparse points (`is_reparse`) and
+/// for which `trusted` returns `Some(true)` (in production [`owned_by_admins`]), so a manifest or a
+/// junction planted by an unprivileged user is ignored.
+pub fn list_trusted_manifests(
+    dir: &Path,
+    trusted: &dyn Fn(&Path) -> Option<bool>,
+    is_reparse: &dyn Fn(&Path) -> bool,
+) -> Vec<QuarantineManifest> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out: Vec<QuarantineManifest> = rd
         .flatten()
-        .filter(|e| trusted(&e.path()) == Some(true))
+        .filter(|e| !is_reparse(&e.path()) && trusted(&e.path()) == Some(true))
         .filter_map(|e| {
             let text = std::fs::read_to_string(e.path().join(MANIFEST_FILE)).ok()?;
             let m: QuarantineManifest = serde_json::from_str(&text).ok()?;
@@ -65,7 +70,8 @@ pub fn list_trusted_manifests(dir: &Path, trusted: &dyn Fn(&Path) -> Option<bool
 }
 
 /// Whether `path` is owned by BUILTIN\Administrators or LocalSystem; `None` when the owner
-/// cannot be read (e.g. the path does not exist).
+/// cannot be read (e.g. the path does not exist). A reparse point is never trusted: the owner
+/// lookup would follow it to its target.
 pub fn owned_by_admins(path: &Path) -> Option<bool> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
@@ -75,6 +81,10 @@ pub fn owned_by_admins(path: &Path) -> Option<bool> {
         PSECURITY_DESCRIPTOR, PSID,
     };
 
+    std::fs::symlink_metadata(path).ok()?;
+    if super::fsmove::is_reparse_point(path) {
+        return Some(false);
+    }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -146,8 +156,55 @@ mod tests {
                 Some(false)
             }
         };
-        assert_eq!(list_trusted_manifests(dir.path(), &trusted), vec![a]);
+        assert_eq!(list_trusted_manifests(dir.path(), &trusted, &|_| false), vec![a]);
         assert_eq!(list_manifests(dir.path()).len(), 3, "the unfiltered listing is unchanged");
+    }
+
+    #[test]
+    fn list_trusted_manifests_skips_reparse_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let (a, b) = (manifest("a-1", now), manifest("b-2", now));
+        save_manifest(dir.path(), &a).unwrap();
+        save_manifest(dir.path(), &b).unwrap();
+        let link = dir.path().join("b-2");
+        let checked = std::cell::RefCell::new(Vec::new());
+        let trusted = |p: &Path| {
+            checked.borrow_mut().push(p.to_path_buf());
+            Some(true)
+        };
+        assert_eq!(list_trusted_manifests(dir.path(), &trusted, &|p| p == link), vec![a]);
+        assert!(!checked.borrow().contains(&link), "a reparse entry is refused before its owner is read");
+    }
+
+    /// `mklink /J link target`; false when it could not be created.
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Run with `cargo test -p stale-core -- --ignored junction`.
+    #[test]
+    #[ignore]
+    fn junction_to_trusted_folder_is_not_trusted_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let m = manifest("j-1", Utc::now());
+        save_manifest(other.path(), &m).unwrap();
+        assert!(junction(&dir.path().join("j-1"), &other.path().join("j-1")), "mklink /J failed");
+        let real = crate::quarantine::fsmove::is_reparse_point;
+        assert_eq!(list_trusted_manifests(dir.path(), &|_| Some(true), &real), vec![], "junction entry skipped");
+        assert_eq!(list_manifests(other.path()), vec![m], "the target itself is listable");
+
+        let programdata = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        let to_system = dir.path().join("to-programdata");
+        assert!(junction(&to_system, Path::new(&programdata)), "mklink /J failed");
+        assert_eq!(owned_by_admins(Path::new(&programdata)), Some(true));
+        assert_eq!(owned_by_admins(&to_system), Some(false), "a junction to a SYSTEM-owned folder is not trusted");
     }
 
     /// Run with `cargo test -p stale-core -- --ignored owned_by_admins`.

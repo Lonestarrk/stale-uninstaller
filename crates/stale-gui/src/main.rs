@@ -10,10 +10,15 @@ use stale_gui::logging;
 use stale_gui::strings::APP_TITLE;
 
 fn main() -> eframe::Result {
+    // Before anything (the log included) is written below the data folder.
+    let secured = stale_core::paths::secure_data_dir();
+    if let Err(e) = &secured {
+        eprintln!("could not lock down the data folder: {e}");
+    }
     logging::init();
     install_panic_hook();
     log::info!("Stale Uninstaller {} starting", stale_core::version());
-    if let Err(e) = stale_core::paths::secure_data_dir() {
+    if let Err(e) = secured {
         log::warn!("could not lock down the data folder: {e}");
     }
     spawn_auto_purge(Settings::load_from(&Settings::path()).quarantine_days);

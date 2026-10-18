@@ -89,7 +89,8 @@ fn is_reparse(md: &std::fs::Metadata) -> bool {
     md.file_type().is_symlink() || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn is_reparse_point(p: &Path) -> bool {
+/// Whether `p` itself (not its target) is a symlink, junction or other reparse point.
+pub(crate) fn is_reparse_point(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|md| is_reparse(&md))
 }
 

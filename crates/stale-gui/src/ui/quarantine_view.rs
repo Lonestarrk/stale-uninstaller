@@ -57,7 +57,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         table(ui, &app.quarantine, busy, &mut action);
     }
     match action {
-        Some(Action::Back) => app.view = View::Programs,
+        Some(Action::Back) => {
+            app.confirm_purge_all = false;
+            app.view = View::Programs;
+        }
         Some(Action::AskPurgeAll) => app.confirm_purge_all = true,
         Some(Action::CancelPurgeAll) => app.confirm_purge_all = false,
         Some(Action::PurgeAll) => {

@@ -390,12 +390,14 @@ fn secure_manifest_dir(ops: &QuarantineOps) -> Result<(), String> {
     ops.mover.ensure_payload_root(&ops.manifest_dir)
 }
 
-/// Refuses a `<manifest dir>\<id>` folder that `ops.trusted_dir` does not vouch for.
+/// Refuses a `<manifest dir>\<id>` folder that is a reparse point or that `ops.trusted_dir` does
+/// not vouch for.
 fn check_trusted(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), String> {
     let folder = ops.manifest_dir.join(&id.0);
-    match (ops.trusted_dir)(&folder) {
-        Some(true) => Ok(()),
-        _ => Err(format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display())),
+    if !ops.mover.is_reparse(&folder) && (ops.trusted_dir)(&folder) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display()))
     }
 }
 
@@ -683,7 +685,7 @@ pub fn auto_purge(ops: &QuarantineOps, days: u32, now: DateTime<Utc>) -> Vec<Qua
         log::warn!("auto-purge: {e}");
         return Vec::new();
     }
-    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir)
+    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir, &|p| ops.mover.is_reparse(p))
         .into_iter()
         .filter(|m| m.created < cutoff)
         .filter_map(|m| match purge_secured(ops, &m) {
@@ -1260,7 +1262,14 @@ mod tests {
 
         e.ops.trusted_dir = Box::new(|_| None);
         assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail("manifest", &untrusted)]), "unknown owner is refused too");
+        assert_eq!(purge(&e.ops, &m), Err(untrusted.clone()));
+
+        // A junction planted as `<id>` is refused even when its target looks trusted.
+        e.ops.trusted_dir = Box::new(|_| Some(true));
+        e.mover.set_reparse(&folder.display().to_string());
+        assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail("manifest", &untrusted)]));
         assert_eq!(purge(&e.ops, &m), Err(untrusted));
+        assert_eq!(auto_purge(&e.ops, 1, now() + Duration::days(30)), vec![]);
         assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")), "purge refused");
         assert!(folder.exists());
     }

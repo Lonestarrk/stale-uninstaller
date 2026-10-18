@@ -134,7 +134,7 @@ where
 
 /// Quarantines whose folders are owned by Administrators or SYSTEM.
 fn trusted_manifests(ops: &QuarantineOps) -> Vec<QuarantineManifest> {
-    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir)
+    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir, &|p| ops.mover.is_reparse(p))
 }
 
 fn find_manifest(ops: &QuarantineOps, id: &QuarantineId) -> Option<QuarantineManifest> {

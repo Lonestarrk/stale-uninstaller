@@ -31,11 +31,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         let mut show_hidden = app.settings.show_hidden;
         let mut toggled = false;
         let mut days = app.settings.quarantine_days;
+        let mut save_days = false;
         ui.menu_button(strings::SETTINGS_MENU, |ui| {
             toggled = ui.checkbox(&mut show_hidden, strings::SHOW_HIDDEN).changed();
             ui.horizontal(|ui| {
                 ui.label(strings::AUTO_PURGE_DAYS);
-                ui.add(egui::DragValue::new(&mut days).range(0..=365));
+                let r = ui.add(egui::DragValue::new(&mut days).range(0..=365));
+                // Saved once a drag ends, not for every value passed on the way.
+                save_days = r.drag_stopped() || (r.changed() && !r.dragged());
                 if days == 0 {
                     ui.label(strings::AUTO_PURGE_OFF);
                 }
@@ -45,6 +48,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             app.toggle_show_hidden();
         }
         if days != app.settings.quarantine_days {
+            app.settings.quarantine_days = days;
+        }
+        if save_days {
             app.set_quarantine_days(days);
         }
         if app.scanning {
