@@ -147,7 +147,7 @@ fn path_values(cx: &Ctx, k: &RegKeyPath, out: &mut Vec<Evidence>) -> bool {
             continue;
         }
         has_path_value = true;
-        if let Some(path) = string_value(&value).as_deref().and_then(install_dir).filter(|p| cx.is_dead(p)) {
+        if let Some(path) = string_value(&value, k).as_deref().and_then(install_dir).filter(|p| cx.is_dead(p)) {
             out.push(Evidence::RegKeyMissingPath { key: k.clone(), value_name: name, path });
         }
     }
@@ -182,7 +182,7 @@ fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
         return;
     }
     for (name, value) in cx.reg.values(root).unwrap_or_default() {
-        if let Some(target) = string_value(&value).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
+        if let Some(target) = string_value(&value, root).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
             out.push(dangling(RefKind::Run, root, target, Some(name)));
         }
     }
@@ -465,6 +465,36 @@ mod tests {
         let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
         live.sort();
         assert_eq!(live, vec![r"C:\Apps\Live\ext.dll", r"C:\Apps\Live\live.exe", r"C:\Apps\Live\open.exe", r"C:\Apps\Live\tray.exe"]);
+    }
+
+    #[test]
+    fn wow64_run_value_expands_to_x86() {
+        let mut reg = FakeRegistry::new();
+        let run = key(Hive::LocalMachine, &format!(r"SOFTWARE\WOW6432Node\{}", &RUN["Software\\".len()..]));
+        reg.set(run.clone(), "Gone32", RegValue::ExpandStr(r#""%ProgramFiles%\Gone Wow\gone.exe" /min"#.into()));
+        reg.set(run.clone(), "Plain32", s(r"%ProgramFiles%\Gone Plain\plain.exe"));
+        let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![run.clone()], app_paths: vec![] };
+        let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
+        let x86 = std::env::var("ProgramFiles(x86)").unwrap();
+        let location = format!(r"LocalMachine\{}", run.path);
+        assert_eq!(
+            ev,
+            vec![
+                dangling(RefKind::Run, &location, &format!(r"{x86}\Gone Wow\gone.exe"), Some("Gone32")),
+                dangling(RefKind::Run, &location, &format!(r"{x86}\Gone Plain\plain.exe"), Some("Plain32")),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_hive_user_variables_are_skipped() {
+        let mut reg = FakeRegistry::new();
+        let theirs = key(Hive::Users, r"S-1-5-21-9\Software\Microsoft\Windows\CurrentVersion\Run");
+        reg.set(theirs.clone(), "Local", RegValue::ExpandStr(r"%LOCALAPPDATA%\Gone\g.exe".into()));
+        reg.set(theirs.clone(), "Fixed", RegValue::ExpandStr(r"C:\Gone Fixed\f.exe".into()));
+        let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![theirs.clone()], app_paths: vec![] };
+        let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
+        assert_eq!(ev, vec![dangling(RefKind::Run, &format!(r"Users\{}", theirs.path), r"C:\Gone Fixed\f.exe", Some("Fixed"))]);
     }
 
     #[test]

@@ -29,6 +29,34 @@ pub fn expand_env(s: &str) -> String {
     out
 }
 
+/// `%ProgramFiles%` -> `%ProgramFiles(x86)%` and `%CommonProgramFiles%` ->
+/// `%CommonProgramFiles(x86)%` (case-insensitive): what a 32-bit program's value means.
+pub fn wow64_vars(s: &str) -> String {
+    const MAP: [(&str, &str); 2] =
+        [("%PROGRAMFILES%", "%ProgramFiles(x86)%"), ("%COMMONPROGRAMFILES%", "%CommonProgramFiles(x86)%")];
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    'scan: while i < s.len() {
+        for (from, to) in MAP {
+            if s.get(i..i + from.len()).is_some_and(|w| w.eq_ignore_ascii_case(from)) {
+                out.push_str(to);
+                i += from.len();
+                continue 'scan;
+            }
+        }
+        let c = s[i..].chars().next().unwrap_or_default();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// [`expand_env`] for a value read in the 32-bit registry view (under `WOW6432Node`):
+/// `%ProgramFiles%` and `%CommonProgramFiles%` name the x86 folders ([`wow64_vars`]).
+pub fn expand_env_wow64(s: &str) -> String {
+    expand_env(&wow64_vars(s))
+}
+
 /// Extracts the executable path from a command line (quotes stripped, env expanded).
 pub fn first_path_in_command(cmd: &str) -> Option<PathBuf> {
     let cmd = cmd.trim();
@@ -238,6 +266,16 @@ mod tests {
         assert_eq!(expand_env(r"%NO_SUCH_VAR_XYZ%\Foo"), r"%NO_SUCH_VAR_XYZ%\Foo");
         assert_eq!(expand_env("50% done"), "50% done");
         assert_eq!(expand_env("plain"), "plain");
+    }
+
+    #[test]
+    fn expand_env_wow64_names_the_x86_folders() {
+        let x86 = std::env::var("ProgramFiles(x86)").unwrap();
+        let common_x86 = std::env::var("CommonProgramFiles(x86)").unwrap();
+        assert_eq!(expand_env_wow64(r"%programfiles%\Foo\a.exe"), format!(r"{x86}\Foo\a.exe"));
+        assert_eq!(expand_env_wow64(r"%CommonProgramFiles%\Bar"), format!(r"{common_x86}\Bar"));
+        assert_eq!(wow64_vars(r"%ProgramFiles(x86)%\X"), r"%ProgramFiles(x86)%\X");
+        assert_eq!(wow64_vars("plain ä %ProgramData%"), "plain ä %ProgramData%");
     }
 
     #[test]

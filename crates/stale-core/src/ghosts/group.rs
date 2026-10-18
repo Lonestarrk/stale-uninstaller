@@ -8,7 +8,7 @@ use crate::leftovers::fs_scan::FsScanRoots;
 use crate::leftovers::names::{is_matchable, name_matches_exact, normalize_name, publisher_matches};
 use crate::leftovers::scan::{dedupe_key, kind_group, rank};
 use crate::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
-use crate::model::{Program, RegKeyPath};
+use crate::model::{Hive, Program, RegKeyPath};
 use crate::pathutil::{drive_letter, norm, normed_under};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -220,6 +220,17 @@ fn in_other_profile(e: &Evidence, current_profile: Option<&Path>) -> bool {
     !normed_under(&norm(path), &norm(current))
 }
 
+/// True for registry evidence read from another account's hive (`HKU\<SID>`): what it points at
+/// may be that account's own per-user install, invisible to us.
+fn from_other_hive(e: &Evidence) -> bool {
+    let key = match e {
+        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => Some(key.clone()),
+        Evidence::DanglingRef { location, .. } => parse_location(location),
+        _ => None,
+    };
+    key.is_some_and(|k| k.hive == Hive::Users)
+}
+
 /// The assessment and, for [`Assessment::Uncertain`], the reasons. The name and folder reasons
 /// override strong evidence; [`REASON_APPDATA_ONLY`] and [`REASON_DATA_ONLY`] (folders only)
 /// can only hold without it.
@@ -254,7 +265,7 @@ fn assess(
     if evidence.iter().filter_map(|e| container_of(e, roots)).any(|c| installed.owns_sibling_in(&c)) {
         reasons.push(REASON_SIBLING_OWNED);
     }
-    if evidence.iter().any(|e| in_other_profile(e, current_profile)) {
+    if evidence.iter().any(|e| in_other_profile(e, current_profile) || from_other_hive(e)) {
         reasons.push(REASON_OTHER_PROFILE);
     }
     let strong = evidence.iter().any(|e| {
@@ -430,7 +441,7 @@ pub fn to_leftovers(g: &Ghost, tasks_root: &Path) -> LeftoverReport {
 mod tests {
     use super::*;
     use crate::fsys::FakeFs;
-    use crate::model::{Hive, ProgramId, Scope};
+    use crate::model::{ProgramId, Scope};
     use crate::registry::key;
     use crate::usage::UsageSource;
     use chrono::TimeZone;
@@ -681,6 +692,35 @@ mod tests {
         assert_eq!(reasons(&ghosts[1]), vec![REASON_OTHER_PROFILE]);
         assert_eq!(ghosts[1].note.as_deref(), Some(NOTE_OTHER_PROFILE));
         assert_eq!(ghosts[0].note, None);
+    }
+
+    #[test]
+    fn other_hive_evidence_is_uncertain_other_profile() {
+        let r = roots(&[]);
+        let theirs = key(Hive::Users, r"S-1-5-21-9\Software\Their Tool");
+        let ev = vec![
+            Evidence::RegKeyMissingPath { key: theirs.clone(), value_name: "InstallDir".into(), path: r"D:\Their Tool".into() },
+            Evidence::DanglingRef {
+                kind: RefKind::Run,
+                location: format!(r"Users\S-1-5-21-9\{RUN}"),
+                target: r"C:\Program Files\Their Runner\r.exe".into(),
+                value_name: Some("Runner".into()),
+            },
+            missing_path(r"SOFTWARE\Our Tool"),
+        ];
+        let ghosts = group_t(ev, &installed(&[]), &KeepList::default(), &r, None);
+        assert_eq!(
+            summary(&ghosts),
+            vec![
+                ("Our Tool".to_string(), Assessment::ProbablyUninstalled),
+                ("Their Runner".to_string(), Assessment::Uncertain),
+                ("Their Tool".to_string(), Assessment::Uncertain),
+            ]
+        );
+        for g in &ghosts[1..] {
+            assert_eq!(reasons(g), vec![REASON_OTHER_PROFILE]);
+            assert_eq!(g.note.as_deref(), Some(NOTE_OTHER_PROFILE));
+        }
     }
 
     #[test]

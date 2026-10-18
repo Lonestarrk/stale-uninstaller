@@ -7,7 +7,7 @@ use super::names::normalize_name;
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_PROGID_OF_PROGRAM};
 use crate::fsys::FsReader;
 use crate::model::{Hive, RegKeyPath};
-use crate::pathutil::{drive_letter, exe_under, expand_env, first_path_in_command};
+use crate::pathutil::{drive_letter, exe_under, expand_env, expand_env_wow64, first_path_in_command, wow64_vars};
 use crate::programs::other_user_sids;
 use crate::registry::{key, RegValue, RegistryReader};
 use std::collections::HashSet;
@@ -107,17 +107,36 @@ pub(crate) fn child(parent: &RegKeyPath, name: &str) -> RegKeyPath {
     key(parent.hive, &format!(r"{}\{name}", parent.path))
 }
 
-/// `Str` and env-expanded `ExpandStr`; other types are ignored.
-pub(crate) fn string_value(v: &RegValue) -> Option<String> {
+/// Per-user folder variables: expanded in this process they name *our* profile, not the one of
+/// the account whose hive the value was read from.
+const USER_VARIABLES: [&str; 6] = ["%LOCALAPPDATA%", "%APPDATA%", "%USERPROFILE%", "%TEMP%", "%TMP%", "%HOMEPATH%"];
+
+/// True when `k` lies under a `WOW6432Node` key (the 32-bit view).
+fn in_wow64_view(k: &RegKeyPath) -> bool {
+    k.path.split('\\').any(|c| c.eq_ignore_ascii_case("WOW6432Node"))
+}
+
+/// `Str` and env-expanded `ExpandStr` of a value read under the key `at`; other types are
+/// ignored. Under a `WOW6432Node` key `%ProgramFiles%` and `%CommonProgramFiles%` name the x86
+/// folders (in a `Str` too, which is expanded later as a command line). Under another account's
+/// hive ([`Hive::Users`]) an `ExpandStr` naming a per-user folder variable is skipped.
+pub(crate) fn string_value(v: &RegValue, at: &RegKeyPath) -> Option<String> {
+    let wow64 = in_wow64_view(at);
     match v {
-        RegValue::Str(s) => Some(s.clone()),
-        RegValue::ExpandStr(s) => Some(expand_env(s)),
+        RegValue::Str(s) => Some(if wow64 { wow64_vars(s) } else { s.clone() }),
+        RegValue::ExpandStr(s) => {
+            let upper = s.to_uppercase();
+            if at.hive == Hive::Users && USER_VARIABLES.iter().any(|var| upper.contains(var)) {
+                return None;
+            }
+            Some(if wow64 { expand_env_wow64(s) } else { expand_env(s) })
+        }
         _ => None,
     }
 }
 
 pub(crate) fn default_string(reg: &dyn RegistryReader, k: &RegKeyPath) -> Option<String> {
-    reg.values(k).ok()?.iter().find(|(n, _)| n.is_empty()).and_then(|(_, v)| string_value(v))
+    reg.values(k).ok()?.iter().find(|(n, _)| n.is_empty()).and_then(|(_, v)| string_value(v, k))
 }
 
 /// The path in a value that is either a bare path (a DLL path may hold unquoted spaces) or a
@@ -316,7 +335,7 @@ fn named_file_type(
 fn run_values(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, found: &mut Found) {
     let Ok(values) = reg.values(root) else { return };
     for (name, value) in values {
-        let exe = string_value(&value).as_deref().and_then(first_path_in_command);
+        let exe = string_value(&value, root).as_deref().and_then(first_path_in_command);
         if exe.is_some_and(|p| target.refers_to(&p)) {
             found.push(LeftoverKind::RegValue { key: root.clone(), name }, Confidence::High, None);
         }
