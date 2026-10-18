@@ -7,7 +7,8 @@ use stale_core::ghosts::{parse_location, Assessment, Evidence, Ghost, RefKind};
 
 use super::leftovers_view::{key_text, note_text};
 use super::STALE_COLOR;
-use crate::app::{StaleApp, View};
+use crate::app::{KeepEntry, StaleApp, View};
+use stale_core::keep::KeepList;
 use crate::{format, strings};
 
 /// Evidence lists longer than this start collapsed.
@@ -18,6 +19,7 @@ enum Action {
     Back,
     Refresh,
     Keep(String),
+    UndoKeep,
     ShowLeftovers,
 }
 
@@ -35,6 +37,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
         }
     });
     ui.separator();
+    if let Some(kept) = &app.last_kept {
+        ui.horizontal(|ui| {
+            ui.label(strings::kept_notice(&kept.ghost.name));
+            if ui.button(strings::UNDO).clicked() {
+                action = Some(Action::UndoKeep);
+            }
+        });
+    }
     if busy {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -84,9 +94,48 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
         Some(Action::Back) => app.view = View::Programs,
         Some(Action::Refresh) => app.refresh_ghosts(),
         Some(Action::Keep(key)) => app.keep_ghost(&key),
+        Some(Action::UndoKeep) => app.undo_keep(),
         Some(Action::ShowLeftovers) => app.open_leftovers_from_ghosts(),
         None => {}
     }
+}
+
+/// The "Behållna" window: every kept name, folder and registry key, each with "Ta bort".
+pub fn keep_window(ui: &mut egui::Ui, app: &mut StaleApp) {
+    if !app.keep_window_open {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let mut open = true;
+    let mut remove = None;
+    egui::Window::new(strings::KEPT_TITLE).open(&mut open).collapsible(false).show(&ctx, |ui| {
+        if keep_entries(&app.keep).is_empty() {
+            ui.label(strings::KEPT_EMPTY);
+            return;
+        }
+        egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+            for (entry, text) in keep_entries(&app.keep) {
+                ui.horizontal(|ui| {
+                    if ui.button(strings::KEPT_REMOVE).clicked() {
+                        remove = Some(entry.clone());
+                    }
+                    ui.label(text);
+                });
+            }
+        });
+    });
+    app.keep_window_open = open;
+    if let Some(entry) = remove {
+        app.remove_keep_entry(&entry);
+    }
+}
+
+/// Each keep entry with its line: names, then folders, then registry keys.
+fn keep_entries(keep: &KeepList) -> Vec<(KeepEntry, String)> {
+    let names = keep.names.iter().map(|n| (KeepEntry::Name(n.clone()), strings::kept_name(n)));
+    let paths = keep.paths.iter().map(|p| (KeepEntry::Path(p.clone()), strings::kept_path(&p.display().to_string())));
+    let keys = keep.keys.iter().map(|k| (KeepEntry::Key(k.clone()), strings::kept_key(&key_text(k))));
+    names.chain(paths).chain(keys).collect()
 }
 
 /// Check box, name, assessment, size, last use and Behåll; then why it is uncertain and its evidence.
@@ -243,6 +292,28 @@ mod tests {
         assert_eq!(uncertainty_text(&g), Some(both));
         g.reasons.clear();
         assert_eq!(uncertainty_text(&g).as_deref(), Some(strings::NOTE_OTHER_PROFILE));
+    }
+
+    #[test]
+    fn keep_entries_list_names_paths_and_keys() {
+        let keep = KeepList {
+            names: vec!["Alpha".into()],
+            paths: vec![PathBuf::from(r"C:\Program Files\Alpha")],
+            keys: vec![RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Alpha".into() }],
+        };
+        let entries = keep_entries(&keep);
+        assert_eq!(
+            entries,
+            vec![
+                (KeepEntry::Name("Alpha".into()), strings::kept_name("Alpha")),
+                (KeepEntry::Path(PathBuf::from(r"C:\Program Files\Alpha")), strings::kept_path(r"C:\Program Files\Alpha")),
+                (
+                    KeepEntry::Key(RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Alpha".into() }),
+                    strings::kept_key(r"HKCU\Software\Alpha")
+                ),
+            ]
+        );
+        assert!(keep_entries(&KeepList::default()).is_empty());
     }
 
     #[test]

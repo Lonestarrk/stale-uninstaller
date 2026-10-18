@@ -36,6 +36,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         let mut toggled = false;
         let mut days = app.settings.quarantine_days;
         let mut save_days = false;
+        let mut open_kept = false;
         ui.menu_button(strings::SETTINGS_MENU, |ui| {
             toggled = ui.checkbox(&mut show_hidden, strings::SHOW_HIDDEN).changed();
             ui.horizontal(|ui| {
@@ -47,9 +48,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                     ui.label(strings::AUTO_PURGE_OFF);
                 }
             });
+            if ui.button(strings::KEPT_MENU).clicked() {
+                open_kept = true;
+                ui.close();
+            }
         });
         if toggled {
             app.toggle_show_hidden();
+        }
+        if open_kept {
+            app.keep_window_open = true;
         }
         if days != app.settings.quarantine_days {
             app.settings.quarantine_days = days;

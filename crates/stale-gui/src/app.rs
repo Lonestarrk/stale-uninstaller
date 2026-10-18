@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
-use stale_core::ghosts::Evidence;
+use stale_core::ghosts::{Evidence, Ghost};
 use stale_core::keep::KeepList;
 use stale_core::leftovers::ProgramHint;
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
@@ -20,7 +20,7 @@ use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMo
 use stale_core::usage::matching::ProgramUsage;
 use stale_core::usage::UsageHit;
 use stale_core::pathutil::first_path_in_command;
-use stale_core::{Program, ProgramId, Scope};
+use stale_core::{Program, ProgramId, RegKeyPath, Scope};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
@@ -87,6 +87,25 @@ pub struct SearchDialog {
     pub dir: String,
 }
 
+/// A ghost kept with "Behåll": what "Ångra" puts back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeptGhost {
+    pub ghost: Ghost,
+    /// Its row in the ghosts view, and whether it was checked.
+    index: usize,
+    checked: bool,
+    /// The keep list before the ghost was kept.
+    keep_before: KeepList,
+}
+
+/// One entry of the keep list, as the "Behållna" window lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeepEntry {
+    Name(String),
+    Path(PathBuf),
+    Key(RegKeyPath),
+}
+
 pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
@@ -136,6 +155,10 @@ pub struct StaleApp {
     ghost_scan_waiting: bool,
     /// What the user chose to keep ("Behåll"); saved to `paths::keep_list_path()`.
     pub keep: KeepList,
+    /// The "Behållna" window (the keep list, editable) is open.
+    pub keep_window_open: bool,
+    /// The last ghost kept with "Behåll", for its "Ångra" notice.
+    pub last_kept: Option<KeptGhost>,
     /// The view the leftovers view's back button returns to: `Programs` or `Ghosts`.
     pub leftovers_origin: View,
     /// Every program from the scan, hidden ones included.
@@ -197,6 +220,8 @@ impl StaleApp {
             ghost_rx: None,
             ghost_scan_waiting: false,
             keep: KeepList::default(),
+            keep_window_open: false,
+            last_kept: None,
             leftovers_origin: View::Programs,
             programs: Vec::new(),
             usage: HashMap::new(),
@@ -643,7 +668,10 @@ impl StaleApp {
 
     fn keep_ghost_at(&mut self, key: &str, path: &Path) {
         let Some(sel) = self.ghosts.as_mut() else { return };
-        let Some(ghost) = sel.ghosts.iter().find(|g| g.key == key) else { return };
+        let Some(index) = sel.ghosts.iter().position(|g| g.key == key) else { return };
+        let ghost = &sel.ghosts[index];
+        self.last_kept =
+            Some(KeptGhost { ghost: ghost.clone(), index, checked: sel.checked[index], keep_before: self.keep.clone() });
         self.keep.keep_name(ghost.name.clone());
         for e in &ghost.evidence {
             match e {
@@ -653,6 +681,47 @@ impl StaleApp {
             }
         }
         sel.remove_by_key(key);
+        if let Err(e) = self.keep.save_to(path) {
+            log::warn!("could not save the keep list to {}: {e}", path.display());
+            self.warnings.push(format!("{}: {e}", strings::KEEP_SAVE_FAILED));
+        }
+    }
+
+    /// "Ångra" after "Behåll": puts the keep list back as it was before (and saves it) and the
+    /// ghost back in its row, checked as it was.
+    pub fn undo_keep(&mut self) {
+        self.undo_keep_at(&stale_core::paths::keep_list_path());
+    }
+
+    fn undo_keep_at(&mut self, path: &Path) {
+        let Some(kept) = self.last_kept.take() else { return };
+        self.keep = kept.keep_before;
+        self.save_keep(path);
+        if let Some(sel) = self.ghosts.as_mut() {
+            let at = kept.index.min(sel.ghosts.len());
+            sel.ghosts.insert(at, kept.ghost);
+            sel.checked.insert(at, kept.checked);
+        }
+    }
+
+    /// "Ta bort" in the "Behållna" window: forgets one keep entry and saves the list. Nothing is
+    /// rescanned; the next "Uppdatera" shows what the entry hid.
+    pub fn remove_keep_entry(&mut self, entry: &KeepEntry) {
+        self.remove_keep_entry_at(entry, &stale_core::paths::keep_list_path());
+    }
+
+    fn remove_keep_entry_at(&mut self, entry: &KeepEntry, path: &Path) {
+        match entry {
+            KeepEntry::Name(n) => self.keep.remove_name(n),
+            KeepEntry::Path(p) => self.keep.remove_path(p),
+            KeepEntry::Key(k) => self.keep.remove_key(k),
+        }
+        // The undo notice would bring the removed entry back.
+        self.last_kept = None;
+        self.save_keep(path);
+    }
+
+    fn save_keep(&mut self, path: &Path) {
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
             self.warnings.push(format!("{}: {e}", strings::KEEP_SAVE_FAILED));
@@ -725,6 +794,7 @@ impl StaleApp {
             Ok(GhostEvent::Done(ghosts)) => {
                 log::info!("ghost scan found {} ghosts", ghosts.len());
                 self.ghosts = Some(GhostSelection::new(ghosts));
+                self.last_kept = None;
             }
             Ok(GhostEvent::Failed(msg)) => {
                 log::error!("{msg}");
@@ -810,6 +880,7 @@ impl eframe::App for StaleApp {
         });
         uninstall_dialog::show(ui, self);
         leftovers_view::search_window(ui, self);
+        ghosts_view::keep_window(ui, self);
         egui::CentralPanel::default().show(ui, |ui| {
             match self.view {
                 View::Programs => {}
@@ -1165,6 +1236,55 @@ mod tests {
         assert_eq!(app.unmatched_hits, vec![hit]);
         app.clear_scan_data();
         assert!(app.unmatched_hits.is_empty(), "a new scan starts without the old hits");
+    }
+
+    #[test]
+    fn undo_keep_restores_ghost() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::Assessment;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        let mut app = StaleApp::empty(Settings::default());
+        app.keep.keep_name("Earlier".into());
+        app.ghosts = Some(GhostSelection::new(vec![
+            ghost("Alpha", Assessment::LeftoversOnly, 1),
+            ghost("Beta", Assessment::ProbablyUninstalled, 2),
+            ghost("Gamma", Assessment::LeftoversOnly, 3),
+        ]));
+        app.keep_ghost_at("beta", &path);
+        assert!(app.keep.is_name_kept("Beta"));
+        assert_eq!(app.last_kept.as_ref().map(|k| k.ghost.name.as_str()), Some("Beta"));
+
+        app.undo_keep_at(&path);
+        let sel = app.ghosts.as_ref().unwrap();
+        assert_eq!(sel.ghosts.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["Alpha", "Beta", "Gamma"]);
+        assert_eq!(sel.checked, vec![false, true, false], "back in its row, checked as before");
+        assert_eq!(app.keep.names, vec!["Earlier".to_string()], "the keep entries are reverted");
+        assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
+        assert_eq!(KeepList::load_from(&path), app.keep, "and saved");
+        assert!(app.last_kept.is_none());
+        app.undo_keep_at(&path);
+        assert_eq!(app.ghosts.as_ref().unwrap().ghosts.len(), 3, "a second undo does nothing");
+    }
+
+    #[test]
+    fn remove_keep_entry_saves_and_rescans_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        let mut app = StaleApp::empty(Settings::default());
+        let key = RegKeyPath { hive: Hive::LocalMachine, path: r"SOFTWARE\Alpha".into() };
+        app.keep.keep_name("Alpha".into());
+        app.keep.keep_path(PathBuf::from(r"C:\Program Files\Alpha"));
+        app.keep.keep_key(key.clone());
+        app.programs = vec![program("installed", false)];
+        app.remove_keep_entry_at(&KeepEntry::Path(PathBuf::from(r"c:\program files\alpha")), &path);
+        app.remove_keep_entry_at(&KeepEntry::Key(key), &path);
+        assert_eq!(app.keep.names, vec!["Alpha".to_string()]);
+        assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
+        assert_eq!(KeepList::load_from(&path), app.keep);
+        app.remove_keep_entry_at(&KeepEntry::Name("alpha".into()), &path);
+        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy(), "nothing is rescanned");
     }
 
     #[test]

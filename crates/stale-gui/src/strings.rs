@@ -55,6 +55,31 @@ pub const SHOW_HIDDEN: &str = "Visa dolda poster";
 pub const AUTO_PURGE_DAYS: &str = "Töm karantän automatiskt efter N dagar";
 /// Next to the auto-purge days when they are 0.
 pub const AUTO_PURGE_OFF: &str = "(av)";
+pub const KEPT_MENU: &str = "Behållna…";
+pub const KEPT_TITLE: &str = "Behållna";
+pub const KEPT_EMPTY: &str = "Inget är behållet";
+pub const KEPT_REMOVE: &str = "Ta bort";
+pub const UNDO: &str = "Ångra";
+
+/// A kept program name in the "Behållna" window.
+pub fn kept_name(name: &str) -> String {
+    format!("Program: {name}")
+}
+
+/// A kept folder in the "Behållna" window.
+pub fn kept_path(path: &str) -> String {
+    format!("Mapp: {path}")
+}
+
+/// A kept registry key in the "Behållna" window.
+pub fn kept_key(key: &str) -> String {
+    format!("Registernyckel: {key}")
+}
+
+/// The one-line notice after "Behåll", next to "Ångra".
+pub fn kept_notice(name: &str) -> String {
+    format!("{name} behålls och visas inte längre.")
+}
 
 // Details panel
 pub const NO_SELECTION: &str = "Inget program valt";
