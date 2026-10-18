@@ -30,6 +30,8 @@ pub struct ExeUsage {
 pub enum ExcludeReason {
     NamePattern,
     Service,
+    /// The exe is the action of a scheduled task (background maintenance, not a user launch).
+    ScheduledTask,
     /// Kept for deserialisation. Only produced for a hit that belongs to a program through a
     /// file-name claim alone (no install folder) and is not its main exe: that is the
     /// uninstaller's or icon's name, not proof of a subcomponent. Inside the install folder a
@@ -65,6 +67,8 @@ pub struct MatchInput<'a> {
     /// name-excluded shortcut targets (see `main_exes`, tier 2).
     pub arg_exes: &'a HashMap<ProgramId, Vec<PathBuf>>,
     pub service_exes: &'a HashSet<String>,
+    /// `norm()`ed exe paths of scheduled-task actions.
+    pub task_exes: &'a HashSet<String>,
 }
 
 pub struct MatchResult {
@@ -373,7 +377,9 @@ fn group_hits(
     hits: Vec<UsageHit>,
     is_main: impl Fn(&Path) -> bool,
     in_folder: impl Fn(&Path) -> bool,
-    service_exes: &HashSet<String>) -> Vec<ExeUsage> {
+    service_exes: &HashSet<String>,
+    task_exes: &HashSet<String>,
+) -> Vec<ExeUsage> {
     let mut groups: BTreeMap<String, Vec<UsageHit>> = BTreeMap::new();
     for hit in hits {
         groups.entry(norm(&hit.exe_path)).or_default().push(hit);
@@ -397,6 +403,9 @@ fn group_hits(
                     None
                 } else {
                     exclude_reason(&latest.exe_path, service_exes)
+                        .or(task_exes.contains(&norm(&latest.exe_path)).then_some(ExcludeReason::ScheduledTask))
+                        // A cached or bundled setup is never use of the program.
+                        .or((!main && is_installer(&latest.exe_path)).then_some(ExcludeReason::NamePattern))
                         .or((!main && !in_folder(&latest.exe_path)).then_some(ExcludeReason::NotMain))
                 },
             })
@@ -429,11 +438,13 @@ fn summarize(
     hits: Vec<UsageHit>,
     is_main: impl Fn(&Path) -> bool,
     in_folder: impl Fn(&Path) -> bool,
-    service_exes: &HashSet<String>) -> ProgramUsage {
+    service_exes: &HashSet<String>,
+    task_exes: &HashSet<String>,
+) -> ProgramUsage {
     let (file_times, real): (Vec<UsageHit>, Vec<UsageHit>) = hits.into_iter().partition(|h| h.source == UsageSource::FileTime);
-    let real = group_hits(real, &is_main, &in_folder, service_exes);
+    let real = group_hits(real, &is_main, &in_folder, service_exes, task_exes);
     let real_exes: HashSet<String> = real.iter().map(|e| norm(&e.exe_path)).collect();
-    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes)
+    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes, task_exes)
         .into_iter()
         .filter(|e| !real_exes.contains(&norm(&e.exe_path)))
         .collect();
@@ -462,7 +473,7 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
     let by_program = candidates
         .iter()
         .zip(assigned)
-        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes)))
+        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes)))
         .collect();
     MatchResult { by_program, unmatched }
 }
@@ -570,10 +581,24 @@ mod tests {
     }
 
     /// Runs matching with Foo's shortcut `C:\Apps\Foo\foo.exe` and no root exes.
+    fn run_with_tasks(programs: &[Program], hits: &[UsageHit], tasks: &HashSet<String>) -> MatchResult {
+        let shortcuts = targets(&[r"C:\Apps\Foo\foo.exe"]);
+        let services = HashSet::new();
+        match_usage(&MatchInput {
+            programs,
+            hits,
+            shortcut_targets: &shortcuts,
+            root_exes: &HashMap::new(),
+            arg_exes: &HashMap::new(),
+            service_exes: &services,
+            task_exes: tasks,
+        })
+    }
+
     fn run(programs: &[Program], hits: &[UsageHit], services: &HashSet<String>) -> MatchResult {
         let shortcuts = targets(&[r"C:\Apps\Foo\foo.exe"]);
         let roots = HashMap::new();
-        match_usage(&MatchInput { programs, hits, shortcut_targets: &shortcuts, root_exes: &roots, arg_exes: &HashMap::new(), service_exes: services })
+        match_usage(&MatchInput { programs, hits, shortcut_targets: &shortcuts, root_exes: &roots, arg_exes: &HashMap::new(), service_exes: services, task_exes: &HashSet::new() })
     }
 
     fn usage<'a>(r: &'a MatchResult, id: &str) -> &'a ProgramUsage {
@@ -824,6 +849,7 @@ mod tests {
             root_exes: &HashMap::from([(ProgramId("Foo".into()), roots)]),
             arg_exes: &HashMap::new(),
             service_exes: &services,
+            task_exes: &HashSet::new(),
         });
         assert_eq!(usage(&r, "Foo").last_used.when, None);
     }
@@ -855,6 +881,7 @@ mod tests {
             root_exes: &HashMap::from([(ProgramId("Discord".into()), roots)]),
             arg_exes: &HashMap::from([(ProgramId("Discord".into()), vec![main.clone()])]),
             service_exes: &HashSet::new(),
+            task_exes: &HashSet::new(),
         });
         let u = usage(&r, "Discord");
         assert_eq!(u.last_used, LastUsed { when: Some(days_ago(3)), source: Some(UsageSource::Bam), confident: true, via: None });
@@ -901,6 +928,7 @@ mod tests {
             root_exes: &HashMap::new(),
             arg_exes: &HashMap::new(),
             service_exes: &HashSet::new(),
+            task_exes: &HashSet::new(),
         };
         explain_match(&input, &ProgramId(id.to_string())).into_iter().map(|e| e.outcome).collect()
     }
@@ -943,7 +971,7 @@ mod tests {
         args: &'a HashMap<ProgramId, Vec<PathBuf>>,
         services: &'a HashSet<String>,
     ) -> MatchInput<'a> {
-        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services }
+        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services, task_exes: Box::leak(Box::default()) }
     }
 
     /// Observed live: Steam's Uninstall entry has no InstallLocation, only
@@ -1191,11 +1219,47 @@ mod tests {
             hit(&format!(r"{chrome}\updater.exe"), 0, UsageSource::Prefetch),
             hit(&format!(r"{chrome}\Application\crashpad_handler.exe"), 0, UsageSource::Bam),
             hit(&format!(r"{chrome}\unins000.exe"), 0, UsageSource::Bam),
+            hit(&format!(r"{chrome}\Application\141.0\Installer\setup.exe"), 0, UsageSource::Bam),
         ];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Chrome");
         assert_eq!(u.last_used.when, None);
-        assert!(u.exes.iter().all(|e| e.excluded == Some(ExcludeReason::NamePattern)));
+        assert!(u.exes.iter().all(|e| e.excluded == Some(ExcludeReason::NamePattern)), "{:?}", u.exes);
+    }
+
+    #[test]
+    fn scheduled_task_exe_does_not_count() {
+        let programs = [prog("Office", Some(r"C:\Program Files\Microsoft Office"))];
+        let hits = [
+            hit(r"C:\Program Files\Microsoft Office\root\VFS\ActionsServer.exe", 0, UsageSource::Bam),
+            hit(r"C:\Program Files\Microsoft Office\Office16\opushutil.exe", 0, UsageSource::Prefetch),
+            hit(r"C:\Program Files\Microsoft Office\Office16\WINWORD.EXE", 5, UsageSource::Bam),
+        ];
+        let tasks = HashSet::from([
+            norm(Path::new(r"C:\Program Files\Microsoft Office\root\VFS\ActionsServer.exe")),
+            norm(Path::new(r"C:\Program Files\Microsoft Office\Office16\opushutil.exe")),
+        ]);
+        let r = run_with_tasks(&programs, &hits, &tasks);
+        let u = usage(&r, "Office");
+        assert_eq!(via_of(u), (Some(days_ago(5)), Some("winword.exe")));
+        assert_eq!(u.exes.iter().filter(|e| e.excluded == Some(ExcludeReason::ScheduledTask)).count(), 2);
+    }
+
+    #[test]
+    fn firefox_default_browser_agent_task_does_not_count() {
+        let ff = r"C:\Program Files\Mozilla Firefox";
+        let programs = [prog("Firefox", Some(ff))];
+        let agent = format!(r"{ff}\default-browser-agent.exe");
+        let hits = [hit(&agent, 0, UsageSource::Bam)];
+        let r = run_with_tasks(&programs, &hits, &HashSet::from([norm(Path::new(&agent))]));
+        assert_eq!(usage(&r, "Firefox").last_used.when, None);
+        assert_eq!(usage(&r, "Firefox").exes[0].excluded, Some(ExcludeReason::ScheduledTask));
+    }
+
+    #[test]
+    fn old_saved_exclude_reasons_still_deserialize() {
+        assert_eq!(serde_json::from_str::<ExcludeReason>("\"NotMain\"").unwrap(), ExcludeReason::NotMain);
+        assert_eq!(serde_json::from_str::<ExcludeReason>("\"ScheduledTask\"").unwrap(), ExcludeReason::ScheduledTask);
     }
 
     #[test]

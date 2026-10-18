@@ -15,6 +15,7 @@ pub fn exclude_label(reason: ExcludeReason) -> &'static str {
     match reason {
         ExcludeReason::NamePattern => strings::EXCLUDED_NAME_PATTERN,
         ExcludeReason::Service => strings::EXCLUDED_SERVICE,
+        ExcludeReason::ScheduledTask => strings::EXCLUDED_SCHEDULED_TASK,
         ExcludeReason::NotMain => strings::EXCLUDED_NOT_MAIN,
     }
 }
@@ -147,7 +148,7 @@ mod tests {
         assert_eq!(exclude_label(ExcludeReason::NamePattern), strings::EXCLUDED_NAME_PATTERN);
         assert_eq!(exclude_label(ExcludeReason::Service), strings::EXCLUDED_SERVICE);
         assert_eq!(exclude_label(ExcludeReason::NotMain), strings::EXCLUDED_NOT_MAIN);
-        for r in [ExcludeReason::NamePattern, ExcludeReason::Service, ExcludeReason::NotMain] {
+        for r in [ExcludeReason::NamePattern, ExcludeReason::Service, ExcludeReason::ScheduledTask, ExcludeReason::NotMain] {
             assert!(!exclude_label(r).is_empty());
         }
     }

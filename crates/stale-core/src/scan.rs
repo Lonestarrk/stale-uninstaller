@@ -64,6 +64,8 @@ pub struct ScanSources {
     pub file_times: FileTimesFn,
     /// `norm()`ed exe paths of installed services.
     pub service_exes: Box<dyn Fn() -> HashSet<String> + Send>,
+    /// `norm()`ed exe paths of scheduled-task actions.
+    pub task_exes: Box<dyn Fn() -> HashSet<String> + Send>,
     /// Resolves `.lnk` hits (UserAssist records Start Menu launches by shortcut path).
     pub resolve_lnk: ResolveLnkFn,
 }
@@ -89,6 +91,7 @@ impl ScanSources {
                 FileTimeProvider { exes: exes.to_vec() }.collect().unwrap_or_default()
             }),
             service_exes: Box::new(move || service_exes(&*services_reg)),
+            task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs, &crate::paths::tasks_root())),
             resolve_lnk: Box::new(resolve_lnk),
         }
     }
@@ -132,6 +135,7 @@ pub struct UsageInputs {
     /// Provider hits (`.lnk` hits resolved) plus file-time hits for the main exes.
     pub hits: Vec<UsageHit>,
     pub service_exes: HashSet<String>,
+    pub task_exes: HashSet<String>,
     /// Provider failures and partial-result warnings, for the user.
     pub warnings: Vec<String>,
 }
@@ -145,6 +149,7 @@ impl UsageInputs {
             root_exes: &self.root_exes,
             arg_exes: &self.arg_exes,
             service_exes: &self.service_exes,
+            task_exes: &self.task_exes,
         }
     }
 }
@@ -183,7 +188,7 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
-    UsageInputs { root_exes, arg_exes, hits, service_exes: (src.service_exes)(), warnings }
+    UsageInputs { root_exes, arg_exes, hits, service_exes: (src.service_exes)(), task_exes: (src.task_exes)(), warnings }
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -291,6 +296,7 @@ mod tests {
             dir_size: Box::new(|_: &Path| Some(1234)),
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
+            task_exes: Box::new(HashSet::new),
             resolve_lnk: Box::new(|_: &Path| None),
         }
     }

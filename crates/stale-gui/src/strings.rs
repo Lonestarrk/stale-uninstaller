@@ -104,6 +104,7 @@ pub const VIA: &str = "via";
 pub const RUNS: &str = "körningar";
 pub const EXCLUDED_NAME_PATTERN: &str = "uppdaterare/tjänst-namn";
 pub const EXCLUDED_SERVICE: &str = "tjänst";
+pub const EXCLUDED_SCHEDULED_TASK: &str = "schemalagd uppgift";
 pub const EXCLUDED_NOT_MAIN: &str = "inte huvudprogram";
 pub const SOURCE_PREFETCH: &str = "Prefetch";
 pub const SOURCE_BAM: &str = "BAM";
