@@ -562,7 +562,7 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
         let what = item.original.display().to_string();
         let mut fail = |error: String| failures.push(Failure { what: what.clone(), error });
         if ops.mover.exists(&item.original) {
-            fail("occupied".to_string());
+            fail(OCCUPIED.to_string());
             kept.push(item.clone());
             continue;
         }
@@ -596,10 +596,23 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
     kept
 }
 
+/// `Failure::error` for something a restore would overwrite: the original path, key, value or
+/// service exists again (e.g. the program was reinstalled). The item stays in quarantine.
+const OCCUPIED: &str = "occupied";
+
+/// `Err("occupied")` when `occupied`, so a reinstalled program's registry data is never
+/// overwritten by an old backup.
+fn not_occupied(occupied: bool) -> Result<(), String> {
+    if occupied { Err(OCCUPIED.to_string()) } else { Ok(()) }
+}
+
+/// Imports each key backup unless the key exists again.
 fn restore_keys(ops: &QuarantineOps, id: &QuarantineId, keys: &[ExportedKey], failures: &mut Vec<Failure>) -> Vec<ExportedKey> {
     let mut kept = Vec::new();
     for k in keys.iter().rev() {
-        let imported = check_backup(ops, id, &k.reg_file, "key-N.reg").and_then(|()| ops.regw.import_file(&k.reg_file));
+        let imported = not_occupied(ops.reg.key_exists(&k.key))
+            .and_then(|()| check_backup(ops, id, &k.reg_file, "key-N.reg"))
+            .and_then(|()| ops.regw.import_file(&k.reg_file));
         if let Err(error) = imported {
             failures.push(Failure { what: key_text(&k.key), error });
             kept.push(k.clone());
@@ -609,7 +622,8 @@ fn restore_keys(ops: &QuarantineOps, id: &QuarantineId, keys: &[ExportedKey], fa
     kept
 }
 
-/// Imports each value export once (it re-creates the whole key as it was).
+/// Imports each value export once (it re-creates the whole key as it was), unless one of its
+/// removed values exists again.
 fn restore_values(
     ops: &QuarantineOps,
     id: &QuarantineId,
@@ -624,7 +638,11 @@ fn restore_values(
     }
     let mut failed: Vec<&Path> = Vec::new();
     for file in files {
-        if let Err(error) = check_backup(ops, id, file, "value-N.reg").and_then(|()| ops.regw.import_file(file)) {
+        let occupied = values.iter().any(|v| v.reg_file == file && value_exists(ops, &v.key, &v.name));
+        let imported = not_occupied(occupied)
+            .and_then(|()| check_backup(ops, id, file, "value-N.reg"))
+            .and_then(|()| ops.regw.import_file(file));
+        if let Err(error) = imported {
             for v in values.iter().filter(|v| v.reg_file == file) {
                 failures.push(Failure { what: format!(r"{}\{}", key_text(&v.key), v.name), error: error.clone() });
             }
@@ -648,7 +666,8 @@ fn restore_tasks(ops: &QuarantineOps, id: &QuarantineId, tasks: &[RemovedTask], 
     kept
 }
 
-/// Re-imports service keys; a restored service only starts after a reboot (noted in `notes`).
+/// Re-imports service keys (unless the service exists again); a restored service only starts
+/// after a reboot (noted in `notes`).
 fn restore_services(
     ops: &QuarantineOps,
     id: &QuarantineId,
@@ -658,7 +677,10 @@ fn restore_services(
 ) -> Vec<RemovedService> {
     let mut kept = Vec::new();
     for s in services.iter().rev() {
-        match check_backup(ops, id, &s.reg_file, "service-*.reg").and_then(|()| ops.regw.import_file(&s.reg_file)) {
+        let imported = not_occupied(service_exists(ops, &s.name))
+            .and_then(|()| check_backup(ops, id, &s.reg_file, "service-*.reg"))
+            .and_then(|()| ops.regw.import_file(&s.reg_file));
+        match imported {
             Ok(()) => notes.push(format!("service-needs-reboot:{}", s.name)),
             Err(error) => {
                 failures.push(Failure { what: s.name.clone(), error });
@@ -1536,5 +1558,35 @@ mod tests {
         assert!(!e.regw.log.lock().unwrap().iter().any(|l| l.starts_with("delete")), "{:?}", e.regw.log.lock().unwrap());
         assert!(m.keys.is_empty() && m.values.is_empty() && m.pending.is_empty());
         assert_eq!(m.failures.len(), 2, "{:?}", m.failures);
+    }
+
+    #[test]
+    fn restore_skips_existing_key_and_keeps_it() {
+        let mut e = env(FakeFs::new());
+        let m = run(&e, &[key_item(r"SOFTWARE\Foo"), key_item(r"SOFTWARE\Bar"), value_item("Foo"), service_item("FooSvc")]);
+        assert!(m.failures.is_empty(), "{:?}", m.failures);
+        // The program was reinstalled: its key, Run value and service exist again.
+        let mut reg = FakeRegistry::new();
+        reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Foo"));
+        reg.set(key(Hive::CurrentUser, RUN), "Foo", crate::registry::RegValue::Str("foo.exe".into()));
+        reg.add_key(key(Hive::LocalMachine, r"SYSTEM\CurrentControlSet\Services\FooSvc"));
+        e.ops.reg = Arc::new(reg);
+        e.regw.log.lock().unwrap().clear();
+
+        assert_eq!(
+            restore(&e.ops, &m),
+            RestoreOutcome::Partial(vec![
+                fail(r"HKLM\SOFTWARE\Foo", "occupied"),
+                fail(&format!(r"HKCU\{RUN}\Foo"), "occupied"),
+                fail("FooSvc", "occupied"),
+            ])
+        );
+        let mdir = e.dir.path().join(&m.id.0);
+        assert_eq!(*e.regw.log.lock().unwrap(), vec![format!("import {}", mdir.join("key-1.reg").display())], "only Bar");
+        let left = list_manifests(e.dir.path());
+        assert_eq!(left.len(), 1, "manifest kept");
+        assert_eq!(left[0].keys, vec![m.keys[0].clone()]);
+        assert_eq!(left[0].values, m.values);
+        assert_eq!(left[0].services, m.services);
     }
 }
