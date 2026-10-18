@@ -3,7 +3,7 @@
 use super::names::{
     child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
 };
-use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
+use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::fsys::FsReader;
 use crate::pathutil::{is_shared_root, norm, normed_under};
 use std::collections::HashSet;
@@ -129,6 +129,7 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
             }
         }
     }
+    mark_used_by_others(&mut out, &hint.other_locations);
     out
 }
 
@@ -279,6 +280,83 @@ mod tests {
         let out = scan_folders(&fs, &roots(), &hint("Foo Studio", None, Some(r"C:\Program Files\Foo Studio\")));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, Confidence::High);
+    }
+
+    fn installed(id: &str, name: &str, install: &str) -> crate::model::Program {
+        use crate::model::{Hive, Program, ProgramId, RegKeyPath, Scope};
+        Program {
+            id: ProgramId(id.into()),
+            key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"Software\{id}") },
+            name: name.into(),
+            publisher: None,
+            version: None,
+            install_location: Some(PathBuf::from(install)),
+            install_date: None,
+            uninstall_string: None,
+            quiet_uninstall_string: None,
+            display_icon: None,
+            is_msi: false,
+            estimated_size_bytes: None,
+            drive: Some('C'),
+            hidden: false,
+            scope: Scope::Machine,
+        }
+    }
+
+    fn with_others(h: ProgramHint, me: &str, programs: &[crate::model::Program]) -> ProgramHint {
+        h.with_other_programs(programs, &crate::model::ProgramId(me.into()))
+    }
+
+    fn find<'a>(items: &'a [Leftover], path: &str) -> &'a Leftover {
+        items
+            .iter()
+            .find(|l| matches!(&l.kind, LeftoverKind::Dir { path: p, .. } if norm(p) == norm(Path::new(path))))
+            .unwrap_or_else(|| panic!("{path} not listed: {items:?}"))
+    }
+
+    #[test]
+    fn sibling_version_folder_is_low_with_note() {
+        let foundation = r"C:\Program Files\Blender Foundation";
+        let (v36, v40) = (format!(r"{foundation}\Blender 3.6"), format!(r"{foundation}\Blender 4.0"));
+        let fs = FakeFs::new().dir(&v36, 10).dir(&v40, 20).profile(r"C:\Users\A");
+        let programs = [installed("b36", "Blender 3.6", &v36), installed("b40", "Blender 4.0", &v40)];
+        let h = with_others(hint("Blender 3.6", Some("Blender Foundation"), Some(&v36)), "b36", &programs);
+        let out = scan_folders(&fs, &roots(), &h);
+        let mine = find(&out, &v36);
+        assert_eq!((mine.confidence, mine.note.as_deref()), (Confidence::High, None));
+        let sibling = find(&out, &v40);
+        assert_eq!((sibling.confidence, sibling.note.as_deref()), (Confidence::Low, Some("used-by-other-program")));
+        assert!(out.iter().filter(|l| l.confidence != Confidence::Low).all(|l| l.size() == Some(10)), "{out:?}");
+
+        // Without the other program the sibling would have been preselected.
+        let out = scan_folders(&fs, &roots(), &hint("Blender 3.6", Some("Blender Foundation"), Some(&v36)));
+        assert_eq!(find(&out, &v40).confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn python_parent_folder_is_low() {
+        let base = r"C:\Users\A\AppData\Local\Programs\Python";
+        let (p311, p312) = (format!(r"{base}\Python311"), format!(r"{base}\Python312"));
+        let fs = FakeFs::new().dir(&p311, 10).dir(&p312, 20).profile(r"C:\Users\A");
+        let programs = [
+            installed("py311", "Python 3.11.4 (64-bit)", &format!(r"{p311}\")),
+            installed("py312", "Python 3.12.0 (64-bit)", &format!(r"{p312}\")),
+        ];
+        let h = with_others(hint("Python 3.11.4 (64-bit)", None, Some(&format!(r"{p311}\"))), "py311", &programs);
+        let out = scan_folders(&fs, &roots(), &h);
+        assert_eq!(find(&out, &p311).confidence, Confidence::High);
+        let parent = find(&out, base);
+        assert_eq!((parent.confidence, parent.note.as_deref()), (Confidence::Low, Some("used-by-other-program")));
+    }
+
+    #[test]
+    fn install_folder_shared_with_another_product_is_low() {
+        let dir = r"C:\Program Files\Vendor Suite";
+        let fs = FakeFs::new().dir(dir, 10);
+        let programs = [installed("tool", "Vendor Tool", dir), installed("suite", "Vendor Suite", dir)];
+        let h = with_others(hint("Vendor Tool", None, Some(dir)), "tool", &programs);
+        let out = scan_folders(&fs, &roots(), &h);
+        assert_eq!(find(&out, dir).confidence, Confidence::Low);
     }
 
     #[test]

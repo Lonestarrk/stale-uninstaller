@@ -126,6 +126,7 @@ pub const KIND_TASK: &str = "Schemalagd uppgift";
 pub const WARNING_ICON: &str = "⚠";
 pub const NOTE_USER_FOLDER: &str = "troligen dina egna filer";
 pub const NOTE_SHARED_PUBLISHER: &str = "delas med andra program från samma utgivare";
+pub const NOTE_OTHER_PROGRAM: &str = "används av ett annat installerat program";
 pub const MARK_SAFE: &str = "Markera säkra";
 pub const REMOVE_CHECKED: &str = "Ta bort markerade";
 pub const SERVICE_REBOOT: &str = "Tjänster tas bort helt först efter omstart";

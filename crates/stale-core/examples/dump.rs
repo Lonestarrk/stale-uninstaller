@@ -19,7 +19,8 @@ fn dump_leftovers(name: &str) {
         return;
     };
     println!("program: {} ({:?})", program.name, program.install_location);
-    let report = scan_leftovers(&LeftoverSources::live(), &ProgramHint::from_program(program));
+    let hint = ProgramHint::from_program(program).with_other_programs(&programs, &program.id);
+    let report = scan_leftovers(&LeftoverSources::live(), &hint);
     let mut counts = [0usize; 3];
     for item in &report.items {
         let (idx, label) = match item.confidence {

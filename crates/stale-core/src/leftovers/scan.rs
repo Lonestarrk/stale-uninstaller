@@ -3,7 +3,7 @@
 use super::fs_scan::{scan_folders, FsScanRoots};
 use super::other_scan::{desktop_dirs, scan_services, scan_shortcuts, scan_tasks};
 use super::reg_scan::{scan_registry, RegScanRoots};
-use super::{Confidence, Leftover, LeftoverKind, LeftoverReport, ProgramHint};
+use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, LeftoverReport, ProgramHint};
 use crate::fsys::{FsReader, RealFs};
 use crate::pathutil::norm;
 use crate::registry::{RegistryReader, WinRegistry};
@@ -94,6 +94,7 @@ pub fn scan_leftovers(src: &LeftoverSources, hint: &ProgramHint) -> LeftoverRepo
             }
         }
     }
+    mark_used_by_others(&mut items, &hint.other_locations);
     items.sort_by_key(|l| (rank(l.confidence), kind_group(&l.kind)));
     LeftoverReport { items }
 }

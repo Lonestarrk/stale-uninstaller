@@ -11,6 +11,7 @@ use stale_core::quarantine::{
     list_trusted_manifests, purge, quarantine, restore, QuarantineId, QuarantineManifest, QuarantineOps,
     QuarantineProgress, RestoreOutcome,
 };
+use stale_core::model::{Program, ProgramId};
 use stale_core::scan::{run_scan, ScanEvent, ScanSources};
 use stale_core::uninstall::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
@@ -202,11 +203,20 @@ pub enum LeftoverScanEvent {
     Failed(String),
 }
 
-/// Searches for `hint`'s leftovers on the "stale-leftovers" thread.
-pub fn spawn_leftover_scan(hint: ProgramHint) -> Receiver<LeftoverScanEvent> {
+/// `hint` knowing the locations of every program in `programs` (the installed programs when the
+/// search started), so their folders are never preselected. A manual hint belongs to no listed
+/// program, so all of them count as others.
+pub fn hint_with_others(hint: ProgramHint, programs: &[Program]) -> ProgramHint {
+    hint.with_other_programs(programs, &ProgramId(String::new()))
+}
+
+/// Searches for `hint`'s leftovers on the "stale-leftovers" thread; `programs` are the installed
+/// programs (see [`hint_with_others`]).
+pub fn spawn_leftover_scan(hint: ProgramHint, programs: Vec<Program>) -> Receiver<LeftoverScanEvent> {
     let (tx, rx) = channel();
     let fallback = tx.clone();
     let spawned = std::thread::Builder::new().name("stale-leftovers".into()).spawn(move || {
+        let hint = hint_with_others(hint, &programs);
         // Built here, not on the UI thread: it resolves every Start Menu and desktop shortcut.
         let run = catch_unwind(AssertUnwindSafe(|| scan_leftovers(&LeftoverSources::live(), &hint)));
         let ev = match run {
@@ -242,5 +252,35 @@ impl Drop for ComGuard {
             // SAFETY: matches the successful `CoInitializeEx` in `init` on this same thread.
             unsafe { CoUninitialize() }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stale_core::model::{Hive, RegKeyPath, Scope};
+    use std::path::PathBuf;
+
+    #[test]
+    fn hint_with_others_counts_every_listed_program() {
+        let program = Program {
+            id: ProgramId("x".into()),
+            key: RegKeyPath { hive: Hive::LocalMachine, path: r"Software\X".into() },
+            name: "X".into(),
+            publisher: None,
+            version: None,
+            install_location: Some(PathBuf::from(r"C:\Apps\X")),
+            install_date: None,
+            uninstall_string: None,
+            quiet_uninstall_string: None,
+            display_icon: None,
+            is_msi: false,
+            estimated_size_bytes: None,
+            drive: Some('C'),
+            hidden: false,
+            scope: Scope::Machine,
+        };
+        let hint = hint_with_others(ProgramHint::manual("Y", None), &[program]);
+        assert_eq!(hint.other_locations, vec![PathBuf::from(r"C:\APPS\X")]);
     }
 }

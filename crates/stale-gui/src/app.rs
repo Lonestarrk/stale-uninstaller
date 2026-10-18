@@ -397,7 +397,8 @@ impl StaleApp {
         if self.leftover_search_running() {
             return;
         }
-        self.leftover_scan_rx = Some(worker::spawn_leftover_scan(ProgramHint::manual(&name, dir)));
+        let hint = ProgramHint::manual(&name, dir);
+        self.leftover_scan_rx = Some(worker::spawn_leftover_scan(hint, self.programs.clone()));
     }
 
     /// Applies every quarantine event waiting on the channel.

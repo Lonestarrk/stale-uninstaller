@@ -226,6 +226,7 @@ fn note_text(note: &str) -> &str {
     match note {
         "user-folder" => strings::NOTE_USER_FOLDER,
         "shared-publisher-key" => strings::NOTE_SHARED_PUBLISHER,
+        stale_core::leftovers::NOTE_OTHER_PROGRAM => strings::NOTE_OTHER_PROGRAM,
         other => other,
     }
 }
@@ -238,6 +239,7 @@ mod tests {
     fn notes_map_to_swedish_and_unknown_pass_through() {
         assert_eq!(note_text("user-folder"), strings::NOTE_USER_FOLDER);
         assert_eq!(note_text("shared-publisher-key"), strings::NOTE_SHARED_PUBLISHER);
+        assert_eq!(note_text("used-by-other-program"), strings::NOTE_OTHER_PROGRAM);
         assert_eq!(note_text("something-new"), "something-new");
     }
 
