@@ -27,6 +27,10 @@ pub const NOTE_CONTAINS_USER_DATA: &str = "contains-user-data";
 /// (`obsidian-updater`), see [`names::name_matches_suffixed`].
 pub const NOTE_SUFFIX_MATCH: &str = "suffix-match";
 
+/// `Leftover::note` of a file-type key (`.canvas`) whose ProgID is named like the program
+/// (`Obsidian Canvas`), and of that ProgID's key.
+pub const NOTE_PROGID_OF_PROGRAM: &str = "progid-of-program";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Confidence { High, Medium, Low }
 

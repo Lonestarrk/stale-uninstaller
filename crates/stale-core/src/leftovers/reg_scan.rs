@@ -3,7 +3,8 @@
 use super::names::{
     child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
 };
-use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
+use super::names::normalize_name;
+use super::{Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_PROGID_OF_PROGRAM};
 use crate::model::{Hive, RegKeyPath};
 use crate::pathutil::{exe_under, expand_env, first_path_in_command};
 use crate::programs::other_user_sids;
@@ -157,10 +158,11 @@ impl Found {
 pub fn scan_registry(reg: &dyn RegistryReader, roots: &RegScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
     let mut found = Found::default();
     uninstall_key(reg, hint, &mut found);
-    if let Some(target) = Target::from_hint(hint) {
-        for root in roots.classes.iter().filter(|r| reg.key_exists(r)) {
-            class_keys(reg, root, &target, &mut found);
-        }
+    let target = Target::from_hint(hint);
+    for root in roots.classes.iter().filter(|r| reg.key_exists(r)) {
+        class_keys(reg, root, target.as_ref(), hint, &mut found);
+    }
+    if let Some(target) = target {
         for root in roots.run.iter().filter(|r| reg.key_exists(r)) {
             run_values(reg, root, &target, &mut found);
         }
@@ -216,14 +218,30 @@ fn software_keys(reg: &dyn RegistryReader, root: &RegKeyPath, hint: &ProgramHint
     }
 }
 
-/// (c) COM classes, file types, ProgIDs and protocols that point at the program. One pass over
-/// the root: per subkey only its default value and `shell\open\command`; per `CLSID\{…}` only
-/// the `InprocServer32`/`LocalServer32` defaults.
-fn class_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, found: &mut Found) {
+/// The ProgID's first token (split at `.` and whitespace) names the program's first word:
+/// `Obsidian.md` or `Obsidian Canvas` for `Obsidian`.
+fn progid_names_program(progid: &str, program_first_word: &str) -> bool {
+    progid
+        .trim()
+        .split(|c: char| c == '.' || c.is_whitespace())
+        .next()
+        .is_some_and(|t| name_matches_exact(t, program_first_word))
+}
+
+/// (c) COM classes, file types, ProgIDs and protocols that point at the program (High), and file
+/// types whose ProgID is named like the program (Medium, with that ProgID's key if it still
+/// exists; the extension keys outlive the ProgIDs' commands). One pass over the root: per subkey
+/// only its default value and `shell\open\command`; per `CLSID\{…}` only the
+/// `InprocServer32`/`LocalServer32` defaults.
+fn class_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: Option<&Target>, hint: &ProgramHint, found: &mut Found) {
     let Ok(subkeys) = reg.subkeys(root) else { return };
+    let normalized = normalize_name(&hint.name);
+    let first_word = normalized.split(' ').next().unwrap_or("");
+    let mut named_progids: Vec<(RegKeyPath, String)> = Vec::new();
     for sub in subkeys {
         let k = child(root, &sub);
         if sub.eq_ignore_ascii_case("CLSID") {
+            let Some(target) = target else { continue };
             for clsid in reg.subkeys(&k).unwrap_or_default() {
                 let c = child(&k, &clsid);
                 let server = |s: &str| target.claims(default_string(reg, &child(&c, s)));
@@ -231,10 +249,26 @@ fn class_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, foun
                     found.key(c, Confidence::High, None);
                 }
             }
-        } else if target.claims(default_string(reg, &k))
-            || target.claims(default_string(reg, &child(&k, r"shell\open\command")))
-        {
+            continue;
+        }
+        let is_file_type = sub.starts_with('.');
+        if target.is_none() && !is_file_type {
+            continue;
+        }
+        let default = default_string(reg, &k);
+        if let Some(progid) = default.as_deref().filter(|p| is_file_type && progid_names_program(p, first_word)) {
+            named_progids.push((k.clone(), progid.trim().to_string()));
+        }
+        if target.is_some_and(|t| t.claims(default) || t.claims(default_string(reg, &child(&k, r"shell\open\command")))) {
             found.key(k, Confidence::High, None);
+        }
+    }
+    // After the High pass, so a ProgID that points into the install folder stays High.
+    for (ext, progid) in named_progids {
+        found.key(ext, Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM));
+        let progid_key = child(root, &progid);
+        if !progid.contains('\\') && reg.key_exists(&progid_key) {
+            found.key(progid_key, Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM));
         }
     }
 }
@@ -429,6 +463,47 @@ mod tests {
                 (format!(r"CurrentUser\{HKCU_RUN}:Obsidian"), Confidence::High, None),
             ]
         );
+    }
+
+    #[test]
+    fn file_type_keys_naming_the_programs_progid_are_medium() {
+        let classes = r"Software\Classes";
+        let mut reg = FakeRegistry::new();
+        let ck = |p: &str| key(Hive::CurrentUser, &format!(r"{classes}\{p}"));
+        // After the vendor uninstaller: the ProgIDs are gone, the extensions still name them.
+        reg.set(ck(".canvas"), "", s("Obsidian Canvas"));
+        reg.set(ck(".base"), "", s("Obsidian Base"));
+        reg.set(ck(".obs"), "", s("Obsidian.Note.1"));
+        // A ProgID that still exists is listed as well.
+        reg.set(ck(".vault"), "", s("Obsidian.Vault"));
+        reg.add_key(ck(r"Obsidian.Vault\DefaultIcon"));
+        // Unrelated ProgIDs and non-extension keys are not.
+        reg.set(ck(".md"), "", s("Markdown"));
+        reg.set(ck(".txt"), "", s("ObsidianLike.txt"));
+        reg.set(ck("Obsidian Notes"), "", s("Obsidian Canvas"));
+        let roots = RegScanRoots { software: vec![], classes: vec![key(Hive::CurrentUser, classes)], run: vec![], app_paths: vec![] };
+        let out = scan_registry(&reg, &roots, &hint("Obsidian", None, None));
+        let note = Some(NOTE_PROGID_OF_PROGRAM.to_string());
+        assert_eq!(
+            found(&out),
+            vec![
+                (format!(r"CurrentUser\{classes}\.base"), Confidence::Medium, note.clone()),
+                (format!(r"CurrentUser\{classes}\.canvas"), Confidence::Medium, note.clone()),
+                (format!(r"CurrentUser\{classes}\.obs"), Confidence::Medium, note.clone()),
+                (format!(r"CurrentUser\{classes}\.vault"), Confidence::Medium, note.clone()),
+                (format!(r"CurrentUser\{classes}\Obsidian.Vault"), Confidence::Medium, note.clone()),
+            ]
+        );
+        assert_eq!(NOTE_PROGID_OF_PROGRAM, "progid-of-program");
+
+        // A ProgID whose command points into the install folder stays High.
+        let dir = r"C:\Apps\Obsidian";
+        reg.set(ck(r"Obsidian.Vault\shell\open\command"), "", s(&format!(r#""{dir}\Obsidian.exe" "%1""#)));
+        let out = scan_registry(&reg, &roots, &hint("Obsidian", None, Some(dir)));
+        let vault = found(&out).into_iter().find(|(k, ..)| k.ends_with("Obsidian.Vault")).unwrap();
+        assert_eq!(vault.1, Confidence::High);
+        // A generic first word matches nothing.
+        assert!(scan_registry(&reg, &roots, &hint("App Obsidian", None, None)).is_empty());
     }
 
     #[test]
