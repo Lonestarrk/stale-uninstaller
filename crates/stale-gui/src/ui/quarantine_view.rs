@@ -5,7 +5,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use stale_core::quarantine::{Failure, QuarantineId, QuarantineManifest};
 
-use super::STALE_COLOR;
+use super::stale_color;
 use crate::app::{StaleApp, View};
 use crate::{format, strings};
 
@@ -139,10 +139,10 @@ fn status(ui: &mut egui::Ui, m: &QuarantineManifest) {
     }
     if !m.failures.is_empty() {
         let text = m.failures.iter().map(failure_text).collect::<Vec<_>>().join("\n");
-        ui.colored_label(STALE_COLOR, strings::error_count(m.failures.len())).on_hover_text(text);
+        ui.colored_label(stale_color(ui.visuals()), strings::error_count(m.failures.len())).on_hover_text(text);
     }
     if !m.pending.is_empty() {
-        ui.colored_label(STALE_COLOR, strings::incomplete_count(m.pending.len()));
+        ui.colored_label(stale_color(ui.visuals()), strings::incomplete_count(m.pending.len()));
     }
 }
 
@@ -157,7 +157,7 @@ fn restore_failures(ui: &mut egui::Ui, failures: &[Failure]) {
     ui.label(strings::t().restore_partial);
     egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
         for f in failures {
-            ui.colored_label(STALE_COLOR, failure_text(f));
+            ui.colored_label(stale_color(ui.visuals()), failure_text(f));
         }
     });
 }

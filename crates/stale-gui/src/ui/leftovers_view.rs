@@ -8,7 +8,7 @@ use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
 use stale_core::quarantine::{DestinationPlan, QuarantineManifest};
 use stale_core::RegKeyPath;
 
-use super::STALE_COLOR;
+use super::stale_color;
 use crate::app::{StaleApp, View};
 use crate::leftover_sel::LeftoverGroup;
 use crate::{format, strings};
@@ -105,7 +105,7 @@ fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Op
                 ui.label(strings::fallback_notice(*from, &format::human_size(Some(*bytes))));
             }
             for drive in &plan.insufficient {
-                ui.colored_label(STALE_COLOR, strings::insufficient_space(*drive));
+                ui.colored_label(stale_color(ui.visuals()), strings::insufficient_space(*drive));
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -146,7 +146,7 @@ fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bo
                 Some(note) => format!("{} {}", strings::t().warning_icon, note_text(note)),
                 None => strings::t().warning_icon.to_string(),
             };
-            ui.colored_label(STALE_COLOR, warning);
+            ui.colored_label(stale_color(ui.visuals()), warning);
         }
         if let LeftoverKind::Dir { size, .. } | LeftoverKind::File { size, .. } = &item.kind {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -169,7 +169,7 @@ fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], back: &s
             let count = m.moved.len() + m.keys.len() + m.values.len() + m.services.len() + m.tasks.len();
             ui.label(strings::moved_to_quarantine(count));
             for line in failure_lines(&m.failures) {
-                ui.colored_label(STALE_COLOR, line);
+                ui.colored_label(stale_color(ui.visuals()), line);
             }
             if !m.services.is_empty() {
                 ui.label(strings::t().service_reboot);

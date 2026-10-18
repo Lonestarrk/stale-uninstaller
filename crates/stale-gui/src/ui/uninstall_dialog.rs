@@ -6,7 +6,7 @@ use eframe::egui;
 use stale_core::uninstall::{RestorePointStatus, UninstallMode};
 use stale_core::{ProgramId, Scope};
 
-use super::STALE_COLOR;
+use super::stale_color;
 use crate::app::{PendingQueue, StaleApp, View};
 use crate::flow::{dependencies_acknowledged, FlowState, ItemState, Step};
 use crate::strings;
@@ -58,13 +58,13 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
             if entry.scope == Scope::OtherUser {
                 ui.label(strings::other_account_item(&entry.name, entry.account.as_deref()));
                 // Another account's uninstaller runs elevated here: shown plainly, in the warning colour.
-                ui.colored_label(STALE_COLOR, entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
+                ui.colored_label(stale_color(ui.visuals()), entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
             } else {
                 ui.label(&entry.name);
             }
             if let Some(reason) = entry.dependency {
                 // Wraps in the window's width; the table badge's warning colour.
-                ui.add(egui::Label::new(egui::RichText::new(strings::t().dependency_warning).color(STALE_COLOR)).wrap())
+                ui.add(egui::Label::new(egui::RichText::new(strings::t().dependency_warning).color(stale_color(ui.visuals()))).wrap())
                     .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
                 ui.checkbox(&mut entry.acknowledged, strings::t().dependency_understand);
             }

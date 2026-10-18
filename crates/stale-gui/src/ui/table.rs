@@ -11,7 +11,7 @@ use crate::app::Row;
 use crate::filter::{is_stale, Sort, SortKey};
 use crate::{format, strings};
 
-use super::STALE_COLOR;
+use super::stale_color;
 
 const ROW_HEIGHT: f32 = 22.0;
 
@@ -65,9 +65,12 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                 let id = &row.program.id;
                 table_row.set_selected(selected.as_ref() == Some(id));
 
+                let mut box_clicked = false;
                 table_row.col(|ui| {
                     let mut on = checked.contains(id);
-                    if ui.checkbox(&mut on, "").changed() {
+                    let response = ui.checkbox(&mut on, "");
+                    box_clicked = response.clicked();
+                    if response.changed() {
                         if on {
                             checked.insert(id.clone());
                         } else {
@@ -79,7 +82,7 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                     ui.horizontal(|ui| {
                         ui.label(&row.program.name);
                         if let Some(reason) = stale_core::dependencies::is_shared_dependency(&row.program) {
-                            ui.small(egui::RichText::new(strings::t().dependency_badge).color(STALE_COLOR))
+                            ui.small(egui::RichText::new(strings::t().dependency_badge).color(stale_color(ui.visuals())))
                                 .on_hover_text(strings::dependency_reason_in(strings::lang(), reason));
                         }
                     });
@@ -102,16 +105,27 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                     let last_used = row.last_used();
                     let mut text = egui::RichText::new(format::last_used_label(last_used, row.last_used_via(), row.last_used_autostart(), now));
                     if is_stale(last_used, now) {
-                        text = text.color(STALE_COLOR);
+                        text = text.color(stale_color(ui.visuals()));
                     }
                     ui.label(text);
                 });
 
                 if table_row.response().clicked() {
                     *selected = Some(id.clone());
+                    // A click anywhere on the row ticks or unticks it; the box handles its own click.
+                    if !box_clicked {
+                        toggle_checked(checked, id);
+                    }
                 }
             });
         });
+}
+
+/// Ticks `id` when it is unticked and unticks it when it is ticked.
+pub fn toggle_checked(checked: &mut HashSet<ProgramId>, id: &ProgramId) {
+    if !checked.remove(id) {
+        checked.insert(id.clone());
+    }
 }
 
 /// The drive letter in a small rounded frame.
@@ -124,4 +138,22 @@ fn drive_badge(ui: &mut egui::Ui, drive: Option<char>) {
         .show(ui, |ui| {
             ui.label(text);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_click_ticks_then_unticks() {
+        let mut checked = HashSet::new();
+        let a = ProgramId("a".into());
+        let b = ProgramId("b".into());
+        toggle_checked(&mut checked, &a);
+        assert!(checked.contains(&a));
+        toggle_checked(&mut checked, &b);
+        assert_eq!(checked.len(), 2);
+        toggle_checked(&mut checked, &a);
+        assert!(!checked.contains(&a) && checked.contains(&b));
+    }
 }

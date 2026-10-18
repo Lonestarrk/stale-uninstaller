@@ -6,7 +6,7 @@ use eframe::egui;
 use stale_core::ghosts::{parse_location, Assessment, Evidence, Ghost, RefKind};
 
 use super::leftovers_view::{key_text, note_text};
-use super::STALE_COLOR;
+use super::stale_color;
 use crate::app::{KeepEntry, StaleApp, View};
 use stale_core::keep::KeepList;
 use crate::{format, strings};
@@ -148,7 +148,7 @@ fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime
         }
         let badge = assessment_label(ghost.assessment);
         if ghost.assessment == Assessment::Uncertain {
-            ui.colored_label(STALE_COLOR, badge);
+            ui.colored_label(stale_color(ui.visuals()), badge);
         } else {
             ui.label(badge);
         }
@@ -161,7 +161,7 @@ fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime
         });
     });
     if let Some(why) = uncertainty_text(ghost) {
-        ui.colored_label(STALE_COLOR, format!("{} {why}", strings::t().warning_icon));
+        ui.colored_label(stale_color(ui.visuals()), format!("{} {why}", strings::t().warning_icon));
     }
     let lines: Vec<String> = ghost.evidence.iter().map(evidence_line).collect();
     egui::CollapsingHeader::new(strings::evidence_header(lines.len()))

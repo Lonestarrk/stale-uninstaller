@@ -197,7 +197,8 @@ pub struct StaleApp {
 
 impl StaleApp {
     /// Loads settings and starts the background scan.
-    pub fn new(_cc: &eframe::CreationContext) -> Self {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
+        crate::ui::apply_style(&cc.egui_ctx);
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
         app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
         let id = session::identity();
