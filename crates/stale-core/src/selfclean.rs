@@ -76,6 +76,11 @@ pub fn remove_tree_no_follow(path: &Path) -> std::io::Result<()> {
 }
 
 /// `remove(path)`; on "access denied" for a read-only entry, clears read-only and tries once more.
+///
+/// The read-only attribute belongs to the file, not to the name: when the entry is a hard link,
+/// clearing it also clears it for every other name of that file, possibly outside the tree. That is
+/// accepted because the data folder is locked down to Administrators and SYSTEM before this runs,
+/// so after the lock-down only admins can create entries (hard links included) in it.
 fn retry_writable(path: &Path, md: &std::fs::Metadata, remove: &dyn Fn(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
     match remove(path) {
         Err(e) if e.kind() == ErrorKind::PermissionDenied && md.permissions().readonly() => {

@@ -232,9 +232,6 @@ struct DirOps<'a> {
     is_reparse: &'a dyn Fn(&Path) -> bool,
     owned_by_admins: &'a dyn Fn(&Path) -> Option<bool>,
     apply: &'a dyn Fn(&Path) -> Result<(), String>,
-    /// Replaces a plain file with a copy this process creates (same content, a new file object
-    /// renamed over the name, see [`crate::trusted::replace_with_own_copy`]).
-    replace: &'a dyn Fn(&Path) -> Result<(), String>,
 }
 
 /// Locks `path` down to Administrators and SYSTEM, replacing the whole DACL and the owner.
@@ -247,14 +244,13 @@ struct DirOps<'a> {
 /// that is an error unless the folder was created by us (`created_by_us`, or just now), since its
 /// DACL is then already right.
 ///
-/// Then each direct child folder or reparse point that is a reparse point or not owned by
-/// Administrators/SYSTEM is renamed aside to `<name>.untrusted-<timestamp>` (one warning each in
-/// the returned list) — re-checked against a fresh listing of `path` just before; names already
-/// holding `.untrusted-` are left alone; links and reparse points are never followed. A plain
-/// file not owned by Administrators/SYSTEM (a planted `settings.json`) is replaced instead: its
-/// content goes into a new file of ours renamed over it, so no handle anyone holds on the old file
-/// reaches the new one ([`crate::trusted::replace_with_own_copy`]); when that fails it is moved
-/// aside, and when that fails too it stays, and loading ignores it (its owner is not trusted, see
+/// Then each direct child (folder, file, link or reparse point) that is a reparse point or not
+/// owned by Administrators/SYSTEM is renamed aside to `<name>.untrusted-<timestamp>` (one warning
+/// each in the returned list) — re-checked against a fresh listing of `path` just before; names
+/// already holding `.untrusted-` are left alone; links and reparse points are never followed. A
+/// planted `settings.json` or `important.json` is never adopted: once it is aside the next load
+/// finds no file and uses the defaults, and a handle the planter kept reaches only the moved file.
+/// When the rename fails the file stays, and loading ignores it (its owner is not trusted, see
 /// [`crate::trusted::read_trusted`]). Admin-owned files are left alone. Trusted child folders get
 /// the same descriptor (one level: the DACL is inheritable below).
 pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, String> {
@@ -264,7 +260,6 @@ pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, Strin
         is_reparse: &is_reparse_point,
         owned_by_admins: &owned_by_admins,
         apply: &apply_locked,
-        replace: &crate::trusted::replace_with_own_copy,
     };
     secure_dir_with(path, created_by_us, &ops)
 }
@@ -303,21 +298,6 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
         }
         let child = path.join(&name);
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
-        if !is_dir && !is_link && !(ops.is_reparse)(&child) {
-            // A plain file (settings.json, important.json, logs): an admin-owned one is ours; any
-            // other is replaced by a copy of ours, and moved aside below only when that fails.
-            if (ops.owned_by_admins)(&child) == Some(true) {
-                continue;
-            }
-            match (ops.replace)(&child) {
-                Ok(()) => {
-                    warnings.push(format!("{} (not owned by Administrators or SYSTEM) replaced by a copy of ours", child.display()));
-                    continue;
-                }
-                Err(e) => warnings.push(format!("{} could not be replaced: {e}", child.display())),
-            }
-        }
         if untrusted(&child) {
             // Only what a fresh listing of the (pinned) folder still shows, still untrusted.
             let listed = std::fs::read_dir(path).into_iter().flatten().flatten().any(|e| e.file_name() == name);
@@ -512,6 +492,11 @@ mod tests {
         assert!(secure_dir(&file, false).unwrap_err().contains("not a folder"));
     }
 
+    /// The live sweep's operations except ownership, which `owned` answers.
+    fn sweep_ops<'a>(owned: &'a dyn Fn(&Path) -> Option<bool>) -> DirOps<'a> {
+        DirOps { is_reparse: &|_| false, owned_by_admins: owned, apply: &|_| Ok(()) }
+    }
+
     /// `is_reparse` that answers false for the first `n` questions about `path`, then true.
     fn reparse_after(path: &Path, n: usize) -> impl Fn(&Path) -> bool + '_ {
         let asked = std::cell::Cell::new(0);
@@ -535,7 +520,7 @@ mod tests {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply, replace: &|_| Ok(()) };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply };
         assert_eq!(secure_dir_with(&dir, false, &ops), Err(REPARSE_AFTER_LOCK.to_string()));
         assert!(dir.join("planted").is_dir(), "nothing renamed");
         assert_eq!(*applied.borrow(), vec![dir.clone()], "no child touched");
@@ -557,7 +542,7 @@ mod tests {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply, replace: &|p| Err(format!("unexpected {}", p.display())) };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let mut names: Vec<String> =
@@ -573,36 +558,59 @@ mod tests {
         assert_eq!(secure_dir_with(&dir, false, &ops).unwrap(), Vec::<String>::new());
     }
 
+    /// A planted settings file is moved aside with its content: the next load uses the defaults,
+    /// and writes through a handle the planter kept never reach the name.
     #[test]
-    fn untrusted_file_is_replaced() {
+    fn planted_settings_are_moved_aside_not_adopted() {
+        use std::io::{Seek, Write};
+        use std::os::windows::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("root");
-        std::fs::create_dir_all(dir.join("planted")).unwrap();
-        for f in ["settings.json", "important.json", "admin.json"] {
-            std::fs::write(dir.join(f), b"{}").unwrap();
-        }
-        let admin = dir.join("admin.json");
-        let important = dir.join("important.json");
-        let owned = |p: &Path| Some(p == admin);
-        let replaced = std::cell::RefCell::new(Vec::new());
-        let replace = |p: &Path| {
-            replaced.borrow_mut().push(p.file_name().unwrap().to_string_lossy().into_owned());
-            if p == important {
-                Err("access denied".to_string())
-            } else {
-                Ok(())
-            }
-        };
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &|_| Ok(()), replace: &replace };
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, br#"{"quarantine_days":1}"#).unwrap();
+        // The planter keeps a write handle that shares everything.
+        let mut planter = std::fs::OpenOptions::new().read(true).write(true).share_mode(0x7).open(&settings).unwrap();
+        let ops = sweep_ops(&|_| Some(false));
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
-        let mut replaced = replaced.into_inner();
-        replaced.sort();
-        assert_eq!(replaced, vec!["important.json", "settings.json"], "admin-owned files are left alone");
-        assert!(dir.join("settings.json").is_file() && admin.is_file(), "replaced in place");
-        assert!(!important.exists(), "a file that cannot be replaced is moved aside");
-        assert!(!dir.join("planted").exists(), "the untrusted folder is moved aside");
-        // settings.json replaced; important.json failed and moved aside; planted moved aside.
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("settings.json") && w.contains("moved aside")), "{warnings:?}");
+        assert!(!settings.exists(), "the name is free");
+        // Even a load that trusted any owner gets the defaults now.
+        let loaded = crate::settings::Settings::load_from_with(&settings, &crate::trusted::tests::trust_all);
+        assert_eq!(loaded, crate::settings::Settings::default());
+        planter.seek(std::io::SeekFrom::Start(0)).unwrap();
+        planter.write_all(br#"{"quarantine_days":2}"#).unwrap();
+        planter.flush().unwrap();
+        assert!(!settings.exists(), "the old handle does not reach the name");
+    }
+
+    #[test]
+    fn planted_keep_list_is_moved_aside_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("important.json");
+        let other = dir.join("notes.txt");
+        let admin = dir.join("admin.json");
+        std::fs::write(&keep, br#"{"names":["planted"]}"#).unwrap();
+        std::fs::write(&other, b"x").unwrap();
+        std::fs::write(&admin, b"{}").unwrap();
+        let owned = |p: &Path| Some(p == admin);
+        let warnings = secure_dir_with(&dir, false, &sweep_ops(&owned)).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(!keep.exists() && !other.exists(), "every non-admin plain file is moved aside");
+        assert!(admin.is_file(), "an admin-owned file stays");
+        let aside: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".untrusted-"))
+            .collect();
+        assert_eq!(aside.len(), 2, "{aside:?}");
+        let keep_aside = dir.join(aside.iter().find(|n| n.starts_with("important.json")).unwrap());
+        assert_eq!(std::fs::read(keep_aside).unwrap(), br#"{"names":["planted"]}"#, "moved, content untouched");
+        let loaded = crate::keep::KeepList::load_from_with(&keep, &crate::trusted::tests::trust_all);
+        assert_eq!(loaded, crate::keep::KeepList::default());
     }
 
     #[test]
@@ -622,7 +630,6 @@ mod tests {
             is_reparse: &|_| false,
             owned_by_admins: &|_| Some(false),
             apply: &|_| Ok(()),
-            replace: &|_| Err("access denied".to_string()),
         };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert!(warnings.iter().any(|w| w.contains("settings.json") && w.contains("ignored")), "{warnings:?}");
@@ -634,44 +641,6 @@ mod tests {
         assert_eq!(crate::keep::KeepList::load_from_with(&keep, &untrusted), crate::keep::KeepList::default(), "and again");
     }
 
-    /// The owner part (`O:…`) of `path`'s security descriptor.
-    fn owner_of(path: &Path) -> String {
-        let sddl = sddl_of(path).unwrap();
-        sddl.split(['G', 'D']).next().unwrap().to_string()
-    }
-
-    #[test]
-    fn replaced_file_keeps_its_content_and_cuts_off_old_handles() {
-        use std::io::{Seek, Write};
-        use std::os::windows::fs::OpenOptionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("root");
-        std::fs::create_dir_all(&dir).unwrap();
-        let settings = dir.join("settings.json");
-        std::fs::write(&settings, br#"{"show_hidden":true}"#).unwrap();
-        // The planter keeps a write handle that shares everything.
-        let mut attacker = std::fs::OpenOptions::new().read(true).write(true).share_mode(0x7).open(&settings).unwrap();
-        let ops = DirOps {
-            is_reparse: &|_| false,
-            owned_by_admins: &|_| Some(false),
-            apply: &|_| Ok(()),
-            replace: &crate::trusted::replace_with_own_copy,
-        };
-        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
-        assert!(warnings.iter().any(|w| w.contains("replaced")), "{warnings:?}");
-        assert_eq!(std::fs::read(&settings).unwrap(), br#"{"show_hidden":true}"#, "the content is kept");
-        // Writes through the old handle no longer reach the file the name opens.
-        attacker.seek(std::io::SeekFrom::Start(0)).unwrap();
-        attacker.write_all(br#"{"show_hidden":false,"quarantine_days":1}"#).unwrap();
-        attacker.flush().unwrap();
-        let loaded = crate::settings::Settings::load_from_with(&settings, &crate::trusted::tests::trust_all);
-        assert!(loaded.show_hidden && loaded.quarantine_days == 30, "{loaded:?}");
-        // The file is now ours: the owner of anything this process creates there.
-        let fresh = dir.join("fresh.json");
-        std::fs::write(&fresh, b"{}").unwrap();
-        assert_eq!(owner_of(&settings), owner_of(&fresh));
-    }
-
     #[test]
     fn sweep_moves_reparse_files_aside() {
         let tmp = tempfile::tempdir().unwrap();
@@ -681,7 +650,7 @@ mod tests {
         std::fs::write(dir.join("plain.dll"), b"x").unwrap();
         let link = dir.join("link.dll");
         let is_reparse = |p: &Path| p == link;
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()), replace: &|_| Ok(()) };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()) };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(!link.exists(), "the link-looking file is moved aside");

@@ -1,7 +1,8 @@
 //! Reading and writing the small files below the data folder (settings, keep list) so that a file
 //! planted by someone else is never trusted: it is opened without following links, its owner is
-//! checked on the same handle the content is read from, and saves replace the file (temporary
-//! file renamed over it) instead of writing into whatever object the name points at.
+//! checked on the same handle the content is read from (a file with a second name, a hard link,
+//! is refused), and saves replace the file (temporary file renamed over it) instead of writing
+//! into whatever object the name points at.
 
 use std::fs::File;
 use std::io::Read;
@@ -10,7 +11,6 @@ use std::path::{Path, PathBuf};
 /// FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE.
 const READ_ACCESS: u32 = 0x1 | 0x80 | 0x2_0000 | 0x10_0000;
 const FILE_SHARE_READ: u32 = 0x1;
-const FILE_SHARE_WRITE: u32 = 0x2;
 const FILE_SHARE_DELETE: u32 = 0x4;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -19,17 +19,27 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// The largest settings or keep-list file read (1 MiB).
 pub const MAX_TRUSTED_BYTES: u64 = 1024 * 1024;
 
-/// Opens `path` itself for reading, never a link's target (`FILE_FLAG_OPEN_REPARSE_POINT`).
-/// `share_write` lets other handles keep writing (the lock-down sweep reads a planted file that
-/// way); loads deny it.
-pub(crate) fn open_no_follow(path: &Path, share_write: bool) -> std::io::Result<File> {
+/// Opens `path` itself for reading, never a link's target (`FILE_FLAG_OPEN_REPARSE_POINT`), and
+/// without write sharing.
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    let share = FILE_SHARE_READ | FILE_SHARE_DELETE | if share_write { FILE_SHARE_WRITE } else { 0 };
     std::fs::OpenOptions::new()
         .access_mode(READ_ACCESS)
-        .share_mode(share)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+}
+
+/// The number of names (hard links) the opened file has, read on that handle; `None` when it
+/// cannot be read.
+pub(crate) fn link_count(file: &File) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` is open and outlives the call; `info` is a valid out-pointer.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some(info.nNumberOfLinks)
 }
 
 /// True when the opened object is a link or reparse point (or a folder): never read.
@@ -95,22 +105,26 @@ pub fn live_owner_trusted(file: &File) -> Option<bool> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrustedRead {
     Missing,
-    /// A link or reparse point, a folder, a file not owned by Administrators/SYSTEM, too large,
-    /// or unreadable: the reason, for the log.
+    /// A link or reparse point, a folder, a file with more than one name (hard link), a file not
+    /// owned by Administrators/SYSTEM, too large, or unreadable: the reason, for the log.
     Refused(String),
     Text(String),
 }
 
-/// Reads `path` (at most `max` bytes) when it is a plain file whose owner `owner_trusted` accepts,
-/// judged on the handle the content is then read from. [`owner_is_admin`] is the live check.
+/// Reads `path` (at most `max` bytes) when it is a plain file with a single name whose owner
+/// `owner_trusted` accepts, all judged on the handle the content is then read from. [`owner_is_admin`] is the live check.
 pub fn read_trusted(path: &Path, max: u64, owner_trusted: &dyn Fn(&File) -> Option<bool>) -> TrustedRead {
-    let file = match open_no_follow(path, false) {
+    let file = match open_no_follow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TrustedRead::Missing,
         Err(e) => return TrustedRead::Refused(format!("open: {e}")),
     };
     if is_reparse_or_dir(&file) {
         return TrustedRead::Refused("a link, reparse point or folder".into());
+    }
+    // Another name for the same file could change it behind this one.
+    if link_count(&file) != Some(1) {
+        return TrustedRead::Refused("a file with more than one name (hard link)".into());
     }
     if owner_trusted(&file) != Some(true) {
         return TrustedRead::Refused("not owned by Administrators or SYSTEM".into());
@@ -182,24 +196,6 @@ pub(crate) fn write_replacing_with(path: &Path, bytes: &[u8], set_owner: &dyn Fn
     result
 }
 
-/// Replaces the plain file `path` with a copy this process creates: its content is read through a
-/// handle that does not follow links (writers may keep their handles), then written to a new file
-/// renamed over it ([`write_replacing`]). The old file object, and every handle anyone holds on
-/// it, is no longer what the name opens. Refuses a link, reparse point, folder or a file over
-/// [`MAX_TRUSTED_BYTES`].
-pub(crate) fn replace_with_own_copy(path: &Path) -> Result<(), String> {
-    let file = open_no_follow(path, true).map_err(|e| format!("open {}: {e}", path.display()))?;
-    if is_reparse_or_dir(&file) {
-        return Err(format!("{} is not a plain file", path.display()));
-    }
-    let bytes = read_capped(&file, MAX_TRUSTED_BYTES).ok_or_else(|| format!("read {} failed", path.display()))?;
-    if bytes.len() as u64 > MAX_TRUSTED_BYTES {
-        return Err(format!("{} is larger than {MAX_TRUSTED_BYTES} bytes", path.display()));
-    }
-    drop(file);
-    write_replacing(path, &bytes).map_err(|e| format!("replace {}: {e}", path.display()))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -240,6 +236,22 @@ pub(crate) mod tests {
         std::fs::remove_dir(&link).unwrap();
     }
 
+    /// A second name for the same file (a hard link someone made before the lock-down, or to a
+    /// file they still control elsewhere) means the content can change behind the trusted name.
+    #[test]
+    fn hard_linked_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(read_trusted(&path, 100, &trust_all), TrustedRead::Text("{}".into()));
+        let other = dir.path().join("other-name.json");
+        std::fs::hard_link(&path, &other).unwrap();
+        assert!(matches!(read_trusted(&path, 100, &trust_all), TrustedRead::Refused(why) if why.contains("link")));
+        assert!(matches!(read_trusted(&other, 100, &trust_all), TrustedRead::Refused(_)));
+        std::fs::remove_file(&other).unwrap();
+        assert_eq!(read_trusted(&path, 100, &trust_all), TrustedRead::Text("{}".into()), "one name again");
+    }
+
     /// `STALE_E2E_TRUST_ALL=1` makes loads accept any owner only with the `e2e-overrides` feature.
     #[test]
     fn e2e_trust_all_only_with_the_feature() {
@@ -247,7 +259,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{}").unwrap();
-        let file = open_no_follow(&path, false).unwrap();
+        let file = open_no_follow(&path).unwrap();
         std::env::set_var("STALE_E2E_TRUST_ALL", "1");
         let with_env = live_owner_trusted(&file);
         std::env::remove_var("STALE_E2E_TRUST_ALL");
@@ -284,17 +296,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         crate::settings::Settings::default().save_to(&path).unwrap();
-        let file = open_no_follow(&path, false).unwrap();
+        let file = open_no_follow(&path).unwrap();
         assert_eq!(owner_is_admin(&file), Some(true));
         drop(file);
         let keep = dir.path().join("important.json");
         crate::keep::KeepList::default().save_to(&keep).unwrap();
-        assert_eq!(owner_is_admin(&open_no_follow(&keep, false).unwrap()), Some(true));
-        // The sweep's replacement too.
-        let planted = dir.path().join("planted.json");
-        std::fs::write(&planted, b"{}").unwrap();
-        replace_with_own_copy(&planted).unwrap();
-        assert_eq!(owner_is_admin(&open_no_follow(&planted, false).unwrap()), Some(true));
+        assert_eq!(owner_is_admin(&open_no_follow(&keep).unwrap()), Some(true));
     }
 
     #[test]
