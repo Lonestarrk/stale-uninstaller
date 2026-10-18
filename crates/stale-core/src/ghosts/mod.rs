@@ -2,6 +2,7 @@
 //! traces. Collectors gather [`Evidence`]; each one lives in its own module.
 
 pub mod folders;
+pub mod registry;
 
 use crate::leftovers::names::{child_matches_in_container, name_matches, name_matches_first_word_only, normalize_name};
 use crate::leftovers::{program_locations, system_root_norm};

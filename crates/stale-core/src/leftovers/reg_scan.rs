@@ -101,12 +101,12 @@ fn lower_file_name(p: &Path) -> Option<String> {
     p.file_name().map(|n| n.to_string_lossy().to_lowercase())
 }
 
-fn child(parent: &RegKeyPath, name: &str) -> RegKeyPath {
+pub(crate) fn child(parent: &RegKeyPath, name: &str) -> RegKeyPath {
     key(parent.hive, &format!(r"{}\{name}", parent.path))
 }
 
 /// `Str` and env-expanded `ExpandStr`; other types are ignored.
-fn string_value(v: &RegValue) -> Option<String> {
+pub(crate) fn string_value(v: &RegValue) -> Option<String> {
     match v {
         RegValue::Str(s) => Some(s.clone()),
         RegValue::ExpandStr(s) => Some(expand_env(s)),
@@ -114,13 +114,13 @@ fn string_value(v: &RegValue) -> Option<String> {
     }
 }
 
-fn default_string(reg: &dyn RegistryReader, k: &RegKeyPath) -> Option<String> {
+pub(crate) fn default_string(reg: &dyn RegistryReader, k: &RegKeyPath) -> Option<String> {
     reg.values(k).ok()?.iter().find(|(n, _)| n.is_empty()).and_then(|(_, v)| string_value(v))
 }
 
 /// The path in a value that is either a bare path (a DLL path may hold unquoted spaces) or a
 /// command line.
-fn path_in_value(s: &str) -> Option<PathBuf> {
+pub(crate) fn path_in_value(s: &str) -> Option<PathBuf> {
     let s = s.trim();
     if s.starts_with('"') || s.to_ascii_lowercase().contains(".exe") {
         first_path_in_command(s)
