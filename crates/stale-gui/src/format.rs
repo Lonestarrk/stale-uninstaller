@@ -32,13 +32,18 @@ pub fn relative_date(when: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String 
     }
 }
 
-/// [`relative_date`], plus " (via link.exe)" when the date came from a subcomponent exe.
-pub fn last_used_label(when: Option<DateTime<Utc>>, via: Option<&str>, now: DateTime<Utc>) -> String {
+/// [`relative_date`], plus " (via link.exe)" when the date came from a subcomponent exe and
+/// " (autostart)" when it came from an automatic start; both: " (autostart, via link.exe)".
+pub fn last_used_label(when: Option<DateTime<Utc>>, via: Option<&str>, autostart: bool, now: DateTime<Utc>) -> String {
     let date = relative_date(when, now);
-    match (when, via) {
-        (Some(_), Some(exe)) => format!("{date} ({} {exe})", strings::VIA),
-        _ => date,
+    if when.is_none() {
+        return date;
     }
+    let notes: Vec<String> = [autostart.then(|| strings::AUTOSTART.to_string()), via.map(|exe| format!("{} {exe}", strings::VIA))]
+        .into_iter()
+        .flatten()
+        .collect();
+    if notes.is_empty() { date } else { format!("{date} ({})", notes.join(", ")) }
 }
 
 /// "–" when unknown, whole MB below 1 GiB (at least 1 for non-empty), otherwise GB with
@@ -128,9 +133,22 @@ mod tests {
     #[test]
     fn last_used_label_shows_via() {
         let now = now();
-        assert_eq!(last_used_label(Some(now), Some("link.exe"), now), "Idag (via link.exe)");
-        assert_eq!(last_used_label(Some(now), None, now), "Idag");
-        assert_eq!(last_used_label(None, Some("link.exe"), now), "Aldrig sedd");
+        assert_eq!(last_used_label(Some(now), Some("link.exe"), false, now), "Idag (via link.exe)");
+        assert_eq!(last_used_label(Some(now), None, false, now), "Idag");
+        assert_eq!(last_used_label(None, Some("link.exe"), false, now), "Aldrig sedd");
+    }
+
+    #[test]
+    fn last_used_label_shows_autostart() {
+        let now = now();
+        assert_eq!(last_used_label(Some(now), None, true, now), "Idag (autostart)");
+        assert_eq!(last_used_label(None, None, true, now), "Aldrig sedd");
+    }
+
+    #[test]
+    fn last_used_label_shows_autostart_and_via() {
+        let now = now();
+        assert_eq!(last_used_label(Some(now), Some("x.exe"), true, now), "Idag (autostart, via x.exe)");
     }
 
     #[test]

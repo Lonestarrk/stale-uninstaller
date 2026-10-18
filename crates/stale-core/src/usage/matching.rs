@@ -24,6 +24,10 @@ pub struct ExeUsage {
     pub run_count: Option<u32>,
     pub is_main: bool,
     pub excluded: Option<ExcludeReason>,
+    /// The exe is started automatically: a scheduled-task action, a `Run`/`RunOnce` value or a
+    /// Startup-folder shortcut.
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +53,10 @@ pub struct LastUsed {
     /// subcomponent such as `link.exe`), else `None`.
     #[serde(default)]
     pub via: Option<String>,
+    /// The date is a Prefetch/BAM trace of an autostart exe (see [`ExeUsage::autostart`]): the
+    /// program was started automatically, not necessarily by the user.
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -69,6 +77,9 @@ pub struct MatchInput<'a> {
     pub service_exes: &'a HashSet<String>,
     /// `norm()`ed exe paths of scheduled-task actions.
     pub task_exes: &'a HashSet<String>,
+    /// `norm()`ed targets of `Run`/`RunOnce` values and Startup-folder shortcuts (scheduled
+    /// tasks are in `task_exes`).
+    pub autostart_exes: &'a HashSet<String>,
 }
 
 pub struct MatchResult {
@@ -427,6 +438,7 @@ fn group_hits(
     in_folder: impl Fn(&Path) -> bool,
     service_exes: &HashSet<String>,
     task_exes: &HashSet<String>,
+    autostart_exes: &HashSet<String>,
 ) -> Vec<ExeUsage> {
     let mut groups: BTreeMap<String, Vec<UsageHit>> = BTreeMap::new();
     for hit in hits {
@@ -475,6 +487,7 @@ fn group_hits(
                 run_count: group.iter().filter_map(|h| h.run_count).max(),
                 is_main: main,
                 excluded,
+                autostart: listed(task_exes, &exe) || listed(autostart_exes, &exe),
             })
         })
         .collect();
@@ -494,8 +507,10 @@ fn last_used<'a>(exes: impl IntoIterator<Item = &'a ExeUsage>) -> LastUsed {
             via: (!e.is_main && e.source != UsageSource::FileTime)
                 .then(|| e.exe_path.file_name().map(|n| n.to_string_lossy().to_lowercase()))
                 .flatten(),
+            // A user launch (UserAssist) or a file time is no sign of an autostart.
+            autostart: e.autostart && matches!(e.source, UsageSource::Bam | UsageSource::Prefetch),
         })
-        .unwrap_or(LastUsed { when: None, source: None, confident: true, via: None })
+        .unwrap_or(LastUsed { when: None, source: None, confident: true, via: None, autostart: false })
 }
 
 /// Summarizes one program's hits (spec §5). File timestamps are a pure fallback: they never
@@ -507,11 +522,12 @@ fn summarize(
     in_folder: impl Fn(&Path) -> bool,
     service_exes: &HashSet<String>,
     task_exes: &HashSet<String>,
+    autostart_exes: &HashSet<String>,
 ) -> ProgramUsage {
     let (file_times, real): (Vec<UsageHit>, Vec<UsageHit>) = hits.into_iter().partition(|h| h.source == UsageSource::FileTime);
-    let real = group_hits(real, &is_main, &in_folder, service_exes, task_exes);
+    let real = group_hits(real, &is_main, &in_folder, service_exes, task_exes, autostart_exes);
     let real_exes: HashSet<String> = real.iter().map(|e| norm(&e.exe_path)).collect();
-    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes, task_exes)
+    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes, task_exes, autostart_exes)
         .into_iter()
         .filter(|e| !real_exes.contains(&norm(&e.exe_path)))
         .collect();
@@ -540,7 +556,7 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
     let by_program = candidates
         .iter()
         .zip(assigned)
-        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes)))
+        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes, input.autostart_exes)))
         .collect();
     MatchResult { by_program, unmatched }
 }
@@ -727,7 +743,7 @@ mod tests {
         let hits = [hit(r"C:\Apps\Foo\FooUpdater.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 200, UsageSource::Bam)];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(200)), source: Some(UsageSource::Bam), confident: true, via: None });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(200)), source: Some(UsageSource::Bam), confident: true, via: None, autostart: false });
         assert_eq!(u.exes.len(), 2);
         assert_eq!(u.exes[0].exe_path, PathBuf::from(r"C:\Apps\Foo\FooUpdater.exe"));
         assert_eq!(u.exes[0].excluded, Some(ExcludeReason::NamePattern));
@@ -744,7 +760,7 @@ mod tests {
         let services = HashSet::from([norm(Path::new(r"C:\Apps\Foo\foo.exe"))]);
         let u = &run(&programs, &hits, &services).by_program[&ProgramId("Foo".into())];
         assert_eq!(u.exes[0].excluded, Some(ExcludeReason::Service));
-        assert_eq!(u.last_used, LastUsed { when: None, source: None, confident: true, via: None });
+        assert_eq!(u.last_used, LastUsed { when: None, source: None, confident: true, via: None, autostart: false });
     }
 
     #[test]
@@ -757,7 +773,7 @@ mod tests {
         ];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(5)), source: Some(UsageSource::UserAssist), confident: true, via: Some("other.exe".into()) });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(5)), source: Some(UsageSource::UserAssist), confident: true, via: Some("other.exe".into()), autostart: false });
         assert_eq!(u.exes.len(), 2);
         assert!(!u.exes[0].is_main);
         assert_eq!(u.exes[0].excluded, None);
@@ -786,7 +802,7 @@ mod tests {
         let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
         let hits = [hit(r"C:\Apps\Foo\foo.exe", 30, UsageSource::FileTime)];
         let r = run(&programs, &hits, &HashSet::new());
-        assert_eq!(usage(&r, "Foo").last_used, LastUsed { when: Some(days_ago(30)), source: Some(UsageSource::FileTime), confident: false, via: None });
+        assert_eq!(usage(&r, "Foo").last_used, LastUsed { when: Some(days_ago(30)), source: Some(UsageSource::FileTime), confident: false, via: None, autostart: false });
     }
 
     #[test]
@@ -910,6 +926,7 @@ mod tests {
             arg_exes: &HashMap::new(),
             service_exes: &services,
             task_exes: &HashSet::new(),
+            autostart_exes: &HashSet::new(),
         });
         assert_eq!(usage(&r, "Foo").last_used.when, None);
     }
@@ -920,7 +937,7 @@ mod tests {
         let hits = [hit(r"C:\Nowhere\x.exe", 1, UsageSource::Bam)];
         let r = run(&programs, &hits, &HashSet::new());
         assert_eq!(r.unmatched, hits.to_vec());
-        assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None }, exes: vec![] });
+        assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: vec![] });
     }
 
     #[test]
@@ -942,9 +959,10 @@ mod tests {
             arg_exes: &HashMap::from([(ProgramId("Discord".into()), vec![main.clone()])]),
             service_exes: &HashSet::new(),
             task_exes: &HashSet::new(),
+            autostart_exes: &HashSet::new(),
         });
         let u = usage(&r, "Discord");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(3)), source: Some(UsageSource::Bam), confident: true, via: None });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(3)), source: Some(UsageSource::Bam), confident: true, via: None, autostart: false });
         let discord = u.exes.iter().find(|e| e.exe_path == main).unwrap();
         assert!(discord.is_main && discord.excluded.is_none());
     }
@@ -963,7 +981,7 @@ mod tests {
         let hits = [hit(r"C:\Apps\Foo\foo.exe", 300, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 1, UsageSource::FileTime)];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(300)), source: Some(UsageSource::Bam), confident: true, via: None });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(300)), source: Some(UsageSource::Bam), confident: true, via: None, autostart: false });
         assert_eq!(u.exes.len(), 1);
         assert_eq!((u.exes[0].source, u.exes[0].last_run), (UsageSource::Bam, days_ago(300)));
     }
@@ -989,6 +1007,7 @@ mod tests {
             arg_exes: &HashMap::new(),
             service_exes: &HashSet::new(),
             task_exes: &HashSet::new(),
+            autostart_exes: &HashSet::new(),
         };
         explain_match(&input, &ProgramId(id.to_string())).into_iter().map(|e| e.outcome).collect()
     }
@@ -1031,8 +1050,8 @@ mod tests {
         args: &'a HashMap<ProgramId, Vec<PathBuf>>,
         services: &'a HashSet<String>,
     ) -> MatchInput<'a> {
-        static NO_TASKS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
-        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services, task_exes: &NO_TASKS }
+        static EMPTY: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services, task_exes: &EMPTY, autostart_exes: &EMPTY }
     }
 
     /// Observed live: Steam's Uninstall entry has no InstallLocation, only
@@ -1424,6 +1443,29 @@ mod tests {
         assert_eq!(u.exes[0].excluded, None);
         assert_eq!(via_of(u), (Some(days_ago(0)), None));
         assert_eq!(u.last_used.source, Some(UsageSource::Bam));
+        assert!(u.last_used.autostart);
+        assert!(u.exes[0].autostart);
+        // A newer user launch wins: the user clicked it, no autostart marker.
+        let hits = [hit(exe, 0, UsageSource::UserAssist), hit(exe, 2, UsageSource::Bam)];
+        let r = run_with_tasks(&programs, &hits, &HashSet::from([norm(Path::new(exe))]));
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.source, Some(UsageSource::UserAssist));
+        assert!(!u.last_used.autostart);
+    }
+
+    #[test]
+    fn run_key_target_is_autostart() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\foo.exe";
+        let hits = [hit(exe, 0, UsageSource::Prefetch)];
+        let (shortcuts, roots, args, services) = (targets(&[exe]), HashMap::new(), HashMap::new(), HashSet::new());
+        let autostart = HashSet::from([norm(Path::new(exe))]);
+        let r = match_usage(&MatchInput { autostart_exes: &autostart, ..input(&programs, &hits, &shortcuts, &roots, &args, &services) });
+        assert!(usage(&r, "Foo").last_used.autostart);
+        // FileTime never carries the marker.
+        let hits = [hit(exe, 0, UsageSource::FileTime)];
+        let r = match_usage(&MatchInput { autostart_exes: &autostart, ..input(&programs, &hits, &shortcuts, &roots, &args, &services) });
+        assert!(!usage(&r, "Foo").last_used.autostart);
     }
 
     #[test]

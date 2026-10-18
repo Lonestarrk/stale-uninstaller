@@ -101,6 +101,8 @@ pub const COUNTED_YES: &str = "✓";
 pub const COUNTED_SUBCOMPONENT: &str = "räknas";
 /// Between the date and the exe name in "Idag (via link.exe)".
 pub const VIA: &str = "via";
+/// The date is an automatic start (scheduled task, Run value, Startup folder): "Idag (autostart)".
+pub const AUTOSTART: &str = "autostart";
 pub const RUNS: &str = "körningar";
 pub const EXCLUDED_NAME_PATTERN: &str = "uppdaterare/tjänst-namn";
 pub const EXCLUDED_SERVICE: &str = "tjänst";

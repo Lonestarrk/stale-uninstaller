@@ -20,13 +20,15 @@ pub fn exclude_label(reason: ExcludeReason) -> &'static str {
     }
 }
 
-/// "✓" for a counted main exe, "räknas" for a counted subcomponent, else the reason it is left out.
-fn counted_label(exe: &ExeUsage) -> &'static str {
-    match exe.excluded {
-        Some(reason) => exclude_label(reason),
+/// "✓" for a counted main exe, "räknas" for a counted subcomponent, else the reason it is left
+/// out; a counted autostart exe gets " (autostart)".
+fn counted_label(exe: &ExeUsage) -> String {
+    let label = match exe.excluded {
+        Some(reason) => return exclude_label(reason).to_string(),
         None if exe.is_main => strings::COUNTED_YES,
         None => strings::COUNTED_SUBCOMPONENT,
-    }
+    };
+    if exe.autostart { format!("{label} ({})", strings::AUTOSTART) } else { label.to_string() }
 }
 
 fn hive_label(hive: Hive) -> &'static str {
@@ -43,6 +45,9 @@ fn last_used_text(row: &Row) -> String {
         return strings::NEVER_SEEN.to_string();
     };
     let mut text = format!("{} ({})", format::ymd(Some(format::local_date(when))), format::source_label(source));
+    if usage.last_used.autostart {
+        text.push_str(&format!(" {}", strings::AUTOSTART));
+    }
     if let Some(via) = &usage.last_used.via {
         text.push_str(&format!(" {} {via}", strings::VIA));
     }
@@ -137,10 +142,13 @@ mod tests {
             run_count: None,
             is_main,
             excluded,
+            autostart: false,
         };
         assert_eq!(counted_label(&exe(true, None)), strings::COUNTED_YES);
         assert_eq!(counted_label(&exe(false, None)), "räknas");
         assert_eq!(counted_label(&exe(false, Some(ExcludeReason::Service))), strings::EXCLUDED_SERVICE);
+        let auto = ExeUsage { autostart: true, ..exe(true, None) };
+        assert_eq!(counted_label(&auto), format!("{} (autostart)", strings::COUNTED_YES));
     }
 
     #[test]

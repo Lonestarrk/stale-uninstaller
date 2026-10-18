@@ -21,6 +21,11 @@ pub fn start_menu_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The all-users and current-user Startup folders (shortcuts there run at logon).
+pub fn startup_dirs() -> Vec<PathBuf> {
+    start_menu_dirs().into_iter().map(|d| d.join("Startup")).collect()
+}
+
 /// Keeps COM initialized on the calling thread for its lifetime. If the thread already uses
 /// another apartment model (`RPC_E_CHANGED_MODE`) COM is usable as-is and nothing is undone.
 struct ComGuard {

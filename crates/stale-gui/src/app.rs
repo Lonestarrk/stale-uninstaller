@@ -47,6 +47,11 @@ impl Row {
         self.usage.as_ref().and_then(|u| u.last_used.via.as_deref())
     }
 
+    /// Whether the last-used date comes from an automatic start.
+    pub fn last_used_autostart(&self) -> bool {
+        self.usage.as_ref().is_some_and(|u| u.last_used.autostart)
+    }
+
     /// The registry estimate, else the measured folder size (spec §5).
     pub fn size_bytes(&self) -> Option<u64> {
         self.program.estimated_size_bytes.or(self.size)
@@ -958,7 +963,7 @@ mod tests {
     }
 
     fn usage() -> ProgramUsage {
-        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None }, exes: Vec::new() }
+        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: Vec::new() }
     }
 
     #[test]

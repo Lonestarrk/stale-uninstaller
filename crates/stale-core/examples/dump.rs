@@ -225,7 +225,8 @@ fn main() {
             .map_or("-".to_string(), |b| format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)));
         let drive = p.drive.map_or("-".to_string(), |d| format!("{d}:"));
         let via = last.and_then(|l| l.via.as_deref()).map_or(String::new(), |v| format!(" via {v}"));
-        println!("{drive} | {} | {when} ({source}){via} | {size}", p.name);
+        let auto = if last.is_some_and(|l| l.autostart) { " autostart" } else { "" };
+        println!("{drive} | {} | {when} ({source}){auto}{via} | {size}", p.name);
     }
     println!("--- {unmatched} unmatched usage hits");
     for w in &warnings {

@@ -11,7 +11,7 @@ use crate::pathutil::{exe_under, is_shared_root};
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
 use crate::services::service_exes;
-use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, ShortcutTarget};
+use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, startup_dirs, ShortcutTarget};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
 use crate::usage::matching::{
@@ -66,6 +66,8 @@ pub struct ScanSources {
     pub service_exes: Box<dyn Fn() -> HashSet<String> + Send>,
     /// `norm()`ed exe paths of scheduled-task actions.
     pub task_exes: Box<dyn Fn() -> HashSet<String> + Send>,
+    /// `norm()`ed targets of `Run`/`RunOnce` values and Startup-folder shortcuts.
+    pub autostart_exes: Box<dyn Fn() -> HashSet<String> + Send>,
     /// Resolves `.lnk` hits (UserAssist records Start Menu launches by shortcut path).
     pub resolve_lnk: ResolveLnkFn,
 }
@@ -76,6 +78,7 @@ impl ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
         let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
         let services_reg = reg.clone();
+        let autostart_reg = reg.clone();
         ScanSources {
             providers: vec![
                 Box::new(BamProvider { reg: reg.clone(), map: Arc::new(WinDeviceMap::new()) }),
@@ -92,6 +95,11 @@ impl ScanSources {
             }),
             service_exes: Box::new(move || service_exes(&*services_reg)),
             task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs, &crate::paths::tasks_root())),
+            autostart_exes: Box::new(move || {
+                let mut exes = crate::leftovers::reg_scan::run_value_exes(&*autostart_reg);
+                exes.extend(shortcut_targets(&startup_dirs()).iter().map(|t| crate::pathutil::norm(&t.path)));
+                exes
+            }),
             resolve_lnk: Box::new(resolve_lnk),
         }
     }
@@ -136,6 +144,7 @@ pub struct UsageInputs {
     pub hits: Vec<UsageHit>,
     pub service_exes: HashSet<String>,
     pub task_exes: HashSet<String>,
+    pub autostart_exes: HashSet<String>,
     /// Provider failures and partial-result warnings, for the user.
     pub warnings: Vec<String>,
 }
@@ -150,6 +159,7 @@ impl UsageInputs {
             arg_exes: &self.arg_exes,
             service_exes: &self.service_exes,
             task_exes: &self.task_exes,
+            autostart_exes: &self.autostart_exes,
         }
     }
 }
@@ -190,7 +200,7 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
-    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, warnings }
+    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, autostart_exes: (src.autostart_exes)(), warnings }
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -299,6 +309,7 @@ mod tests {
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
             task_exes: Box::new(HashSet::new),
+            autostart_exes: Box::new(HashSet::new),
             resolve_lnk: Box::new(|_: &Path| None),
         }
     }
