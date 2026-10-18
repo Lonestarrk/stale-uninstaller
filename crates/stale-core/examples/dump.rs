@@ -11,7 +11,7 @@ use stale_core::programs::enumerate_programs;
 use stale_core::registry::WinRegistry;
 use stale_core::pathutil::exe_under;
 use stale_core::scan::{gather_usage, run_scan, ScanEvent, ScanSources};
-use stale_core::usage::matching::{explain_match, main_exes_with_rule, usage_install_dir};
+use stale_core::usage::matching::{explain_match, program_main_exes, usage_install_dir};
 
 /// `dump leftovers <name>`: lists what is left of the first visible program whose name contains
 /// `<name>`. Nothing is deleted.
@@ -147,7 +147,7 @@ fn dump_usage(name: &str) {
         println!("effective dir:    {effective:?}");
         let roots = inputs.root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
         let args = inputs.arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
-        let (mains, rule) = main_exes_with_rule(p, &src.shortcut_targets, roots, args);
+        let (mains, rule) = program_main_exes(p, &src.shortcut_targets, roots, args, &inputs.service_exes);
         println!("main exes ({rule:?}): {mains:?}");
         let dirs: Vec<&Path> = p.install_location.iter().chain(effective.iter()).map(PathBuf::as_path).collect();
         let names: HashSet<String> = dirs.iter().flat_map(|d| exe_names_under(d)).collect();

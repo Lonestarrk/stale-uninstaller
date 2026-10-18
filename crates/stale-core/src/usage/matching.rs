@@ -132,6 +132,19 @@ pub fn main_exes_skipping(
     main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, skip).0
 }
 
+/// The main exe(s) and rule usage matching really uses: [`main_exes_rule_skipping`] that skips
+/// service exes (a `norm()`ed set, see `listed`). A scheduled task may start the main exe
+/// (an autostart at logon): the program is then running, so it stays the main exe.
+pub fn program_main_exes(
+    p: &Program,
+    shortcut_targets: &[ShortcutTarget],
+    root_exes: &[(PathBuf, u64)],
+    arg_exes: &[PathBuf],
+    service_exes: &HashSet<String>,
+) -> (Vec<PathBuf>, MainRule) {
+    main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, &|e| listed(service_exes, e))
+}
+
 /// The tier of [`main_exes`] that picked the main exe(s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainRule {
@@ -330,8 +343,8 @@ impl<'a> Candidate<'a> {
         let roots = input.root_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
-        let background = |e: &Path| listed(input.service_exes, e) || listed(input.task_exes, e);
-        let main = main_exes_skipping(program, input.shortcut_targets, roots, args, &background)
+        let main = program_main_exes(program, input.shortcut_targets, roots, args, input.service_exes)
+            .0
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
             .collect();
@@ -340,7 +353,7 @@ impl<'a> Candidate<'a> {
             .display_icon
             .as_deref()
             .map(strip_icon_index)
-            .filter(|i| is_exe(i) && !i.parent().is_none_or(is_rejected_dir) && !background(i))
+            .filter(|i| is_exe(i) && !i.parent().is_none_or(is_rejected_dir) && !listed(input.service_exes, i))
             .filter(|i| !install.as_deref().is_some_and(|inst| normed_under(&norm(i), inst)))
             .and_then(|i| file_name_upper(&i));
         let uninstaller_name = if install.is_none() {
@@ -422,38 +435,46 @@ fn group_hits(
     let mut exes: Vec<ExeUsage> = groups
         .into_values()
         .filter_map(|group| {
-            let main = is_main(&group.first()?.exe_path);
-            let setup_named = is_installer(&group[0].exe_path);
+            let exe = group.first()?.exe_path.clone();
+            let main = is_main(&exe);
+            let setup_named = is_installer(&exe);
+            let is_ua = |h: &UsageHit| h.source == UsageSource::UserAssist;
             // A main exe with a setup-like name (Visual Studio Installer's `setup.exe`) counts from
             // execution traces, but a UserAssist entry for it does not.
             let ua_blocked = setup_named && main;
-            let traces: Vec<&UsageHit> =
-                group.iter().filter(|h| !(ua_blocked && h.source == UsageSource::UserAssist)).collect();
+            let traces: Vec<&UsageHit> = group.iter().filter(|h| !(ua_blocked && is_ua(h))).collect();
             let all_blocked = traces.is_empty();
             let group: Vec<UsageHit> = if all_blocked { group } else { traces.into_iter().cloned().collect() };
-            let latest = group.iter().max_by_key(|h| h.last_run)?;
-            // UserAssist records launches by the user, so such an exe counts even when it is not
-            // a main exe or has a background-looking name; running an uninstaller never does.
-            let user_launched =
-                group.iter().any(|h| h.source == UsageSource::UserAssist) && !is_uninstaller(&latest.exe_path);
-            // A setup exe is never use of the program, whatever recorded it.
+            // A cached or bundled setup is never use of the program, whatever recorded it.
             let installer = setup_named && (!main || all_blocked);
+            // A scheduled task that starts the main exe is an autostart: the program runs, so
+            // it counts. A task running any other exe is maintenance.
+            let background = exclude_reason(&exe, service_exes)
+                .or((!main && listed(task_exes, &exe)).then_some(ExcludeReason::ScheduledTask))
+                .or((!main && !in_folder(&exe)).then_some(ExcludeReason::NotMain));
+            // UserAssist records launches by the user, so an otherwise excluded exe counts when the
+            // user started it (running an uninstaller never does).
+            let user_launched = background.is_some() && group.iter().any(is_ua) && !is_uninstaller(&exe);
+            // A service or helper (updater, tray, …) also runs on its own, so only those launches
+            // date it, never its Prefetch/BAM traces.
+            let helper = matches!(background, Some(ExcludeReason::Service | ExcludeReason::NamePattern));
+            let (group, excluded): (Vec<UsageHit>, Option<ExcludeReason>) = if installer {
+                (group, Some(ExcludeReason::NamePattern))
+            } else if user_launched && helper {
+                (group.into_iter().filter(is_ua).collect(), None)
+            } else if user_launched {
+                (group, None)
+            } else {
+                (group, background)
+            };
+            let latest = group.iter().max_by_key(|h| h.last_run)?;
             Some(ExeUsage {
                 exe_path: latest.exe_path.clone(),
                 last_run: latest.last_run,
                 source: latest.source,
                 run_count: group.iter().filter_map(|h| h.run_count).max(),
                 is_main: main,
-                excluded: if installer {
-                    Some(ExcludeReason::NamePattern)
-                } else if user_launched {
-                    None
-                } else {
-                    exclude_reason(&latest.exe_path, service_exes)
-                        .or(listed(task_exes, &latest.exe_path).then_some(ExcludeReason::ScheduledTask))
-                        // A cached or bundled setup is never use of the program.
-                        .or((!main && !in_folder(&latest.exe_path)).then_some(ExcludeReason::NotMain))
-                },
+                excluded,
             })
         })
         .collect();
@@ -629,22 +650,15 @@ mod tests {
     /// Runs matching with Foo's shortcut `C:\Apps\Foo\foo.exe` and no root exes.
     fn run_with_tasks(programs: &[Program], hits: &[UsageHit], tasks: &HashSet<String>) -> MatchResult {
         let shortcuts = targets(&[r"C:\Apps\Foo\foo.exe"]);
-        let services = HashSet::new();
-        match_usage(&MatchInput {
-            programs,
-            hits,
-            shortcut_targets: &shortcuts,
-            root_exes: &HashMap::new(),
-            arg_exes: &HashMap::new(),
-            service_exes: &services,
-            task_exes: tasks,
-        })
+        let (roots, args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        match_usage(&MatchInput { task_exes: tasks, ..input(programs, hits, &shortcuts, &roots, &args, &services) })
     }
 
+    /// Like [`run_with_tasks`], with the given services and no scheduled tasks.
     fn run(programs: &[Program], hits: &[UsageHit], services: &HashSet<String>) -> MatchResult {
         let shortcuts = targets(&[r"C:\Apps\Foo\foo.exe"]);
-        let roots = HashMap::new();
-        match_usage(&MatchInput { programs, hits, shortcut_targets: &shortcuts, root_exes: &roots, arg_exes: &HashMap::new(), service_exes: services, task_exes: &HashSet::new() })
+        let (roots, args) = (HashMap::new(), HashMap::new());
+        match_usage(&input(programs, hits, &shortcuts, &roots, &args, services))
     }
 
     fn usage<'a>(r: &'a MatchResult, id: &str) -> &'a ProgramUsage {
@@ -1017,7 +1031,8 @@ mod tests {
         args: &'a HashMap<ProgramId, Vec<PathBuf>>,
         services: &'a HashSet<String>,
     ) -> MatchInput<'a> {
-        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services, task_exes: Box::leak(Box::default()) }
+        static NO_TASKS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services, task_exes: &NO_TASKS }
     }
 
     /// Observed live: Steam's Uninstall entry has no InstallLocation, only
@@ -1320,10 +1335,10 @@ mod tests {
         assert_eq!(u.last_used.when, Some(days_ago(9)));
         // The service binary no longer claims anything by name, so it does not count at all.
         assert!(u.exes.iter().all(|e| !e.exe_path.to_string_lossy().contains("CLICKTORUN") || e.excluded.is_some()));
-        // And as a scheduled-task action, with no other exe to fall back on: no date at all.
+        // A scheduled task that runs the main exe is an autostart of the program: it counts.
         let tasks = HashSet::from([norm(Path::new(svc))]);
         let r = run_with_tasks(std::slice::from_ref(&p), &hits[..1], &tasks);
-        assert_eq!(usage(&r, "Office").last_used.when, None);
+        assert_eq!(usage(&r, "Office").last_used.when, Some(days_ago(0)));
         assert_eq!(main_exes_skipping(&p, &[], &[], &[], &|e| norm(e) == norm(Path::new(svc))), Vec::<PathBuf>::new());
     }
 
@@ -1363,6 +1378,64 @@ mod tests {
         // UserAssist alone does not count.
         let r = match_usage(&input(&programs, &hits[2..], &shortcuts, &roots, &none, &services));
         assert_eq!(usage(&r, "VSI").last_used.when, None);
+    }
+
+    #[test]
+    fn userassist_bypass_dates_service_exe_only_from_userassist() {
+        // A service binary the user once started from Start, running all the time since.
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\tray.exe";
+        let hits = [
+            UsageHit { run_count: Some(1), ..hit(exe, 365, UsageSource::UserAssist) },
+            UsageHit { run_count: Some(40), ..hit(exe, 0, UsageSource::Prefetch) },
+            hit(exe, 0, UsageSource::Bam),
+        ];
+        let r = run(&programs, &hits, &HashSet::from([norm(Path::new(exe))]));
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.when, Some(days_ago(365)));
+        assert_eq!(u.last_used.source, Some(UsageSource::UserAssist));
+        assert_eq!((u.exes[0].last_run, u.exes[0].source, u.exes[0].run_count), (days_ago(365), UsageSource::UserAssist, Some(1)));
+        assert_eq!(u.exes[0].excluded, None);
+    }
+
+    #[test]
+    fn userassist_bypass_dates_name_pattern_exe_only_from_userassist() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\FooUpdater.exe";
+        let hits = [hit(exe, 365, UsageSource::UserAssist), hit(exe, 0, UsageSource::Bam)];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.when, Some(days_ago(365)));
+        assert_eq!(u.last_used.source, Some(UsageSource::UserAssist));
+        // Without a user launch the exe does not count at all.
+        let r = run(&programs, &hits[1..], &HashSet::new());
+        assert_eq!(usage(&r, "Foo").last_used.when, None);
+    }
+
+    #[test]
+    fn autostart_task_running_main_exe_counts() {
+        // MSI Afterburner: clicked once from Start a year ago, started at every logon by a task.
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\foo.exe";
+        let hits = [hit(exe, 365, UsageSource::UserAssist), hit(exe, 0, UsageSource::Bam)];
+        let r = run_with_tasks(&programs, &hits, &HashSet::from([norm(Path::new(exe))]));
+        let u = usage(&r, "Foo");
+        assert!(u.exes[0].is_main);
+        assert_eq!(u.exes[0].excluded, None);
+        assert_eq!(via_of(u), (Some(days_ago(0)), None));
+        assert_eq!(u.last_used.source, Some(UsageSource::Bam));
+    }
+
+    #[test]
+    fn program_main_exes_skip_services_only() {
+        let p = prog("Foo", Some(r"C:\Apps\Foo"));
+        let shortcuts = targets(&[r"C:\Apps\Foo\agent.exe"]);
+        let roots = vec![(PathBuf::from(r"C:\Apps\Foo\agent.exe"), 100), (PathBuf::from(r"C:\Apps\Foo\app.exe"), 50)];
+        let agent = HashSet::from([norm(Path::new(r"C:\Apps\Foo\agent.exe"))]);
+        let (mains, rule) = program_main_exes(&p, &shortcuts, &roots, &[], &agent);
+        assert_eq!((mains, rule), (paths(&[r"C:\Apps\Foo\app.exe"]), MainRule::LargestRootExe));
+        let (mains, rule) = program_main_exes(&p, &shortcuts, &roots, &[], &HashSet::new());
+        assert_eq!((mains, rule), (paths(&[r"C:\Apps\Foo\agent.exe"]), MainRule::Shortcut));
     }
 
     #[test]

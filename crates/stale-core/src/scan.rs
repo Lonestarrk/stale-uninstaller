@@ -15,7 +15,7 @@ use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, ShortcutT
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
 use crate::usage::matching::{
-    arg_exe_names, is_name_excluded, main_exes, match_usage, usage_install_dir, MatchInput, ProgramUsage,
+    arg_exe_names, is_name_excluded, match_usage, program_main_exes, usage_install_dir, MatchInput, ProgramUsage,
 };
 use crate::usage::prefetch::PrefetchProvider;
 use crate::usage::userassist::UserAssistProvider;
@@ -168,12 +168,14 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
             (!found.is_empty()).then(|| ((*id).clone(), found))
         })
         .collect();
+    let (service_exes, task_exes) = ((src.service_exes)(), (src.task_exes)());
+    // The same main exes matching uses, so a service never gets a file-time fallback.
     let mains: Vec<PathBuf> = programs
         .iter()
         .flat_map(|p| {
             let roots = root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
             let args = arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
-            main_exes(p, &src.shortcut_targets, roots, args)
+            program_main_exes(p, &src.shortcut_targets, roots, args, &service_exes).0
         })
         .collect();
 
@@ -188,7 +190,7 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
-    UsageInputs { root_exes, arg_exes, hits, service_exes: (src.service_exes)(), task_exes: (src.task_exes)(), warnings }
+    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, warnings }
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -349,6 +351,25 @@ mod tests {
         let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
         let beta = usage.keys().find(|id| id.0.ends_with("Beta")).unwrap();
         assert_eq!(usage[beta].last_used.source, Some(UsageSource::FileTime));
+    }
+
+    #[test]
+    fn file_times_skip_service_main_exes_only() {
+        let mut src = sources(FixedProvider(Ok(vec![])));
+        src.list_root_exes = Box::new(|dir: &Path| vec![(dir.join("agent.exe"), 200), (dir.join("main.exe"), 100)]);
+        // An autostart task's own main exe stays the main exe; a service never is.
+        src.task_exes = Box::new(|| HashSet::from([crate::pathutil::norm(Path::new(r"D:\Apps\Alpha\agent.exe"))]));
+        src.service_exes = Box::new(|| HashSet::from([crate::pathutil::norm(Path::new(r"D:\Apps\Beta\agent.exe"))]));
+        let (tx_exes, rx_exes) = channel();
+        src.file_times = Box::new(move |exes: &[PathBuf]| {
+            tx_exes.send(exes.to_vec()).unwrap();
+            vec![]
+        });
+        run(src);
+        let exes = rx_exes.recv().unwrap();
+        assert!(exes.contains(&PathBuf::from(r"D:\Apps\Alpha\agent.exe")), "{exes:?}");
+        assert!(exes.contains(&PathBuf::from(r"D:\Apps\Beta\main.exe")), "{exes:?}");
+        assert!(!exes.contains(&PathBuf::from(r"D:\Apps\Beta\agent.exe")), "{exes:?}");
     }
 
     #[test]
