@@ -7,9 +7,47 @@ use stale_core::quarantine::{auto_purge, QuarantineOps};
 use stale_core::settings::Settings;
 use stale_gui::app::StaleApp;
 use stale_gui::logging;
-use stale_gui::strings::APP_TITLE;
+use stale_gui::strings::{ALREADY_RUNNING, APP_TITLE};
+
+/// Name of the machine-wide mutex that marks a running Stale Uninstaller.
+const INSTANCE_MUTEX: &str = r"Global\StaleUninstaller";
+
+/// Takes the single-instance mutex; `false` when another Stale Uninstaller (any session) holds it.
+/// The handle stays open until the process ends.
+fn single_instance() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = INSTANCE_MUTEX.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call; the handle is deliberately leaked
+    // so the mutex lives as long as the process.
+    unsafe {
+        match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
+            Ok(_) => GetLastError() != ERROR_ALREADY_EXISTS,
+            // Cannot tell (e.g. access denied to another session's mutex): assume another instance.
+            Err(e) => {
+                eprintln!("CreateMutexW: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// "Stale Uninstaller körs redan." in a message box.
+fn show_already_running() {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let text: Vec<u16> = ALREADY_RUNNING.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = APP_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION) };
+}
 
 fn main() -> eframe::Result {
+    if !single_instance() {
+        show_already_running();
+        return Ok(());
+    }
     // Before anything (the log included) is written below the data folder.
     let secured = stale_core::paths::secure_data_dir();
     if let Err(e) = &secured {

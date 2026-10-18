@@ -1,6 +1,7 @@
 //! All user-visible text (Swedish).
 
 pub const APP_TITLE: &str = "Stale Uninstaller";
+pub const ALREADY_RUNNING: &str = "Stale Uninstaller körs redan.";
 pub const LOADING: &str = "Läser installerade program…";
 pub const NO_PROGRAMS: &str = "Inga program hittades.";
 pub const WARNINGS: &str = "Varningar";
