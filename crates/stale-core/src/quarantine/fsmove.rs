@@ -7,7 +7,6 @@ use std::sync::Mutex;
 
 use super::QuarantineId;
 use crate::pathutil::{drive_letter, norm};
-use crate::proc::{run_hidden, system32_tool};
 
 /// Why [`FileMover::move_path`] did not complete.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,10 +43,10 @@ pub trait FileMover: Send + Sync {
     /// Moves a file or folder; creates `to`'s parent folders and never overwrites an existing `to`.
     /// Across volumes it copies the whole tree, verifies it, then deletes the source.
     fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError>;
-    /// Creates `root`, makes Administrators its owner (the folder itself only, never recursively) and
-    /// replaces its ACL with inheritable full control for Administrators and SYSTEM, which new
-    /// subfolders inherit. Refuses a root (or parent) that is a reparse point; a failed ACL change
-    /// is fatal only for a root that already existed.
+    /// Creates `root` (its parent must exist) and locks it down with [`crate::acl::secure_dir`]:
+    /// owner Administrators, a protected DACL of exactly Administrators + SYSTEM full control
+    /// (inherited below), untrusted children renamed aside. Refuses a root (or parent) that is a
+    /// reparse point; a failed lock-down is fatal only for a root that already existed.
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String>;
     /// Bytes of a file, or of all files below a folder; 0 when missing.
     fn size_of(&self, p: &Path) -> u64;
@@ -177,25 +176,10 @@ impl FileMover for RealFileMover {
                 return Err(format!("{} is a link or reparse point", p.display()));
             }
         }
-        let existed = std::fs::symlink_metadata(root).is_ok();
-        std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
-        let icacls = system32_tool("icacls.exe");
-        let owner = [root.as_os_str(), "/setowner".as_ref(), "*S-1-5-32-544".as_ref(), "/c".as_ref(), "/q".as_ref()];
-        let grant = [
-            root.as_os_str(),
-            "/inheritance:r".as_ref(),
-            "/grant:r".as_ref(),
-            "*S-1-5-32-544:(OI)(CI)F".as_ref(),
-            "*S-1-5-18:(OI)(CI)F".as_ref(),
-        ];
-        match run_hidden(&icacls, &owner).and_then(|()| run_hidden(&icacls, &grant)) {
-            Ok(()) => Ok(()),
-            Err(e) if existed => Err(format!("securing existing {}: {e}", root.display())),
-            Err(e) => {
-                log::warn!("quarantine: icacls on {} failed: {e}", root.display());
-                Ok(())
-            }
+        for warning in crate::acl::secure_dir(root, false)? {
+            log::warn!("quarantine: {warning}");
         }
+        Ok(())
     }
 
     fn size_of(&self, p: &Path) -> u64 {
@@ -472,7 +456,7 @@ mod tests {
         if std::os::windows::fs::symlink_dir(target, link).is_ok() {
             return true;
         }
-        std::process::Command::new(system32_tool("cmd.exe"))
+        std::process::Command::new(crate::proc::system32_tool("cmd.exe"))
             .args(["/c", "mklink", "/J"])
             .arg(link)
             .arg(target)

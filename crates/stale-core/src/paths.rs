@@ -6,18 +6,23 @@ fn env_or(var: &str, fallback: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| fallback.to_string())
 }
 
+fn data_dir_path() -> PathBuf {
+    PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller")
+}
+
 /// `%ProgramData%\Stale Uninstaller`, created on demand (creation errors are ignored).
 pub fn data_dir() -> PathBuf {
-    let dir = PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller");
+    let dir = data_dir_path();
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
-/// Locks `data_dir()` down to Administrators and SYSTEM (owner and inherited ACL, refusing a link
-/// or reparse point), like a quarantine payload root: settings and manifests below it are trusted.
-pub fn secure_data_dir() -> Result<(), String> {
-    use crate::quarantine::fsmove::{FileMover, RealFileMover};
-    RealFileMover.ensure_payload_root(&data_dir())
+/// Locks `%ProgramData%\Stale Uninstaller` down to Administrators and SYSTEM (owner and the whole
+/// DACL replaced, a link or reparse point refused, untrusted children renamed aside; created
+/// locked when missing) via [`crate::acl::secure_dir`], so settings and manifests below it are
+/// trusted. Returns the warnings about children moved aside.
+pub fn secure_data_dir() -> Result<Vec<String>, String> {
+    crate::acl::secure_dir(&data_dir_path(), false)
 }
 
 /// `data_dir()\logs`, created on demand (creation errors are ignored).

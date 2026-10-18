@@ -18,8 +18,9 @@ fn main() -> eframe::Result {
     logging::init();
     install_panic_hook();
     log::info!("Stale Uninstaller {} starting", stale_core::version());
-    if let Err(e) = secured {
-        log::warn!("could not lock down the data folder: {e}");
+    match secured {
+        Ok(warnings) => warnings.iter().for_each(|w| log::warn!("data folder: {w}")),
+        Err(e) => log::warn!("could not lock down the data folder: {e}"),
     }
     spawn_auto_purge(Settings::load_from(&Settings::path()).quarantine_days);
     let options = eframe::NativeOptions {

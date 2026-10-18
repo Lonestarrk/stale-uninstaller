@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod devicepath;
 pub mod fsys;
 pub mod knownfolders;
