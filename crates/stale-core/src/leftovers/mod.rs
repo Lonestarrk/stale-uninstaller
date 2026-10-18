@@ -4,6 +4,9 @@ pub mod fs_scan;
 pub mod names;
 pub mod other_scan;
 pub mod reg_scan;
+pub mod scan;
+
+pub use scan::{mark_safe, scan_leftovers, LeftoverSources};
 
 use crate::model::{Program, RegKeyPath};
 use serde::{Deserialize, Serialize};
