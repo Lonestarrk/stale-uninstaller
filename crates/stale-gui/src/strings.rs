@@ -164,7 +164,6 @@ pub struct Strings {
     pub via: &'static str,
     /// The date is an automatic start (scheduled task, Run value, Startup folder): "Idag (autostart)".
     pub autostart: &'static str,
-    pub runs: &'static str,
     pub excluded_name_pattern: &'static str,
     pub excluded_service: &'static str,
     pub excluded_scheduled_task: &'static str,
@@ -407,7 +406,6 @@ pub static SV: Strings = Strings {
     counted_subcomponent: "räknas",
     via: "via",
     autostart: "autostart",
-    runs: "körningar",
     excluded_name_pattern: "uppdaterare/tjänst-namn",
     excluded_service: "tjänst",
     excluded_scheduled_task: "schemalagd uppgift",
@@ -567,7 +565,7 @@ pub static EN: Strings = Strings {
     unknown_drive: "?",
     // Toolbar
     uninstall: "Uninstall",
-    force_remove: "Forced removal",
+    force_remove: "Force remove",
     find_leftovers: "Find leftovers",
     refresh: "Refresh",
     search_hint: "Search programs…",
@@ -604,12 +602,12 @@ pub static EN: Strings = Strings {
     show_hidden: "Show hidden entries",
     auto_purge_days: "Empty the quarantine automatically after N days",
     auto_purge_off: "(off)",
-    kept_menu: "Kept…",
+    kept_menu: "Keep list…",
     language_menu: "Språk / Language",
     lang_sv: "Svenska",
     lang_en: "English",
-    kept_title: "Kept",
-    kept_empty: "Nothing is kept",
+    kept_title: "Keep list",
+    kept_empty: "The keep list is empty",
     kept_remove: "Remove",
     undo: "Undo",
     // Details panel
@@ -623,13 +621,12 @@ pub static EN: Strings = Strings {
     col_file: "File",
     col_last_run: "Last run",
     col_source: "Source",
-    col_counted: "Counts",
+    col_counted: "Counted",
     counted_yes: "✓",
-    counted_subcomponent: "counts",
+    counted_subcomponent: "counted",
     via: "via",
     autostart: "autostart",
-    runs: "runs",
-    excluded_name_pattern: "updater/service name",
+    excluded_name_pattern: "updater or service name",
     excluded_service: "service",
     excluded_scheduled_task: "scheduled task",
     excluded_not_main: "not the main program",
@@ -648,7 +645,7 @@ pub static EN: Strings = Strings {
     cancel: "Cancel",
     start: "Start",
     step_restore_point: "Restore point",
-    step_vendor: "Own uninstaller",
+    step_vendor: "Program's uninstaller",
     step_leftovers: "Leftovers",
     step_done: "Done",
     step_separator: "·",
@@ -660,7 +657,7 @@ pub static EN: Strings = Strings {
     state_pending: "Waiting",
     state_running: "Running",
     state_uninstalled: "Uninstalled",
-    state_forced: "Forced",
+    state_forced: "Force-removed",
     state_not_uninstalled: "Not uninstalled",
     exit_code: "code",
     state_skipped: "Skipped",
@@ -699,7 +696,7 @@ pub static EN: Strings = Strings {
     note_publisher_of_installed: "the name is the publisher of an installed program",
     note_in_use: "used by a service, task, autostart or shortcut",
     note_launcher_library: "belongs to a game library",
-    mark_safe: "Check the safe ones",
+    mark_safe: "Check safe items",
     remove_checked: "Remove checked",
     service_reboot: "Services are fully removed only after a restart",
     quarantine_thread_failed: "Could not start the removal",
@@ -724,12 +721,12 @@ pub static EN: Strings = Strings {
     ghost_scan_thread_failed: "Could not start the ghost program search",
     ghost_scan_aborted: "The ghost program search stopped unexpectedly – see the log file",
     assess_probably: "Probably uninstalled",
-    assess_leftovers: "Leftovers without an installation",
+    assess_leftovers: "Leftovers only",
     assess_uncertain: "Uncertain",
     keep: "Keep",
     keep_save_failed: "Could not save the list of kept programs",
     keep_tip: "Never show this program, its folders or keys again",
-    show_ghost_leftovers: "Show leftovers for checked",
+    show_ghost_leftovers: "Show leftovers of checked programs",
     back: "Back",
     ref_run: "Autostart",
     ref_app_paths: "App Paths",
@@ -743,7 +740,7 @@ pub static EN: Strings = Strings {
     quarantine_title: "Quarantine",
     quarantine_empty: "The quarantine is empty",
     purge_all: "Empty quarantine",
-    purge: "Empty",
+    purge: "Empty quarantine",
     col_program: "Program",
     col_date: "Date",
     col_status: "Status",
@@ -759,7 +756,7 @@ pub static EN: Strings = Strings {
     unknown_content_left: "Unknown content left in the quarantine folder – left untouched",
     drive_missing: "Drive {X}: is not connected – the entry is kept",
     code_occupied: "the original exists again",
-    code_acl_not_reinherited: "the permissions could not be reset",
+    code_acl_not_reinherited: "permissions could not be inherited from the parent folder",
     code_reparse_in_destination: "a link in the destination path",
     code_reparse_in_quarantine_path: "a link in the quarantine path",
     code_partial_move: "only partly moved",
@@ -837,7 +834,7 @@ pub fn no_uninstaller(name: &str) -> String {
 pub fn fallback_notice(from: char, size: &str) -> String {
     match lang() {
         Lang::Sv => format!("{from}: saknar NTFS – {size} kopieras till C:"),
-        Lang::En => format!("{from}: has no NTFS – {size} is copied to C:"),
+        Lang::En => format!("{from}: is not NTFS – {size} will be copied to C:"),
     }
 }
 
@@ -846,11 +843,34 @@ pub fn insufficient_space(drive: char) -> String {
     t().insufficient_space.replace("{X}", &drive.to_string())
 }
 
+/// `singular` for 1, else `plural` (English counts).
+fn plural(n: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if n == 1 { singular } else { plural }
+}
+
 /// "(3 träffar, 58 MB)" after a section title.
 pub fn section_counts(hits: usize, size: &str) -> String {
-    match lang() {
+    section_counts_in(lang(), hits, size)
+}
+
+/// [`section_counts`] in `lang`.
+pub fn section_counts_in(lang: Lang, hits: usize, size: &str) -> String {
+    match lang {
         Lang::Sv => format!("({hits} träffar, {size})"),
-        Lang::En => format!("({hits} hits, {size})"),
+        Lang::En => format!("({hits} {}, {size})", plural(hits, "hit", "hits")),
+    }
+}
+
+/// A run count in the details table: "5 körningar" / "5 runs".
+pub fn run_count(n: u32) -> String {
+    run_count_in(lang(), n)
+}
+
+/// [`run_count`] in `lang`.
+pub fn run_count_in(lang: Lang, n: u32) -> String {
+    match lang {
+        Lang::Sv => format!("{n} körningar"),
+        Lang::En => format!("{n} {}", plural(n as usize, "run", "runs")),
     }
 }
 
@@ -858,15 +878,20 @@ pub fn section_counts(hits: usize, size: &str) -> String {
 pub fn checked_summary(checked: usize, total: usize, size: &str) -> String {
     match lang() {
         Lang::Sv => format!("{checked} av {total} markerade · {size} frigörs"),
-        Lang::En => format!("{checked} of {total} checked · {size} freed"),
+        Lang::En => format!("{checked} of {total} checked · {size} to free"),
     }
 }
 
 /// "4 objekt flyttade till karantän".
 pub fn moved_to_quarantine(count: usize) -> String {
-    match lang() {
+    moved_to_quarantine_in(lang(), count)
+}
+
+/// [`moved_to_quarantine`] in `lang`.
+pub fn moved_to_quarantine_in(lang: Lang, count: usize) -> String {
+    match lang {
         Lang::Sv => format!("{count} objekt flyttade till karantän"),
-        Lang::En => format!("{count} items moved to quarantine"),
+        Lang::En => format!("{count} {} moved to quarantine", plural(count, "item", "items")),
     }
 }
 
@@ -882,7 +907,7 @@ pub fn probably_section(count: usize) -> String {
 pub fn leftovers_section(count: usize) -> String {
     match lang() {
         Lang::Sv => format!("Rester utan installation (bocka i själv) ({count})"),
-        Lang::En => format!("Leftovers without an installation (check them yourself) ({count})"),
+        Lang::En => format!("Leftovers only (check them yourself) ({count})"),
     }
 }
 
@@ -943,7 +968,7 @@ pub fn evidence_ref(kind: &str, location: &str, target: &str) -> String {
 pub fn evidence_usage(date: &str, source: &str, exe: &str) -> String {
     match lang() {
         Lang::Sv => format!("Körd {date} ({source}): {exe}"),
-        Lang::En => format!("Run {date} ({source}): {exe}"),
+        Lang::En => format!("Last run {date} ({source}): {exe}"),
     }
 }
 
@@ -965,15 +990,20 @@ pub fn purge_one_confirm(name: &str, size: &str) -> String {
 pub fn purge_all_confirm(size: &str) -> String {
     match lang() {
         Lang::Sv => format!("Detta frigör {size} och kan inte ångras."),
-        Lang::En => format!("This frees {size} and cannot be undone."),
+        Lang::En => format!("This permanently deletes everything in quarantine ({size}) and cannot be undone."),
     }
 }
 
 /// A quarantine's status column: "2 fel".
 pub fn error_count(n: usize) -> String {
-    match lang() {
+    error_count_in(lang(), n)
+}
+
+/// [`error_count`] in `lang`.
+pub fn error_count_in(lang: Lang, n: usize) -> String {
+    match lang {
         Lang::Sv => format!("{n} fel"),
-        Lang::En => format!("{n} errors"),
+        Lang::En => format!("{n} {}", plural(n, "error", "errors")),
     }
 }
 
@@ -992,7 +1022,7 @@ pub fn scan_warning_in(lang: Lang, w: &ScanWarning) -> String {
             format!("Prefetch: {skipped} av {total} filer kunde inte läsas")
         }
         (Lang::En, ScanWarning::PrefetchUnreadable { skipped, total }) => {
-            format!("Prefetch: {skipped} of {total} files could not be read")
+            format!("Prefetch: {skipped} of {total} {} could not be read", plural(*total, "file", "files"))
         }
         (Lang::Sv, ScanWarning::SourceFailed { source, error }) => format!("{source} kunde inte läsas: {error}"),
         (Lang::En, ScanWarning::SourceFailed { source, error }) => format!("{source} could not be read: {error}"),
@@ -1146,6 +1176,23 @@ mod tests {
         assert_eq!(scan_warning_in(Lang::En, &failed), "BAM could not be read: boom");
         let thread = ScanWarning::ThreadFailed { error: "x".into() };
         assert_eq!(scan_warning_in(Lang::En, &thread), "Could not start the scan: x");
+    }
+
+    #[test]
+    fn english_counts_use_the_singular_for_one() {
+        assert_eq!(error_count_in(Lang::En, 1), "1 error");
+        assert_eq!(error_count_in(Lang::En, 2), "2 errors");
+        assert_eq!(moved_to_quarantine_in(Lang::En, 1), "1 item moved to quarantine");
+        assert_eq!(moved_to_quarantine_in(Lang::En, 4), "4 items moved to quarantine");
+        assert_eq!(section_counts_in(Lang::En, 1, "3 MB"), "(1 hit, 3 MB)");
+        assert_eq!(section_counts_in(Lang::En, 3, "3 MB"), "(3 hits, 3 MB)");
+        assert_eq!(run_count_in(Lang::En, 1), "1 run");
+        assert_eq!(run_count_in(Lang::En, 5), "5 runs");
+        assert_eq!(run_count_in(Lang::Sv, 5), "5 körningar");
+        let one = ScanWarning::PrefetchUnreadable { skipped: 1, total: 1 };
+        assert_eq!(scan_warning_in(Lang::En, &one), "Prefetch: 1 of 1 file could not be read");
+        assert_eq!(error_count_in(Lang::Sv, 1), "1 fel");
+        assert_eq!(moved_to_quarantine_in(Lang::Sv, 1), "1 objekt flyttade till karantän");
     }
 
     #[test]

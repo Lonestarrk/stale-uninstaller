@@ -10,4 +10,5 @@ pub mod leftover_sel;
 pub mod logging;
 pub mod strings;
 pub mod ui;
+pub mod warning;
 pub mod worker;

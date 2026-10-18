@@ -27,6 +27,7 @@ use crate::flow::FlowState;
 use crate::ghost_sel::GhostSelection;
 use crate::leftover_sel::LeftoverSelection;
 use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
+use crate::warning::{Msg, Warning};
 use crate::worker::{GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
 use crate::{strings, worker};
 
@@ -120,7 +121,7 @@ pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
     pub scanning: bool,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
     pub filters: Filters,
     pub sort: Sort,
     pub selected: Option<ProgramId>,
@@ -189,7 +190,8 @@ impl StaleApp {
         app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
         let id = session::identity();
         if session::runs_as_other_account(&id) {
-            app.warnings.push(strings::other_account_warning(id.session_user.as_deref().unwrap_or_default(), &id.token_user));
+            let session = id.session_user.clone().unwrap_or_default();
+            app.warnings.push(Warning::OtherAccount { session, token: id.token_user.clone() });
         }
         app.rx = Some(worker::spawn_scan());
         app.scanning = true;
@@ -289,7 +291,7 @@ impl StaleApp {
             }
             ScanEvent::Warning(w) => {
                 log::warn!("{w}");
-                self.warnings.push(strings::scan_warning(&w));
+                self.warnings.push(Warning::Scan(w));
             }
             ScanEvent::Done => self.scanning = false,
         }
@@ -448,7 +450,7 @@ impl StaleApp {
                 Err(TryRecvError::Disconnected) => {
                     // Gone without `QueueDone`: the worker panicked (logged by the panic hook).
                     log::error!("uninstall worker disconnected before QueueDone");
-                    flow.warnings.push(strings::t().queue_aborted.to_string());
+                    flow.warnings.push(Warning::Fixed(Msg::QueueAborted));
                     flow.finish();
                     break;
                 }
@@ -577,7 +579,7 @@ impl StaleApp {
                     return;
                 }
                 Ok(QuarantineEvent::Failed(msg)) => {
-                    log::error!("{msg}");
+                    log::error!("{msg:?}");
                     self.removal_progress = None;
                     self.warnings.push(msg);
                     return;
@@ -589,7 +591,7 @@ impl StaleApp {
                 Err(TryRecvError::Disconnected) => {
                     log::error!("quarantine worker disconnected before Finished");
                     self.removal_progress = None;
-                    self.warnings.push(strings::t().quarantine_aborted.to_string());
+                    self.warnings.push(Warning::Fixed(Msg::QuarantineAborted));
                     return;
                 }
             }
@@ -647,7 +649,7 @@ impl StaleApp {
             QuarantineAdminEvent::Purged(id) => self.quarantine.retain(|m| m.id != id),
             QuarantineAdminEvent::PurgedAll => {}
             QuarantineAdminEvent::Failed(msg) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
         }
@@ -680,13 +682,13 @@ impl StaleApp {
                 self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]))
             }
             Ok(LeftoverScanEvent::Failed(msg)) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
             Err(TryRecvError::Empty) => self.leftover_scan_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
                 log::error!("leftover scan worker disconnected before Done");
-                self.warnings.push(strings::t().leftover_scan_aborted.to_string());
+                self.warnings.push(Warning::Fixed(Msg::LeftoverScanAborted));
             }
         }
     }
@@ -713,7 +715,7 @@ impl StaleApp {
         sel.remove_by_key(key);
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
-            self.warnings.push(format!("{}: {e}", strings::t().keep_save_failed));
+            self.warnings.push(Warning::Detail(Msg::KeepSaveFailed, e.to_string()));
         }
     }
 
@@ -754,7 +756,7 @@ impl StaleApp {
     fn save_keep(&mut self, path: &Path) {
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
-            self.warnings.push(format!("{}: {e}", strings::t().keep_save_failed));
+            self.warnings.push(Warning::Detail(Msg::KeepSaveFailed, e.to_string()));
         }
     }
 
@@ -809,7 +811,7 @@ impl StaleApp {
         self.ghost_scan_waiting = false;
         if self.programs.is_empty() {
             log::warn!("ghost scan refused: no installed programs known");
-            self.warnings.push(strings::t().ghosts_need_programs.to_string());
+            self.warnings.push(Warning::Fixed(Msg::GhostsNeedPrograms));
             return;
         }
         self.ghost_rx = Some(worker::spawn_ghost_scan(self.programs.clone(), self.unmatched_hits.clone()));
@@ -839,13 +841,13 @@ impl StaleApp {
                 self.last_kept = None;
             }
             Ok(GhostEvent::Failed(msg)) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
             Err(TryRecvError::Empty) => self.ghost_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
                 log::error!("ghost scan worker disconnected before Done");
-                self.warnings.push(strings::t().ghost_scan_aborted.to_string());
+                self.warnings.push(Warning::Fixed(Msg::GhostScanAborted));
             }
         }
     }
@@ -865,7 +867,7 @@ impl StaleApp {
                     // logged by the panic hook): say so instead of showing partial results silently.
                     if self.scanning {
                         log::error!("scan worker disconnected before Done");
-                        self.warnings.push(strings::t().scan_aborted.to_string());
+                        self.warnings.push(Warning::Fixed(Msg::ScanAborted));
                         self.scanning = false;
                     }
                     return;
@@ -900,9 +902,9 @@ impl eframe::App for StaleApp {
         egui::Panel::top("top").show(ui, |ui| {
             toolbar::show(ui, self);
             if !self.warnings.is_empty() {
-                ui.collapsing(strings::t().warnings, |ui| {
+                egui::CollapsingHeader::new(strings::t().warnings).id_salt("warnings").show(ui, |ui| {
                     for w in &self.warnings {
-                        ui.label(w);
+                        ui.label(w.text());
                     }
                 });
             }
@@ -997,7 +999,7 @@ mod tests {
         assert_eq!(a.size, None);
         assert_eq!(b.usage, None);
         assert_eq!(b.size, Some(1234));
-        assert_eq!(app.warnings, vec![strings::scan_warning(&ScanWarning::ThreadFailed { error: "w".into() })]);
+        assert_eq!(app.warnings, vec![Warning::Scan(ScanWarning::ThreadFailed { error: "w".into() })]);
         assert!(app.scanning);
 
         app.apply_event(ScanEvent::Done);
@@ -1023,7 +1025,7 @@ mod tests {
         app.drain_events();
         assert!(!app.scanning);
         assert_eq!(app.rows.len(), 1, "events before the disconnect are applied");
-        assert_eq!(app.warnings, vec![strings::t().scan_aborted.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::ScanAborted)]);
         assert!(app.rx.is_none());
     }
 
@@ -1045,7 +1047,7 @@ mod tests {
         tx.send(ScanEvent::Warning(ScanWarning::ThreadFailed { error: "w".into() })).unwrap();
         app.drain_events();
         assert!(app.scanning && app.rx.is_some());
-        assert_eq!(app.warnings, vec![strings::scan_warning(&ScanWarning::ThreadFailed { error: "w".into() })]);
+        assert_eq!(app.warnings, vec![Warning::Scan(ScanWarning::ThreadFailed { error: "w".into() })]);
     }
 
     #[test]
@@ -1225,9 +1227,9 @@ mod tests {
         assert_eq!(app.quarantine, vec![manifest("a"), manifest("b")]);
         app.apply_quarantine_admin(QuarantineAdminEvent::Listed(vec![manifest("c")]));
         assert_eq!(app.quarantine, vec![manifest("c")]);
-        app.apply_quarantine_admin(QuarantineAdminEvent::Failed("nope".into()));
+        app.apply_quarantine_admin(QuarantineAdminEvent::Failed(Warning::Fixed(Msg::QuarantineAdminAborted)));
         assert_eq!(app.quarantine, vec![manifest("c")], "a failure keeps the rows");
-        assert_eq!(app.warnings, vec!["nope".to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::QuarantineAdminAborted)]);
     }
 
     #[test]
@@ -1430,7 +1432,7 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.refresh_ghosts();
         assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy());
-        assert_eq!(app.warnings, vec![strings::t().ghosts_need_programs.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::GhostsNeedPrograms)]);
     }
 
     #[test]
@@ -1446,7 +1448,7 @@ mod tests {
         app.apply_event(ScanEvent::Done);
         app.start_waiting_ghost_scan();
         assert!(!app.ghost_scan_busy() && app.ghost_rx.is_none());
-        assert_eq!(app.warnings, vec![strings::t().ghosts_need_programs.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::GhostsNeedPrograms)]);
     }
 
     #[test]

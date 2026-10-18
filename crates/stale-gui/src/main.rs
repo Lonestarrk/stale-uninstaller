@@ -45,9 +45,9 @@ fn message_box(text: &str, error: bool) {
 }
 
 fn main() -> eframe::Result {
-    // Before any text is shown: the saved language, else the Windows display language.
-    let settings = Settings::load_from(&Settings::path());
-    strings::set_lang(strings::startup_lang(settings.language.as_deref()));
+    // Nothing is read below the data folder before it is locked down (`secure_data_dir`), so
+    // the message boxes up to there follow the Windows display language.
+    strings::set_lang(strings::detect_lang());
     // A build whose stale-core has the test-only environment overrides (e.g. `--all-features`)
     // would trust whatever STALE_E2E_* says: never run it.
     if stale_core::E2E_OVERRIDES {
@@ -70,6 +70,9 @@ fn main() -> eframe::Result {
         Ok(warnings) => warnings.iter().for_each(|w| log::warn!("data folder: {w}")),
         Err(e) => log::warn!("could not lock down the data folder: {e}"),
     }
+    // The data folder is ours now: the saved language, else the Windows display language.
+    let settings = Settings::load_from(&Settings::path());
+    strings::set_lang(strings::startup_lang(settings.language.as_deref()));
     log::info!("language: {}", strings::lang().code());
     spawn_auto_purge(settings.quarantine_days);
     let options = eframe::NativeOptions {

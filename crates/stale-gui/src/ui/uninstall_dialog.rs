@@ -23,6 +23,7 @@ enum Action {
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let ctx = ui.ctx().clone();
     let window = egui::Window::new(strings::t().queue_title)
+        .id(egui::Id::unique("queue_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]);
@@ -130,7 +131,7 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
     if !flow.warnings.is_empty() {
         ui.separator();
         for w in &flow.warnings {
-            ui.label(w);
+            ui.label(w.text());
         }
     }
     ui.separator();

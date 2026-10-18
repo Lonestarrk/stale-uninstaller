@@ -96,6 +96,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 /// drive short of space; Fortsätt only when there is room.
 fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Option<Action>) {
     egui::Window::new(strings::t().remove_checked)
+        .id(egui::Id::unique("remove_checked_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -155,6 +156,11 @@ fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bo
     });
 }
 
+/// A removal's failures, one line each, with the core's error codes worded.
+fn failure_lines(failures: &[stale_core::quarantine::Failure]) -> Vec<String> {
+    failures.iter().map(super::quarantine_view::failure_text).collect()
+}
+
 /// After the removal: per program what was moved and what failed, then the way back.
 fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], back: &str, action: &mut Option<Action>) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -162,8 +168,8 @@ fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], back: &s
             ui.strong(&m.program_name);
             let count = m.moved.len() + m.keys.len() + m.values.len() + m.services.len() + m.tasks.len();
             ui.label(strings::moved_to_quarantine(count));
-            for f in &m.failures {
-                ui.colored_label(STALE_COLOR, format!("{}: {}", f.what, f.error));
+            for line in failure_lines(&m.failures) {
+                ui.colored_label(STALE_COLOR, line);
             }
             if !m.services.is_empty() {
                 ui.label(strings::t().service_reboot);
@@ -184,6 +190,7 @@ pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     let mut close = false;
     let mut start = false;
     egui::Window::new(strings::t().search_title)
+        .id(egui::Id::unique("search_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -313,6 +320,21 @@ mod tests {
             assert_eq!(note_text(key), text, "{key}");
         }
         assert_eq!(note_text("something-new"), "something-new");
+    }
+
+    #[test]
+    fn removal_failures_are_worded() {
+        let failures = vec![
+            stale_core::quarantine::Failure { what: r"C:\Apps\Foo".into(), error: r"locked: C:\Apps\Foo\a.dll".into() },
+            stale_core::quarantine::Failure { what: r"C:\Apps\Bar".into(), error: "destination-exists".into() },
+        ];
+        assert_eq!(
+            failure_lines(&failures),
+            vec![
+                r"C:\Apps\Foo: används av ett annat program: C:\Apps\Foo\a.dll".to_string(),
+                r"C:\Apps\Bar: målet finns redan".to_string()
+            ]
+        );
     }
 
     #[test]

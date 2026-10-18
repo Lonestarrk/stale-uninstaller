@@ -146,7 +146,8 @@ fn status(ui: &mut egui::Ui, m: &QuarantineManifest) {
     }
 }
 
-fn failure_text(f: &Failure) -> String {
+/// "C:\Apps\Foo: <the error in the user's language>".
+pub(crate) fn failure_text(f: &Failure) -> String {
     format!("{}: {}", f.what, strings::core_error(&f.error))
 }
 
@@ -165,6 +166,7 @@ fn restore_failures(ui: &mut egui::Ui, failures: &[Failure]) {
 fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action: &mut Option<Action>) {
     let size = format::human_size(Some(m.total_size()));
     egui::Window::new(strings::t().purge_one)
+        .id(egui::Id::unique("purge_one_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -186,6 +188,7 @@ fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action:
 fn confirm_window(ui: &egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mut Option<Action>) {
     let size = format::human_size(Some(rows.iter().map(|m| m.total_size()).sum()));
     egui::Window::new(strings::t().purge_all)
+        .id(egui::Id::unique("purge_all_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])

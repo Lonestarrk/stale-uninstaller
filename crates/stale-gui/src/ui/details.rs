@@ -65,7 +65,7 @@ fn exe_file_name(exe: &ExeUsage) -> String {
 fn last_run_text(exe: &ExeUsage) -> String {
     let date = format::ymd(Some(format::local_date(exe.last_run)));
     match exe.run_count {
-        Some(n) if n > 0 => format!("{date} ({n} {})", strings::t().runs),
+        Some(n) if n > 0 => format!("{date} ({})", strings::run_count(n)),
         _ => date,
     }
 }

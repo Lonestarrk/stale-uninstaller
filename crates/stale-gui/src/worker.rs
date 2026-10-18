@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{
     RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 
-use crate::strings;
+use crate::warning::{Msg, Warning};
 
 /// Starts a scan on the "stale-scan" thread; events arrive on the returned channel.
 pub fn spawn_scan() -> Receiver<ScanEvent> {
@@ -54,7 +54,8 @@ pub fn spawn_uninstall(items: Vec<QueueItem>, opts: QueueOptions) -> (Receiver<U
     });
     if let Err(e) = spawned {
         log::error!("could not spawn uninstall thread: {e}");
-        let _ = fallback.send(UninstallEvent::Warning(format!("{}: {e}", strings::t().uninstall_thread_failed)));
+        // `flow` words it as "could not start the uninstall: <e>".
+        let _ = fallback.send(UninstallEvent::Warning(e.to_string()));
         let _ = fallback.send(UninstallEvent::QueueDone);
     }
     (rx, stop_waiting)
@@ -67,7 +68,7 @@ pub enum QuarantineEvent {
     Progress { done: usize, total: usize, what: String },
     /// One manifest per program, in batch order.
     Finished(Vec<QuarantineManifest>),
-    Failed(String),
+    Failed(Warning),
 }
 
 /// Quarantines each program's leftovers in turn on the "stale-quarantine" thread.
@@ -94,13 +95,13 @@ pub fn spawn_quarantine(batches: Vec<(String, Vec<Leftover>)>) -> Receiver<Quara
         let ev = match run {
             Ok(manifests) => QuarantineEvent::Finished(manifests),
             // The panic hook has logged the details.
-            Err(_) => QuarantineEvent::Failed(strings::t().quarantine_aborted.to_string()),
+            Err(_) => QuarantineEvent::Failed(Warning::Fixed(Msg::QuarantineAborted)),
         };
         let _ = tx.send(ev);
     });
     if let Err(e) = spawned {
         log::error!("could not spawn quarantine thread: {e}");
-        let _ = fallback.send(QuarantineEvent::Failed(format!("{}: {e}", strings::t().quarantine_thread_failed)));
+        let _ = fallback.send(QuarantineEvent::Failed(Warning::Detail(Msg::QuarantineThreadFailed, e.to_string())));
     }
     rx
 }
@@ -114,7 +115,7 @@ pub enum QuarantineAdminEvent {
     Purged(QuarantineId),
     /// Sent after the last `Purged` of a purge.
     PurgedAll,
-    Failed(String),
+    Failed(Warning),
 }
 
 /// Runs `job` with live quarantine ops on the "stale-quarantine-admin" thread.
@@ -129,12 +130,12 @@ where
         let run = catch_unwind(AssertUnwindSafe(|| job(&QuarantineOps::live(), &tx)));
         if run.is_err() {
             // The panic hook has logged the details.
-            let _ = tx.send(QuarantineAdminEvent::Failed(strings::t().quarantine_admin_aborted.to_string()));
+            let _ = tx.send(QuarantineAdminEvent::Failed(Warning::Fixed(Msg::QuarantineAdminAborted)));
         }
     });
     if let Err(e) = spawned {
         log::error!("could not spawn quarantine admin thread: {e}");
-        let _ = fallback.send(QuarantineAdminEvent::Failed(format!("{}: {e}", strings::t().quarantine_admin_thread_failed)));
+        let _ = fallback.send(QuarantineAdminEvent::Failed(Warning::Detail(Msg::QuarantineAdminThreadFailed, e.to_string())));
     }
     rx
 }
@@ -164,7 +165,7 @@ pub fn spawn_restore(id: QuarantineId) -> Receiver<QuarantineAdminEvent> {
                 log::info!("restore of quarantine {}: {outcome:?}", id.0);
                 QuarantineAdminEvent::Restored { id, outcome }
             }
-            None => QuarantineAdminEvent::Failed(format!("{}: {}", strings::t().quarantine_entry_missing, id.0)),
+            None => QuarantineAdminEvent::Failed(Warning::Detail(Msg::QuarantineEntryMissing, id.0.clone())),
         };
         let _ = tx.send(ev);
         let _ = tx.send(QuarantineAdminEvent::Listed(trusted_manifests(ops)));
@@ -184,15 +185,10 @@ pub fn spawn_purge(ids: Vec<QuarantineId>) -> Receiver<QuarantineAdminEvent> {
                     }
                     Err(e) => {
                         log::warn!("purge of quarantine {}: {e}", id.0);
-                        QuarantineAdminEvent::Failed(format!(
-                            "{} ({}): {}",
-                            strings::t().purge_failed,
-                            m.program_name,
-                            strings::purge_error(&e)
-                        ))
+                        QuarantineAdminEvent::Failed(Warning::PurgeFailed { program: m.program_name.clone(), error: e })
                     }
                 },
-                None => QuarantineAdminEvent::Failed(format!("{}: {}", strings::t().quarantine_entry_missing, id.0)),
+                None => QuarantineAdminEvent::Failed(Warning::Detail(Msg::QuarantineEntryMissing, id.0.clone())),
             };
             let _ = tx.send(ev);
         }
@@ -206,7 +202,7 @@ pub fn spawn_purge(ids: Vec<QuarantineId>) -> Receiver<QuarantineAdminEvent> {
 pub enum LeftoverScanEvent {
     /// The searched program name and what was found.
     Done(String, LeftoverReport),
-    Failed(String),
+    Failed(Warning),
 }
 
 /// `hint` knowing the locations of every program in `programs` (the installed programs when the
@@ -227,13 +223,13 @@ pub fn spawn_leftover_scan(hint: ProgramHint, programs: Vec<Program>) -> Receive
         let run = catch_unwind(AssertUnwindSafe(|| scan_leftovers(&LeftoverSources::live(), &hint)));
         let ev = match run {
             Ok(report) => LeftoverScanEvent::Done(hint.name, report),
-            Err(_) => LeftoverScanEvent::Failed(strings::t().leftover_scan_aborted.to_string()),
+            Err(_) => LeftoverScanEvent::Failed(Warning::Fixed(Msg::LeftoverScanAborted)),
         };
         let _ = tx.send(ev);
     });
     if let Err(e) = spawned {
         log::error!("could not spawn leftover scan thread: {e}");
-        let _ = fallback.send(LeftoverScanEvent::Failed(format!("{}: {e}", strings::t().leftover_scan_thread_failed)));
+        let _ = fallback.send(LeftoverScanEvent::Failed(Warning::Detail(Msg::LeftoverScanThreadFailed, e.to_string())));
     }
     rx
 }
@@ -242,7 +238,7 @@ pub fn spawn_leftover_scan(hint: ProgramHint, programs: Vec<Program>) -> Receive
 #[derive(Clone, Debug)]
 pub enum GhostEvent {
     Done(Vec<Ghost>),
-    Failed(String),
+    Failed(Warning),
 }
 
 /// Looks for ghost programs on the "stale-ghosts" thread; `programs` are every installed program
@@ -261,13 +257,13 @@ pub fn spawn_ghost_scan(programs: Vec<Program>, unmatched: Vec<UsageHit>) -> Rec
         let ev = match run {
             Ok(ghosts) => GhostEvent::Done(ghosts),
             // The panic hook has logged the details.
-            Err(_) => GhostEvent::Failed(strings::t().ghost_scan_aborted.to_string()),
+            Err(_) => GhostEvent::Failed(Warning::Fixed(Msg::GhostScanAborted)),
         };
         let _ = tx.send(ev);
     });
     if let Err(e) = spawned {
         log::error!("could not spawn ghost scan thread: {e}");
-        let _ = fallback.send(GhostEvent::Failed(format!("{}: {e}", strings::t().ghost_scan_thread_failed)));
+        let _ = fallback.send(GhostEvent::Failed(Warning::Detail(Msg::GhostScanThreadFailed, e.to_string())));
     }
     rx
 }

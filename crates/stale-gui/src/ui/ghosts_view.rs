@@ -79,7 +79,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
                         continue;
                     }
                     egui::CollapsingHeader::new(section_title(assessment, rows.len()))
-                        .id_salt(("ghost_section", assessment_label(assessment)))
+                        .id_salt(("ghost_section", format!("{assessment:?}")))
                         .default_open(open)
                         .show(ui, |ui| {
                             for i in rows {
@@ -108,7 +108,7 @@ pub fn keep_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     let ctx = ui.ctx().clone();
     let mut open = true;
     let mut remove = None;
-    egui::Window::new(strings::t().kept_title).open(&mut open).collapsible(false).show(&ctx, |ui| {
+    egui::Window::new(strings::t().kept_title).id(egui::Id::unique("keep_list_window")).open(&mut open).collapsible(false).show(&ctx, |ui| {
         if keep_entries(&app.keep).is_empty() {
             ui.label(strings::t().kept_empty);
             return;
