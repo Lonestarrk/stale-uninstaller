@@ -1,5 +1,6 @@
 //! Leftover data model: what remains on disk/registry after an uninstall.
 
+pub mod fs_scan;
 pub mod names;
 
 use crate::model::{Program, RegKeyPath};
