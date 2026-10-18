@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// The kind of a per-profile root, for the only per-profile roots scanned here: `AppData\Roaming`,
 /// `AppData\Local` and `AppData\Local\Programs`. Other entries of [`FsScanRoots::per_profile`]
 /// (`AppData\Local\Temp`) are not program roots.
-fn per_profile_kind(rel: &Path) -> Option<RootKind> {
+pub(super) fn per_profile_kind(rel: &Path) -> Option<RootKind> {
     match norm(rel).as_str() {
         r"APPDATA\ROAMING" | r"APPDATA\LOCAL" => Some(RootKind::AppData),
         r"APPDATA\LOCAL\PROGRAMS" => Some(RootKind::LocalPrograms),

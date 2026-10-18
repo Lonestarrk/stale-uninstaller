@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::channel;
 
+use stale_core::ghosts::{scan_ghosts, Evidence, GhostSources};
 use stale_core::leftovers::{scan_leftovers, Confidence, LeftoverKind, LeftoverSources, ProgramHint};
 use stale_core::programs::enumerate_programs;
 use stale_core::registry::WinRegistry;
@@ -44,8 +45,58 @@ fn dump_leftovers(name: &str) {
     println!("--- {} High, {} Medium, {} Low", counts[0], counts[1], counts[2]);
 }
 
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// `dump ghosts`: lists programs that are gone from the uninstall list but left traces, with
+/// their evidence. Nothing is deleted.
+fn dump_ghosts() {
+    let (tx, rx) = channel();
+    let scanner = std::thread::spawn(move || run_scan(ScanSources::live(), tx));
+    let (mut programs, mut unmatched) = (Vec::new(), Vec::new());
+    for event in rx {
+        match event {
+            ScanEvent::Programs(p) => programs = p,
+            ScanEvent::UnmatchedHits(h) => unmatched = h,
+            _ => {}
+        }
+    }
+    scanner.join().expect("scan thread panicked");
+    let ghosts = scan_ghosts(&GhostSources::live(programs, unmatched));
+    for g in &ghosts {
+        let last = g.last_used.map_or("never".to_string(), |w| w.format("%Y-%m-%d").to_string());
+        let publisher = g.publisher.as_deref().map_or(String::new(), |p| format!(" [{p}]"));
+        println!("{}{publisher} | {:?} | {} | {last}", g.name, g.assessment, mb(g.total_size));
+        for e in &g.evidence {
+            let line = match e {
+                Evidence::Folder { path, size, root_kind, .. } => {
+                    format!("Folder {:?} {} ({})", root_kind, path.display(), size.map_or("-".to_string(), mb))
+                }
+                Evidence::RegKeyMissingPath { key, value_name, path } => {
+                    format!(r"RegKeyMissingPath {:?}\{} [{value_name}] -> {}", key.hive, key.path, path.display())
+                }
+                Evidence::RegKeyOrphan { key } => format!(r"RegKeyOrphan {:?}\{}", key.hive, key.path),
+                Evidence::DanglingRef { kind, location, target, value_name } => {
+                    let value = value_name.as_deref().map_or(String::new(), |v| format!(" [{v}]"));
+                    format!("{kind:?} {location}{value} -> {}", target.display())
+                }
+                Evidence::UsageTrace { exe, last_run, source } => {
+                    format!("UsageTrace {source:?} {} at {}", exe.display(), last_run.format("%Y-%m-%d"))
+                }
+            };
+            println!("    {line}");
+        }
+    }
+    println!("--- {} ghosts", ghosts.len());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("ghosts") {
+        dump_ghosts();
+        return;
+    }
     if args.first().map(String::as_str) == Some("leftovers") {
         match args.get(1) {
             Some(name) => dump_leftovers(name),

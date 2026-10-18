@@ -2,12 +2,17 @@
 //! traces. Collectors gather [`Evidence`]; each one lives in its own module.
 
 pub mod folders;
+pub mod group;
 pub mod refs;
 pub mod registry;
+pub mod scan;
 
-use crate::leftovers::names::{child_matches_in_container, name_matches, name_matches_first_word_only, normalize_name};
+pub use group::{ghost_name_of, group, to_leftovers, Assessment, Ghost, NameRoots};
+pub use scan::{scan_ghosts, GhostSources};
+
+use crate::leftovers::names::{child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, normalize_name};
 use crate::leftovers::{program_locations, system_root_norm};
-use crate::model::{Program, RegKeyPath};
+use crate::model::{Hive, Program, RegKeyPath};
 use crate::pathutil::{norm, normed_under};
 use crate::usage::UsageSource;
 use chrono::{DateTime, Utc};
@@ -89,6 +94,12 @@ pub const SKIP_FOLDERS: &[&str] = &[
     "npm",
     "npm-cache",
     "nuget",
+    "Update",
+    "Updater",
+    "CrashReports",
+    "CrashDumps",
+    "Maintenance Service",
+    "Mozilla Maintenance Service",
 ];
 
 /// Publisher folders that hold one folder per product; the container itself is never a ghost,
@@ -108,6 +119,25 @@ pub fn is_skipped_folder(name: &str) -> bool {
 /// True when `name` is in [`CONTAINER_FOLDERS`].
 pub fn is_container_folder(name: &str) -> bool {
     CONTAINER_FOLDERS.iter().any(|c| c.eq_ignore_ascii_case(name))
+}
+
+/// `Hive\path` (`LocalMachine\SOFTWARE\Foo`), the form [`Evidence::DanglingRef`] uses for a
+/// registry location.
+pub fn format_location(k: &RegKeyPath) -> String {
+    format!(r"{:?}\{}", k.hive, k.path)
+}
+
+/// The key a registry [`Evidence::DanglingRef`] location names; `None` for any other location
+/// (a `.lnk` path, a service or task name).
+pub fn parse_location(s: &str) -> Option<RegKeyPath> {
+    let (hive, path) = s.split_once('\\')?;
+    let hive = match hive {
+        "LocalMachine" => Hive::LocalMachine,
+        "CurrentUser" => Hive::CurrentUser,
+        "Users" => Hive::Users,
+        _ => return None,
+    };
+    (!path.is_empty()).then(|| RegKeyPath { hive, path: path.to_string() })
 }
 
 /// What the installed programs (visible and hidden) own: their names and folders.
@@ -143,6 +173,11 @@ impl InstalledIndex {
         self.names.iter().any(|n| name_matches(name, n))
     }
 
+    /// [`name_matches_exact`] against any installed name: the program itself, not its vendor.
+    pub fn matches_exact(&self, name: &str) -> bool {
+        self.names.iter().any(|n| name_matches_exact(name, n))
+    }
+
     /// [`name_matches_first_word_only`] against any installed name (`Google` for `Google Chrome`).
     pub fn matches_first_word(&self, name: &str) -> bool {
         self.names.iter().any(|n| name_matches_first_word_only(name, n))
@@ -160,6 +195,24 @@ impl InstalledIndex {
         self.locations.iter().any(|loc| normed_under(loc, &n))
     }
 
+    /// True when an installed location lies under a child of `container`: the publisher folder
+    /// is shared with a program that is still installed.
+    pub fn owns_sibling_in(&self, container: &Path) -> bool {
+        self.holds_location(container)
+    }
+
+    /// True when `name` ([`normalize_name`]d) is a run of whole words of an installed name
+    /// (`Code` in `Microsoft Visual Studio Code`).
+    pub fn is_word_of_name(&self, name: &str) -> bool {
+        let n = normalize_name(name);
+        let words: Vec<&str> = n.split(' ').filter(|w| !w.is_empty()).collect();
+        !words.is_empty()
+            && self.names.iter().any(|installed| {
+                let tokens: Vec<&str> = installed.split(' ').collect();
+                tokens.windows(words.len()).any(|w| w == words.as_slice())
+            })
+    }
+
     /// [`child_matches_in_container`] against any installed name (`Mozilla\Firefox` for
     /// `Mozilla Firefox`).
     pub(crate) fn matches_in_container(&self, child: &str, container: &str) -> bool {
@@ -170,7 +223,7 @@ impl InstalledIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Hive, ProgramId, Scope};
+    use crate::model::{ProgramId, Scope};
 
     fn program(name: &str, install: Option<&str>, hidden: bool) -> Program {
         Program {
@@ -214,8 +267,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_location_roundtrip() {
+        for k in [
+            RegKeyPath { hive: Hive::LocalMachine, path: r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into() },
+            RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Classes\CLSID\{0000-1}".into() },
+            RegKeyPath { hive: Hive::Users, path: r"S-1-5-21\Software\Foo".into() },
+        ] {
+            assert_eq!(parse_location(&format_location(&k)), Some(k));
+        }
+        for s in [r"C:\Menu\Gone.lnk", "GoneSvc", r"Vendor\Updater", "LocalMachine", r"LocalMachine\"] {
+            assert_eq!(parse_location(s), None, "{s}");
+        }
+    }
+
+    #[test]
     fn skip_and_container_names() {
-        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad"] {
+        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad", "updater", "Mozilla Maintenance Service"] {
             assert!(is_skipped_folder(n), "{n}");
         }
         for n in ["Google", "Old Tool", "Microsoftish"] {

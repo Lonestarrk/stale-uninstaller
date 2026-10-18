@@ -130,7 +130,8 @@ pub fn usage_evidence(
     let mut newest: BTreeMap<String, (PathBuf, DateTime<Utc>, UsageSource)> = BTreeMap::new();
     for hit in unmatched {
         let raw = hit.exe_path.to_string_lossy();
-        let exe = if raw.starts_with('\\') {
+        // Drive-less, but not a UNC path (`\\server\share\...`).
+        let exe = if raw.starts_with('\\') && !raw.starts_with(r"\\") {
             let on = |d: &char| PathBuf::from(format!("{d}:{raw}"));
             if drives.iter().any(|d| fs.exists(&on(d))) {
                 continue;
@@ -268,6 +269,13 @@ mod tests {
         let Evidence::UsageTrace { exe, source, .. } = &ev[0] else { panic!("{ev:?}") };
         assert_eq!(exe, &PathBuf::from(r"C:\PROGRAM FILES\GONE\G.EXE"));
         assert_eq!(*source, UsageSource::Prefetch);
+    }
+
+    #[test]
+    fn unc_hit_is_not_resolved_against_drives() {
+        let hits = [hit(r"\\server\share\gone.exe", 1, UsageSource::Bam)];
+        let (i, k) = none();
+        assert_eq!(usage_evidence(&FakeFs::new(), &hits, &i, &k, &all), vec![]);
     }
 
     #[test]

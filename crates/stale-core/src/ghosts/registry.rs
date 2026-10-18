@@ -1,7 +1,7 @@
 //! Registry ghosts: vendor keys whose install path is gone, and Run / App Paths / Classes
 //! entries that point at missing files.
 
-use super::{Evidence, InstalledIndex, RefKind};
+use super::{format_location, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
 use crate::leftovers::reg_scan::{child, default_string, path_in_value, string_value, RegScanRoots};
@@ -54,13 +54,8 @@ impl Ctx<'_> {
     }
 }
 
-/// `Hive\path`, the form [`Evidence::DanglingRef`] uses for a registry location.
-fn location(k: &RegKeyPath) -> String {
-    format!(r"{:?}\{}", k.hive, k.path)
-}
-
 fn dangling(kind: RefKind, k: &RegKeyPath, target: PathBuf, value_name: Option<String>) -> Evidence {
-    Evidence::DanglingRef { kind, location: location(k), target, value_name }
+    Evidence::DanglingRef { kind, location: format_location(k), target, value_name }
 }
 
 /// Vendor keys whose install path is gone, then Run values, App Paths entries and COM classes /

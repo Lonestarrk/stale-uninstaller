@@ -43,7 +43,7 @@ impl LeftoverSources {
     }
 }
 
-fn dedupe_key(kind: &LeftoverKind) -> String {
+pub(crate) fn dedupe_key(kind: &LeftoverKind) -> String {
     match kind {
         LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => norm(path),
         LeftoverKind::RegKey { key } => format!(r"{:?}\{}", key.hive, key.path).to_lowercase(),
@@ -55,7 +55,7 @@ fn dedupe_key(kind: &LeftoverKind) -> String {
     }
 }
 
-fn kind_group(kind: &LeftoverKind) -> u8 {
+pub(crate) fn kind_group(kind: &LeftoverKind) -> u8 {
     match kind {
         LeftoverKind::Dir { .. } | LeftoverKind::File { .. } => 0,
         LeftoverKind::RegKey { .. } | LeftoverKind::RegValue { .. } => 1,
@@ -63,7 +63,7 @@ fn kind_group(kind: &LeftoverKind) -> u8 {
     }
 }
 
-fn rank(c: Confidence) -> u8 {
+pub(crate) fn rank(c: Confidence) -> u8 {
     match c {
         Confidence::High => 0,
         Confidence::Medium => 1,
