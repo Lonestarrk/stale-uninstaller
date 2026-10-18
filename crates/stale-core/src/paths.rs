@@ -25,10 +25,18 @@ pub fn secure_data_dir() -> Result<Vec<String>, String> {
     crate::acl::secure_dir(&data_dir_path(), false)
 }
 
+/// Creates `dir` locked ([`crate::acl::create_locked`], so the data folder's lock-down sweep
+/// recognises it as ours), falling back to a plain folder; errors are ignored.
+fn create_ours(dir: &std::path::Path) {
+    if std::fs::symlink_metadata(dir).is_err() && crate::acl::create_locked(dir).is_err() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+}
+
 /// `data_dir()\logs`, created on demand (creation errors are ignored).
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    create_ours(&dir);
     dir
 }
 
@@ -40,7 +48,7 @@ pub fn user_profiles_root() -> PathBuf {
 /// `data_dir()\quarantine`: one manifest per quarantine. Created on demand (creation errors are ignored).
 pub fn quarantine_manifest_dir() -> PathBuf {
     let dir = data_dir().join("quarantine");
-    let _ = std::fs::create_dir_all(&dir);
+    create_ours(&dir);
     dir
 }
 

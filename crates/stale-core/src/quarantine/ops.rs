@@ -401,9 +401,11 @@ impl Run<'_> {
         }
     }
 
-    /// The payload root for `drive`; on first use its parent and itself are created and locked down.
+    /// The payload root for `drive`; on first use its parent and itself are created and locked
+    /// down, and this quarantine's `<id>` folder is created locked below it.
     fn payload_root(&mut self, drive: char) -> Result<PathBuf, String> {
         let ops = self.ops;
+        let id = self.m.id.0.clone();
         self.roots
             .entry(drive)
             .or_insert_with(|| {
@@ -412,6 +414,7 @@ impl Run<'_> {
                     ops.mover.ensure_payload_root(parent)?;
                 }
                 ops.mover.ensure_payload_root(&root)?;
+                ops.mover.create_locked_dir(&root.join(&id))?;
                 Ok(root)
             })
             .clone()
@@ -602,7 +605,8 @@ pub fn quarantine(
         roots: BTreeMap::new(),
         broken: false,
     };
-    if let Err(e) = secure_manifest_dir(ops).and_then(|()| save_manifest(&ops.manifest_dir, &run.m)) {
+    let created = secure_manifest_dir(ops).and_then(|()| ops.mover.create_locked_dir(&run.folder));
+    if let Err(e) = created.and_then(|()| save_manifest(&ops.manifest_dir, &run.m)) {
         // Without a manifest nothing could be restored, so nothing is touched.
         for it in items {
             run.fail(describe(&it.kind), format!("manifest could not be saved: {e}"));
@@ -1269,11 +1273,14 @@ mod tests {
             *e.mover.log.lock().unwrap(),
             vec![
                 ensure_manifest_dir(&e),
+                format!("create-locked {}", e.dir.path().join(&m.id.0).display()),
                 r"ensure D:\Stale Uninstaller".to_string(),
                 r"ensure D:\Stale Uninstaller\quarantine".to_string(),
+                format!(r"create-locked D:\Stale Uninstaller\quarantine\{}", m.id.0),
                 format!(r"move D:\Games\Foo -> {}", d.display()),
                 r"ensure C:\Stale Uninstaller".to_string(),
                 r"ensure C:\Stale Uninstaller\quarantine".to_string(),
+                format!(r"create-locked C:\Stale Uninstaller\quarantine\{}", m.id.0),
                 format!(r"move C:\Apps\Foo -> {}", c.display()),
                 format!(r"move E:\Foo -> {}", e_on_c.display()),
             ]

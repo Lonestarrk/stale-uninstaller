@@ -48,6 +48,10 @@ pub trait FileMover: Send + Sync {
     /// (inherited below), untrusted children renamed aside. Refuses a root (or parent) that is a
     /// reparse point; a failed lock-down is fatal only for a root that already existed.
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String>;
+    /// Creates the folder `p` (its parent must exist) with the locked Administrators + SYSTEM
+    /// descriptor and owner Administrators ([`crate::acl::create_locked`]), so the lock-down sweep
+    /// recognises it as ours whatever the "default owner" policy says. An existing folder is fine.
+    fn create_locked_dir(&self, p: &Path) -> Result<(), String>;
     /// Bytes of a file, or of all files below a folder; 0 when missing.
     fn size_of(&self, p: &Path) -> u64;
     fn exists(&self, p: &Path) -> bool;
@@ -206,6 +210,13 @@ impl FileMover for RealFileMover {
         Ok(())
     }
 
+    fn create_locked_dir(&self, p: &Path) -> Result<(), String> {
+        if std::fs::symlink_metadata(p).is_ok() {
+            return Ok(());
+        }
+        crate::acl::create_locked(p)
+    }
+
     fn size_of(&self, p: &Path) -> u64 {
         match std::fs::symlink_metadata(p) {
             Ok(md) if md.is_dir() => crate::size::dir_size(p).unwrap_or(0),
@@ -269,7 +280,7 @@ pub struct FakeFileMover {
     reparse: Mutex<BTreeMap<String, PathBuf>>,
     /// norm(path) of sources whose move copies but cannot delete the source.
     partial: Mutex<BTreeMap<String, PathBuf>>,
-    /// `"move <from> -> <to>"`, `"remove <p>"`, `"prune <p>"`, `"ensure <root>"`.
+    /// `"move <from> -> <to>"`, `"remove <p>"`, `"prune <p>"`, `"ensure <root>"`, `"create-locked <p>"`.
     pub log: Mutex<Vec<String>>,
 }
 
@@ -359,6 +370,14 @@ impl FileMover for FakeFileMover {
         self.log.lock().unwrap().push(format!("ensure {}", root.display()));
         if !self.exists(root) {
             self.entries.lock().unwrap().insert(norm(root), (root.to_path_buf(), None));
+        }
+        Ok(())
+    }
+
+    fn create_locked_dir(&self, p: &Path) -> Result<(), String> {
+        self.log.lock().unwrap().push(format!("create-locked {}", p.display()));
+        if !self.exists(p) {
+            self.entries.lock().unwrap().insert(norm(p), (p.to_path_buf(), None));
         }
         Ok(())
     }

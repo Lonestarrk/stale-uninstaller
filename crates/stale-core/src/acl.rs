@@ -3,7 +3,7 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, MutexGuard};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_INVALID_OWNER, ERROR_SUCCESS, HANDLE, HLOCAL, LUID};
@@ -68,15 +68,26 @@ impl Drop for Sd {
     }
 }
 
-/// Enables SeRestorePrivilege and SeTakeOwnershipPrivilege on the process token (once), so an
-/// elevated process can always make Administrators the owner. Unheld privileges are ignored.
-fn enable_owner_privileges() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let mut token = HANDLE::default();
-        // SAFETY: the pseudo handle needs no closing; `token` is closed below.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) }.is_err() {
-            return;
+/// Serializes privilege changes: each lock-down enables the privileges and restores them after.
+static PRIVILEGES: Mutex<()> = Mutex::new(());
+
+/// SeRestorePrivilege and SeTakeOwnershipPrivilege enabled on the process token (so an elevated
+/// process can always make Administrators the owner) while this guard lives; dropping it puts
+/// back their previous state. Unheld privileges are ignored.
+struct OwnerPrivileges {
+    _lock: MutexGuard<'static, ()>,
+    token: HANDLE,
+    previous: Vec<TOKEN_PRIVILEGES>,
+}
+
+impl OwnerPrivileges {
+    fn enable() -> OwnerPrivileges {
+        let lock = PRIVILEGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = OwnerPrivileges { _lock: lock, token: HANDLE::default(), previous: Vec::new() };
+        // SAFETY: the pseudo handle needs no closing; `token` is closed in `drop`.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut guard.token) }.is_err() {
+            guard.token = HANDLE::default();
+            return guard;
         }
         for name in [SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME] {
             let mut luid = LUID::default();
@@ -88,12 +99,42 @@ fn enable_owner_privileges() {
                 PrivilegeCount: 1,
                 Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
             };
-            // SAFETY: `token` is open with TOKEN_ADJUST_PRIVILEGES; `tp` is a valid one-entry list.
-            let _ = unsafe { AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None) };
+            let mut previous = TOKEN_PRIVILEGES::default();
+            let mut len = 0u32;
+            // SAFETY: `token` is open with TOKEN_ADJUST_PRIVILEGES; `tp` is a valid one-entry list and
+            // `previous` a buffer of the size passed, which receives the earlier state.
+            let adjusted = unsafe {
+                AdjustTokenPrivileges(
+                    guard.token,
+                    false,
+                    Some(&tp),
+                    std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                    Some(&mut previous),
+                    Some(&mut len),
+                )
+            };
+            // An unheld privilege yields PrivilegeCount 0: nothing to restore.
+            if adjusted.is_ok() && previous.PrivilegeCount > 0 {
+                guard.previous.push(previous);
+            }
         }
-        // SAFETY: `token` was opened above.
-        let _ = unsafe { CloseHandle(token) };
-    });
+        guard
+    }
+}
+
+impl Drop for OwnerPrivileges {
+    fn drop(&mut self) {
+        if self.token.is_invalid() {
+            return;
+        }
+        for previous in &self.previous {
+            // SAFETY: `token` is open with TOKEN_ADJUST_PRIVILEGES; `previous` came from the call
+            // that changed the privilege.
+            let _ = unsafe { AdjustTokenPrivileges(self.token, false, Some(previous), 0, None, None) };
+        }
+        // SAFETY: `token` was opened in `enable`.
+        let _ = unsafe { CloseHandle(self.token) };
+    }
 }
 
 /// Sets owner = Administrators and the locked, protected DACL on an existing file or folder.
@@ -103,7 +144,7 @@ fn apply_locked(path: &Path) -> Result<(), String> {
 
 /// The locked, protected DACL, plus owner = Administrators when `with_owner`.
 fn set_security(path: &Path, with_owner: bool) -> Result<(), String> {
-    enable_owner_privileges();
+    let _privileges = OwnerPrivileges::enable();
     let sd = Sd::from_sddl(LOCKED_SDDL)?;
     let (owner, dacl) = sd.parts()?;
     let name = wide(path);
@@ -128,9 +169,11 @@ fn set_security(path: &Path, with_owner: bool) -> Result<(), String> {
     }
 }
 
-/// Creates `path` (its parent must exist) with the locked descriptor already in place.
-fn create_locked(path: &Path) -> Result<(), String> {
-    enable_owner_privileges();
+/// Creates the folder `path` (its parent must exist) with the locked descriptor already in place:
+/// owner Administrators when the token allows it (else the creator), the two-ACE DACL. Used for
+/// folders the lock-down sweep must recognise as ours whatever the "default owner" policy says.
+pub fn create_locked(path: &Path) -> Result<(), String> {
+    let _privileges = OwnerPrivileges::enable();
     let name = wide(path);
     let mut last = String::new();
     for sddl in [LOCKED_SDDL, LOCKED_SDDL_NO_OWNER] {
@@ -150,23 +193,70 @@ fn create_locked(path: &Path) -> Result<(), String> {
     Err(format!("create {}: {last}", path.display()))
 }
 
+/// FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES: data access, so the missing delete sharing is enforced
+/// (an open with attribute access only takes no part in sharing checks).
+const PIN_ACCESS: u32 = 0x1 | 0x80;
+const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// Opens the folder `path` itself (never a link's target) without delete sharing, so while the
+/// handle is open neither it nor a folder above it can be renamed, replaced or deleted. Refuses a
+/// reparse point or a non-folder, judged on the opened handle.
+fn pin_folder(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .access_mode(PIN_ACCESS)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let md = file.metadata().map_err(|e| format!("read {}: {e}", path.display()))?;
+    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{} is a link or reparse point", path.display()));
+    }
+    if !md.is_dir() {
+        return Err(format!("{} is not a folder", path.display()));
+    }
+    Ok(file)
+}
+
+/// `Err` of [`secure_dir`] when `path` turned into a reparse point while it was being locked.
+pub const REPARSE_AFTER_LOCK: &str = "reparse-after-lock";
+
+/// What [`secure_dir`] asks of the system, so tests can substitute it.
+struct DirOps<'a> {
+    is_reparse: &'a dyn Fn(&Path) -> bool,
+    owned_by_admins: &'a dyn Fn(&Path) -> Option<bool>,
+    apply: &'a dyn Fn(&Path) -> Result<(), String>,
+}
+
 /// Locks `path` down to Administrators and SYSTEM, replacing the whole DACL and the owner.
 ///
-/// A missing folder is created with that descriptor (`CreateDirectoryW`); an existing one gets it
-/// through `SetNamedSecurityInfoW`. A link or reparse point is refused. When setting the descriptor
-/// fails, that is an error unless the folder was created by us (`created_by_us`, or just now),
-/// since its DACL is then already right.
+/// A missing folder is created with that descriptor ([`create_locked`]); an existing one gets it
+/// through `SetNamedSecurityInfoW`. A link or reparse point is refused. The folder is held open
+/// without delete sharing for the whole call (so it cannot be swapped for a junction meanwhile),
+/// and is checked again after the descriptor change: a reparse point then is
+/// `Err("reparse-after-lock")` and nothing below it is touched. When setting the descriptor fails,
+/// that is an error unless the folder was created by us (`created_by_us`, or just now), since its
+/// DACL is then already right.
 ///
 /// Then each direct child that is a reparse point or not owned by Administrators/SYSTEM is renamed
-/// aside to `<name>.untrusted-<timestamp>` (one warning each in the returned list); trusted child
-/// folders get the same descriptor (one level: the DACL is inheritable below that).
+/// aside to `<name>.untrusted-<timestamp>` (one warning each in the returned list) — re-checked
+/// against a fresh listing of `path` just before; names already holding `.untrusted-` are left
+/// alone. Trusted child folders get the same descriptor (one level: the DACL is inheritable below).
 pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, String> {
     use crate::quarantine::fsmove::is_reparse_point;
     use crate::quarantine::store::owned_by_admins;
+    let ops = DirOps { is_reparse: &is_reparse_point, owned_by_admins: &owned_by_admins, apply: &apply_locked };
+    secure_dir_with(path, created_by_us, &ops)
+}
 
+fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec<String>, String> {
     let mut created_by_us = created_by_us;
     match std::fs::symlink_metadata(path) {
-        Ok(_) if is_reparse_point(path) => return Err(format!("{} is a link or reparse point", path.display())),
+        Ok(_) if (ops.is_reparse)(path) => return Err(format!("{} is a link or reparse point", path.display())),
         Ok(md) if !md.is_dir() => return Err(format!("{} is not a folder", path.display())),
         Ok(_) => {}
         Err(_) => {
@@ -174,20 +264,34 @@ pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, Strin
             created_by_us = true;
         }
     }
+    let _pinned = pin_folder(path)?;
     let mut warnings = Vec::new();
-    if let Err(e) = apply_locked(path) {
+    if let Err(e) = (ops.apply)(path) {
         if !created_by_us {
             return Err(e);
         }
         warnings.push(e);
     }
+    if (ops.is_reparse)(path) {
+        return Err(REPARSE_AFTER_LOCK.to_string());
+    }
     let Ok(rd) = std::fs::read_dir(path) else { return Ok(warnings) };
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let untrusted = |child: &Path| (ops.is_reparse)(child) || (ops.owned_by_admins)(child) != Some(true);
     for entry in rd.flatten() {
-        let child = entry.path();
-        let reparse = is_reparse_point(&child);
-        if reparse || owned_by_admins(&child) != Some(true) {
-            let mut aside = entry.file_name();
+        let name = entry.file_name();
+        if name.to_string_lossy().contains(".untrusted-") {
+            continue;
+        }
+        let child = path.join(&name);
+        if untrusted(&child) {
+            // Only what a fresh listing of the (pinned) folder still shows, still untrusted.
+            let listed = std::fs::read_dir(path).into_iter().flatten().flatten().any(|e| e.file_name() == name);
+            if !listed || !untrusted(&child) {
+                continue;
+            }
+            let reparse = (ops.is_reparse)(&child);
+            let mut aside = name.clone();
             aside.push(format!(".untrusted-{stamp}"));
             let aside = path.join(aside);
             let why = if reparse { "link or reparse point" } else { "not owned by Administrators or SYSTEM" };
@@ -196,7 +300,7 @@ pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, Strin
                 Err(e) => warnings.push(format!("{} ({why}) could not be moved aside: {e}", child.display())),
             }
         } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            if let Err(e) = apply_locked(&child) {
+            if let Err(e) = (ops.apply)(&child) {
                 warnings.push(e);
             }
         }
@@ -246,6 +350,80 @@ mod tests {
         assert!(secure_dir(&file, false).unwrap_err().contains("not a folder"));
     }
 
+    /// `is_reparse` that answers false for the first `n` questions about `path`, then true.
+    fn reparse_after(path: &Path, n: usize) -> impl Fn(&Path) -> bool + '_ {
+        let asked = std::cell::Cell::new(0);
+        move |p: &Path| {
+            if p != path {
+                return false;
+            }
+            asked.set(asked.get() + 1);
+            asked.get() > n
+        }
+    }
+
+    #[test]
+    fn reparse_after_lock_stops_before_the_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(dir.join("planted")).unwrap();
+        let is_reparse = reparse_after(&dir, 1);
+        let applied = std::cell::RefCell::new(Vec::new());
+        let apply = |p: &Path| {
+            applied.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply };
+        assert_eq!(secure_dir_with(&dir, false, &ops), Err(REPARSE_AFTER_LOCK.to_string()));
+        assert!(dir.join("planted").is_dir(), "nothing renamed");
+        assert_eq!(*applied.borrow(), vec![dir.clone()], "no child touched");
+    }
+
+    #[test]
+    fn sweep_moves_untrusted_children_aside_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        for child in ["ours", "planted", "old.untrusted-20261018120000"] {
+            std::fs::create_dir_all(dir.join(child)).unwrap();
+        }
+        std::fs::write(dir.join("planted.txt"), b"x").unwrap();
+        let ours = dir.join("ours");
+        let owned = |p: &Path| Some(p == ours);
+        let applied = std::cell::RefCell::new(Vec::new());
+        let apply = |p: &Path| {
+            applied.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply };
+        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"ours".to_string()) && names.contains(&"old.untrusted-20261018120000".to_string()));
+        assert!(names.iter().any(|n| n.starts_with("planted.untrusted-")), "{names:?}");
+        assert!(names.iter().any(|n| n.starts_with("planted.txt.untrusted-")), "{names:?}");
+        assert_eq!(*applied.borrow(), vec![dir.clone(), ours.clone()]);
+
+        // A second run finds nothing new to move aside.
+        assert_eq!(secure_dir_with(&dir, false, &ops).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pinned_folder_cannot_be_swapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(dir.join("child")).unwrap();
+        let pinned = pin_folder(&dir).unwrap();
+        assert!(std::fs::rename(&dir, tmp.path().join("moved")).is_err(), "the folder itself stays put");
+        assert!(std::fs::rename(tmp.path(), tmp.path().with_extension("moved")).is_err(), "and so does its parent");
+        std::fs::rename(dir.join("child"), dir.join("child2")).unwrap();
+        drop(pinned);
+        std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
+        assert!(pin_folder(&tmp.path().join("moved").join("child2").join("missing")).is_err());
+    }
+
     /// Run with `cargo test -p stale-core -- --ignored secure_dir_removes_preplanted_everyone_ace --nocapture`.
     /// Making Administrators the owner needs an elevated process; unelevated, the owner change is
     /// refused (ERROR_INVALID_OWNER), so the test then checks the DACL replacement alone and says so.
@@ -267,8 +445,7 @@ mod tests {
             set_security(&dir, false).unwrap();
         }
         let listing = std::process::Command::new(&icacls).arg(&dir).output().unwrap();
-        println!("icacls:
-{}", crate::proc::decode_oem(&listing.stdout));
+        println!("icacls:\n{}", crate::proc::decode_oem(&listing.stdout));
         let sddl = sddl_of(&dir).unwrap();
         println!("sddl: {sddl}");
         let dacl = &sddl[sddl.find("D:").unwrap()..];
