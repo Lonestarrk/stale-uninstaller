@@ -268,7 +268,7 @@ mod tests {
         }
         let listing = std::process::Command::new(&icacls).arg(&dir).output().unwrap();
         println!("icacls:
-{}", String::from_utf8_lossy(&listing.stdout));
+{}", crate::proc::decode_oem(&listing.stdout));
         let sddl = sddl_of(&dir).unwrap();
         println!("sddl: {sddl}");
         let dacl = &sddl[sddl.find("D:").unwrap()..];
