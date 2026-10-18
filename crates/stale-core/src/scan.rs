@@ -14,7 +14,9 @@ use crate::services::service_exes;
 use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, ShortcutTarget};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
-use crate::usage::matching::{arg_exe_names, is_name_excluded, main_exes, match_usage, MatchInput, ProgramUsage};
+use crate::usage::matching::{
+    arg_exe_names, is_name_excluded, main_exes, match_usage, usage_install_dir, MatchInput, ProgramUsage,
+};
 use crate::usage::prefetch::PrefetchProvider;
 use crate::usage::userassist::UserAssistProvider;
 use crate::usage::{UsageHit, UsageProvider};
@@ -123,25 +125,42 @@ fn find_arg_exes(install: &Path, targets: &[ShortcutTarget], find: &dyn Fn(&Path
     names.iter().flat_map(|n| find(install, n)).collect()
 }
 
-/// Blocking. Stops early when the receiver hangs up.
-pub fn run_scan(src: ScanSources, tx: Sender<ScanEvent>) {
-    let _ = scan(src, &tx);
+/// Everything usage matching needs besides the programs and shortcut targets.
+pub struct UsageInputs {
+    pub root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>>,
+    pub arg_exes: HashMap<ProgramId, Vec<PathBuf>>,
+    /// Provider hits (`.lnk` hits resolved) plus file-time hits for the main exes.
+    pub hits: Vec<UsageHit>,
+    pub service_exes: HashSet<String>,
+    /// Provider failures and partial-result warnings, for the user.
+    pub warnings: Vec<String>,
 }
 
-/// `Err` means the receiver is gone.
-fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc::SendError<ScanEvent>> {
-    let programs = enumerate_programs(&*src.reg);
-    tx.send(ScanEvent::Programs(programs.clone()))?;
+impl UsageInputs {
+    pub fn match_input<'a>(&'a self, programs: &'a [Program], shortcut_targets: &'a [ShortcutTarget]) -> MatchInput<'a> {
+        MatchInput {
+            programs,
+            hits: &self.hits,
+            shortcut_targets,
+            root_exes: &self.root_exes,
+            arg_exes: &self.arg_exes,
+            service_exes: &self.service_exes,
+        }
+    }
+}
 
-    let root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>> = programs
+/// Reads root exes and Squirrel argument exes (in each program's [`usage_install_dir`]), every
+/// provider's hits and the service exes.
+pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
+    let dirs: Vec<(&ProgramId, PathBuf)> =
+        programs.iter().filter_map(|p| Some((&p.id, usage_install_dir(p, &src.shortcut_targets)?))).collect();
+    let root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>> =
+        dirs.iter().map(|(id, dir)| ((*id).clone(), (src.list_root_exes)(dir))).collect();
+    let arg_exes: HashMap<ProgramId, Vec<PathBuf>> = dirs
         .iter()
-        .filter_map(|p| Some((p.id.clone(), (src.list_root_exes)(own_folder(p)?))))
-        .collect();
-    let arg_exes: HashMap<ProgramId, Vec<PathBuf>> = programs
-        .iter()
-        .filter_map(|p| {
-            let found = find_arg_exes(own_folder(p)?, &src.shortcut_targets, &*src.find_exes);
-            (!found.is_empty()).then(|| (p.id.clone(), found))
+        .filter_map(|(id, dir)| {
+            let found = find_arg_exes(dir, &src.shortcut_targets, &*src.find_exes);
+            (!found.is_empty()).then(|| ((*id).clone(), found))
         })
         .collect();
     let mains: Vec<PathBuf> = programs
@@ -153,34 +172,36 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
         })
         .collect();
 
-    let mut hits = Vec::new();
+    let (mut hits, mut warnings) = (Vec::new(), Vec::new());
     for provider in &src.providers {
-        let (result, warnings) = provider.collect_with_warnings();
-        for w in warnings {
-            log::warn!("{w}");
-            tx.send(ScanEvent::Warning(w))?;
-        }
+        let (result, provider_warnings) = provider.collect_with_warnings();
+        warnings.extend(provider_warnings);
         match result {
             Ok(h) => hits.extend(h),
-            Err(e) => {
-                let msg = format!("{}: {}", provider.name(), e);
-                log::warn!("{msg}");
-                tx.send(ScanEvent::Warning(msg))?;
-            }
+            Err(e) => warnings.push(format!("{}: {}", provider.name(), e)),
         }
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
+    UsageInputs { root_exes, arg_exes, hits, service_exes: (src.service_exes)(), warnings }
+}
 
-    let services = (src.service_exes)();
-    let result = match_usage(&MatchInput {
-        programs: &programs,
-        hits: &hits,
-        shortcut_targets: &src.shortcut_targets,
-        root_exes: &root_exes,
-        arg_exes: &arg_exes,
-        service_exes: &services,
-    });
+/// Blocking. Stops early when the receiver hangs up.
+pub fn run_scan(src: ScanSources, tx: Sender<ScanEvent>) {
+    let _ = scan(src, &tx);
+}
+
+/// `Err` means the receiver is gone.
+fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc::SendError<ScanEvent>> {
+    let programs = enumerate_programs(&*src.reg);
+    tx.send(ScanEvent::Programs(programs.clone()))?;
+
+    let inputs = gather_usage(&src, &programs);
+    for w in &inputs.warnings {
+        log::warn!("{w}");
+        tx.send(ScanEvent::Warning(w.clone()))?;
+    }
+    let result = match_usage(&inputs.match_input(&programs, &src.shortcut_targets));
     tx.send(ScanEvent::Usage(result.by_program))?;
     tx.send(ScanEvent::UnmatchedHits(result.unmatched))?;
 
@@ -376,6 +397,23 @@ mod tests {
         let discord = usage.keys().find(|id| id.0.ends_with("Discord")).unwrap();
         assert_eq!(usage[discord].last_used.source, Some(UsageSource::Bam));
         assert!(usage[discord].exes[0].is_main);
+    }
+
+    /// Observed live (Steam): no InstallLocation, only an uninstaller in the install folder; the
+    /// root exes must still be listed there so `steam.exe` becomes the main exe.
+    #[test]
+    fn root_exes_are_listed_in_the_uninstallers_folder_without_install_location() {
+        let mut reg = FakeRegistry::new();
+        let k = key(Hive::LocalMachine, &format!(r"{UNINSTALL}\Steam"));
+        reg.set(k.clone(), "DisplayName", RegValue::Str("Steam".into()));
+        reg.set(k, "UninstallString", RegValue::Str(r"D:\Apps\Steam\uninstall.exe".into()));
+        let mut src = sources(FixedProvider(Ok(vec![hit(r"D:\Apps\Steam\main.exe")])));
+        src.reg = Arc::new(reg);
+        let events = run(src);
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let steam = usage.keys().find(|id| id.0.ends_with("Steam")).unwrap();
+        assert_eq!(usage[steam].last_used.source, Some(UsageSource::Bam));
+        assert!(usage[steam].exes[0].is_main, "{:?}", usage[steam].exes);
     }
 
     #[test]

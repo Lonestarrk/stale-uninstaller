@@ -1,14 +1,17 @@
 //! Manual check of the whole core: `cargo run -p stale-core --example dump` (elevated for BAM/Prefetch).
 //! Prints `drive | name | last used (source) | size`, never-seen first, then oldest first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 
 use stale_core::ghosts::{scan_ghosts, Evidence, GhostSources};
 use stale_core::leftovers::{scan_leftovers, Confidence, LeftoverKind, LeftoverSources, ProgramHint};
 use stale_core::programs::enumerate_programs;
 use stale_core::registry::WinRegistry;
-use stale_core::scan::{run_scan, ScanEvent, ScanSources};
+use stale_core::pathutil::exe_under;
+use stale_core::scan::{gather_usage, run_scan, ScanEvent, ScanSources};
+use stale_core::usage::matching::{explain_match, main_exes_with_rule, usage_install_dir};
 
 /// `dump leftovers <name>`: lists what is left of the first visible program whose name contains
 /// `<name>`. Nothing is deleted.
@@ -92,10 +95,97 @@ fn dump_ghosts() {
     println!("--- {} ghosts", ghosts.len());
 }
 
+/// Upper-cased names of the `.exe` files in `dir` and up to three levels below it.
+fn exe_names_under(dir: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth < 3 {
+                    stack.push((path, depth + 1));
+                }
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+                names.insert(entry.file_name().to_string_lossy().to_uppercase());
+            }
+        }
+    }
+    names
+}
+
+/// `dump usage <name>`: for every program whose name contains `<name>`, its install folders,
+/// main exes, and every usage hit related to it with what matching did with it.
+fn dump_usage(name: &str) {
+    let needle = name.to_lowercase();
+    let src = ScanSources::live();
+    let programs = enumerate_programs(&*src.reg);
+    let inputs = gather_usage(&src, &programs);
+    for w in &inputs.warnings {
+        println!("warning: {w}");
+    }
+    let mut per_source: HashMap<String, usize> = HashMap::new();
+    for h in &inputs.hits {
+        *per_source.entry(format!("{:?}", h.source)).or_default() += 1;
+    }
+    let mut counts: Vec<_> = per_source.into_iter().collect();
+    counts.sort();
+    println!("hits per source: {counts:?}");
+    let input = inputs.match_input(&programs, &src.shortcut_targets);
+    for p in programs.iter().filter(|p| p.name.to_lowercase().contains(&needle)) {
+        println!();
+        println!("=== {} [{}]{}", p.name, p.id.0, if p.hidden { " (hidden)" } else { "" });
+        println!("install_location: {:?}", p.install_location);
+        println!("display_icon:     {:?}", p.display_icon);
+        println!("uninstall_string: {:?}", p.uninstall_string);
+        let effective: Option<PathBuf> = usage_install_dir(p, &src.shortcut_targets);
+        println!("effective dir:    {effective:?}");
+        let roots = inputs.root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
+        let args = inputs.arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
+        let (mains, rule) = main_exes_with_rule(p, &src.shortcut_targets, roots, args);
+        println!("main exes ({rule:?}): {mains:?}");
+        let dirs: Vec<&Path> = p.install_location.iter().chain(effective.iter()).map(PathBuf::as_path).collect();
+        let names: HashSet<String> = dirs.iter().flat_map(|d| exe_names_under(d)).collect();
+        println!("exe names under install dirs: {}", names.len());
+        let mut shown = 0;
+        for e in explain_match(&input, &p.id) {
+            let file = e.hit.exe_path.file_name().map(|n| n.to_string_lossy().to_uppercase());
+            let related = dirs.iter().any(|d| exe_under(&e.hit.exe_path, d))
+                || file.is_some_and(|f| names.contains(&f))
+                || !(e.outcome == "no-candidate" || e.outcome == "drive-less-unmatched" || e.outcome.starts_with("assigned-to:"));
+            if !related {
+                continue;
+            }
+            shown += 1;
+            let runs = e.hit.run_count.map_or(String::new(), |c| format!(" x{c}"));
+            println!(
+                "  {:?} {} {}{runs} -> {}",
+                e.hit.source,
+                e.hit.last_run.format("%Y-%m-%d %H:%M"),
+                e.hit.exe_path.display(),
+                e.outcome
+            );
+        }
+        println!("--- {shown} related hits");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("ghosts") {
         dump_ghosts();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("usage") {
+        match args.get(1) {
+            Some(name) => dump_usage(name),
+            None => println!("usage: dump usage <program name>"),
+        }
         return;
     }
     if args.first().map(String::as_str) == Some("leftovers") {

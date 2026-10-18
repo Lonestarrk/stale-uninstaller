@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{UsageHit, UsageSource};
+use crate::leftovers::{system_root_norm, ProgramHint};
 use crate::model::{Program, ProgramId};
 use crate::pathutil::{drive_letter, exe_under, first_path_in_command, is_shared_root, norm, normed_under};
 use crate::shortcuts::ShortcutTarget;
@@ -95,23 +96,45 @@ fn dedupe(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 ///    App.exe`), the exes in `arg_exes` (found under the install location by the caller)
 ///    named in their arguments (see `arg_exe_names`);
 /// 3. `display_icon` if it is a non-uninstaller exe under the install location;
-/// 4. the largest non-name-excluded exe in the install root.
+/// 4. the largest exe in the install root that is neither name-excluded nor an installer/setup.
 ///
-/// Empty without a (non-shared) install location.
+/// "Install location" is [`usage_install_dir`]; empty without one.
 pub fn main_exes(
     p: &Program,
     shortcut_targets: &[ShortcutTarget],
     root_exes: &[(PathBuf, u64)],
     arg_exes: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let Some(install) = p.install_location.as_deref().filter(|i| !is_shared_root(i)) else {
-        return vec![];
+    main_exes_with_rule(p, shortcut_targets, root_exes, arg_exes).0
+}
+
+/// The tier of [`main_exes`] that picked the main exe(s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainRule {
+    Shortcut,
+    ShortcutArguments,
+    DisplayIcon,
+    LargestRootExe,
+    /// No main exe (no usable install location, or nothing found).
+    None,
+}
+
+/// [`main_exes`] plus the rule that picked them.
+pub fn main_exes_with_rule(
+    p: &Program,
+    shortcut_targets: &[ShortcutTarget],
+    root_exes: &[(PathBuf, u64)],
+    arg_exes: &[PathBuf],
+) -> (Vec<PathBuf>, MainRule) {
+    let Some(install) = usage_install_dir(p, shortcut_targets) else {
+        return (vec![], MainRule::None);
     };
+    let install = install.as_path();
     let (excluded, ok): (Vec<&ShortcutTarget>, Vec<&ShortcutTarget>) =
         shortcut_targets.iter().filter(|t| exe_under(&t.path, install)).partition(|t| is_name_excluded(&t.path));
     let from_shortcuts = dedupe(ok.iter().map(|t| t.path.clone()));
     if !from_shortcuts.is_empty() {
-        return from_shortcuts;
+        return (from_shortcuts, MainRule::Shortcut);
     }
     let wanted: HashSet<String> = excluded.iter().flat_map(|t| arg_exe_names(&t.arguments)).collect();
     let from_args = dedupe(
@@ -122,18 +145,41 @@ pub fn main_exes(
             .cloned(),
     );
     if !from_args.is_empty() {
-        return from_args;
+        return (from_args, MainRule::ShortcutArguments);
     }
     let icon = p.display_icon.as_deref().map(strip_icon_index);
     if let Some(icon) = icon.filter(|i| is_exe(i) && exe_under(i, install) && !is_uninstaller(i)) {
-        return vec![icon];
+        return (vec![icon], MainRule::DisplayIcon);
     }
     root_exes
         .iter()
-        .filter(|(exe, _)| !is_name_excluded(exe))
+        .filter(|(exe, _)| !is_name_excluded(exe) && !is_installer(exe))
         .max_by_key(|(_, size)| *size)
-        .map(|(exe, _)| vec![exe.clone()])
-        .unwrap_or_default()
+        .map_or((vec![], MainRule::None), |(exe, _)| (vec![exe.clone()], MainRule::LargestRootExe))
+}
+
+/// The folder usage matching treats as the program's own: [`ProgramHint::effective_install_dir`]
+/// (`InstallLocation`, else the uninstaller's or display icon's folder), else the folder of the
+/// target of a Start Menu shortcut named exactly like the program. The last rule is only for MSI
+/// entries, which can carry no path at all (Google Chrome's: only `MsiExec.exe /X{…}`); browser
+/// web apps ("YouTube" → `chrome_proxy.exe`) are not MSI and never take the browser's folder. A
+/// target in a shared root or under `%SystemRoot%` gives nothing.
+pub fn usage_install_dir(p: &Program, shortcut_targets: &[ShortcutTarget]) -> Option<PathBuf> {
+    if let Some(dir) = ProgramHint::from_program(p).effective_install_dir() {
+        return Some(dir);
+    }
+    if !p.is_msi {
+        return None;
+    }
+    let name = p.name.trim();
+    let system_root = system_root_norm();
+    shortcut_targets
+        .iter()
+        .filter(|t| t.lnk.file_stem().is_some_and(|s| s.to_string_lossy().trim().eq_ignore_ascii_case(name)))
+        .filter(|t| is_exe(&t.path) && drive_letter(&t.path).is_some() && !is_uninstaller(&t.path))
+        .filter_map(|t| t.path.parent())
+        .find(|dir| !is_shared_root(dir) && !normed_under(&norm(dir), &system_root) && norm(dir) != system_root)
+        .map(Path::to_path_buf)
 }
 
 /// True when the exe's file stem contains one of `EXCLUDED_NAME_PARTS`.
@@ -165,6 +211,29 @@ pub fn arg_exe_names(arguments: &str) -> Vec<String> {
         .collect()
 }
 
+/// `EAAntiCheat.Installer.exe`, `GameSetup.exe`: never the program itself, but running one is
+/// not excluded from usage either (a setup can be the program, e.g. Visual Studio Installer's).
+fn is_installer(exe: &Path) -> bool {
+    exe.file_stem().is_some_and(|s| {
+        let s = s.to_string_lossy().to_lowercase();
+        s.contains("installer") || s.contains("setup")
+    })
+}
+
+/// `<install>\APP-1.0.9253\DISCORD.EXE` -> `<install>\DISCORD.EXE` for [`norm`]ed paths: Squirrel
+/// keeps each version in an `app-<version>` folder, so the main exe moves with every update.
+fn squirrel_neutral(exe: &str, install: &str) -> String {
+    let Some(rest) = exe.strip_prefix(install).and_then(|r| r.strip_prefix('\\')) else { return exe.to_string() };
+    match rest.split_once('\\') {
+        Some((dir, tail))
+            if dir.strip_prefix("APP-").is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')) =>
+        {
+            format!(r"{install}\{tail}")
+        }
+        _ => exe.to_string(),
+    }
+}
+
 /// `unins000.exe`, `Uninstall Foo.exe`, …
 fn is_uninstaller(exe: &Path) -> bool {
     exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().contains("unins"))
@@ -185,13 +254,13 @@ pub fn exclude_reason(exe: &Path, is_main: bool, service_exes: &HashSet<String>)
 /// A program prepared for matching, with everything normalized once.
 struct Candidate<'a> {
     program: &'a Program,
-    /// `norm()`ed install location; `None` when missing or a shared root.
+    /// `norm()`ed [`usage_install_dir`].
     install: Option<String>,
-    /// `norm()`ed main exes.
+    /// `norm()`ed main exes, Squirrel `app-<version>` folders removed ([`squirrel_neutral`]).
     main: HashSet<String>,
-    /// Without an install location: uppercased display-icon exe name (counts as main).
+    /// Without an install folder: uppercased display-icon exe name (counts as main).
     icon_name: Option<String>,
-    /// Without an install location: uppercased uninstaller exe name (never MsiExec).
+    /// Without an install folder: uppercased uninstaller exe name (never MsiExec).
     uninstaller_name: Option<String>,
 }
 
@@ -199,10 +268,13 @@ impl<'a> Candidate<'a> {
     fn new(program: &'a Program, input: &MatchInput) -> Self {
         let roots = input.root_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
-        let main = main_exes(program, input.shortcut_targets, roots, args).iter().map(|e| norm(e)).collect();
-        let install = program.install_location.as_deref().filter(|i| !is_shared_root(i)).map(norm);
+        let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
+        let main = main_exes(program, input.shortcut_targets, roots, args)
+            .iter()
+            .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
+            .collect();
         let (mut icon_name, mut uninstaller_name) = (None, None);
-        if program.install_location.is_none() {
+        if install.is_none() {
             icon_name = program.display_icon.as_deref().map(strip_icon_index).filter(|i| is_exe(i)).and_then(|i| file_name_upper(&i));
             uninstaller_name = program
                 .uninstall_string
@@ -216,7 +288,11 @@ impl<'a> Candidate<'a> {
     }
 
     fn is_main(&self, exe: &Path) -> bool {
-        self.main.contains(&norm(exe)) || (self.icon_name.is_some() && file_name_upper(exe) == self.icon_name)
+        let neutral = match &self.install {
+            Some(install) => squirrel_neutral(&norm(exe), install),
+            None => norm(exe),
+        };
+        self.main.contains(&neutral) || (self.icon_name.is_some() && file_name_upper(exe) == self.icon_name)
     }
 
     fn claims_by_name(&self, name: &Option<String>) -> bool {
@@ -239,16 +315,16 @@ fn assign_hit(hit: &UsageHit, candidates: &[Candidate]) -> Vec<(usize, PathBuf)>
         return under
             .into_iter()
             .filter(|&(_, len)| len == longest)
-            .map(|(i, _)| (i, with_install_drive(&hit.exe_path, candidates[i].program)))
+            .map(|(i, _)| (i, with_install_drive(&hit.exe_path, candidates[i].install.as_deref())))
             .collect();
     }
     let name = file_name_upper(&hit.exe_path);
     candidates.iter().position(|c| c.claims_by_name(&name)).map(|i| (i, hit.exe_path.clone())).into_iter().collect()
 }
 
-/// Gives a drive-less (volume-stripped Prefetch) path the install location's drive.
-fn with_install_drive(exe: &Path, program: &Program) -> PathBuf {
-    let drive = program.install_location.as_deref().and_then(drive_letter);
+/// Gives a drive-less (volume-stripped Prefetch) path the (`norm`ed) install folder's drive.
+fn with_install_drive(exe: &Path, install: Option<&str>) -> PathBuf {
+    let drive = install.map(Path::new).and_then(drive_letter);
     match drive {
         Some(d) if exe.to_string_lossy().starts_with('\\') => PathBuf::from(format!("{d}:{}", exe.display())),
         _ => exe.to_path_buf(),
@@ -332,6 +408,59 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
         .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), input.service_exes)))
         .collect();
     MatchResult { by_program, unmatched }
+}
+
+/// How one hit fared for one program (see [`explain_match`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HitExplanation {
+    pub hit: UsageHit,
+    /// `counted:main`, `counted`, `excluded:<ExcludeReason>`, `superseded` (a file time hidden by
+    /// a real source for the same exe), `filetime-ignored` (file times only date a program without
+    /// other hits, see `summarize`), `assigned-to:<other program names>`,
+    /// `drive-less-unmatched` (volume-stripped path no install location claims) or `no-candidate`.
+    pub outcome: String,
+}
+
+/// Explains, for each hit in `input.hits`, whether [`match_usage`] assigns it to `program` and
+/// whether it then counts, or why not. Diagnostics only (`dump usage`).
+pub fn explain_match(input: &MatchInput, program: &ProgramId) -> Vec<HitExplanation> {
+    let candidates: Vec<Candidate> = input.programs.iter().map(|p| Candidate::new(p, input)).collect();
+    let me = candidates.iter().position(|c| &c.program.id == program);
+    let usage = match_usage(input).by_program.remove(program);
+    input
+        .hits
+        .iter()
+        .map(|hit| {
+            let owners = assign_hit(hit, &candidates);
+            let mine = me.and_then(|i| owners.iter().find(|(o, _)| *o == i));
+            let outcome = match mine {
+                Some((_, path)) => {
+                    let n = norm(path);
+                    let file_time = hit.source == UsageSource::FileTime;
+                    let exe = usage.as_ref().and_then(|u| {
+                        u.exes.iter().find(|e| norm(&e.exe_path) == n && (e.source == UsageSource::FileTime) == file_time)
+                    });
+                    let has_real = usage.as_ref().is_some_and(|u| u.exes.iter().any(|e| e.source != UsageSource::FileTime));
+                    match exe {
+                        Some(_) if file_time && has_real => "filetime-ignored".to_string(),
+                        Some(e) => match e.excluded {
+                            Some(r) => format!("excluded:{r:?}"),
+                            None if e.is_main => "counted:main".to_string(),
+                            None => "counted".to_string(),
+                        },
+                        None => "superseded".to_string(),
+                    }
+                }
+                None if !owners.is_empty() => {
+                    let names: Vec<&str> = owners.iter().map(|(o, _)| candidates[*o].program.name.as_str()).collect();
+                    format!("assigned-to:{}", names.join(", "))
+                }
+                None if hit.exe_path.to_string_lossy().starts_with('\\') => "drive-less-unmatched".to_string(),
+                None => "no-candidate".to_string(),
+            };
+            HitExplanation { hit: hit.clone(), outcome }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -704,6 +833,191 @@ mod tests {
         assert_eq!(u.last_used.when, None);
         // The file-time row is still listed on its own.
         assert!(u.exes.iter().any(|e| e.source == UsageSource::FileTime && e.exe_path == Path::new(r"C:\Apps\Foo\foo.exe")));
+    }
+
+    fn explain(programs: &[Program], hits: &[UsageHit], id: &str) -> Vec<String> {
+        let shortcuts = targets(&[r"C:\Apps\Foo\foo.exe"]);
+        let input = MatchInput {
+            programs,
+            hits,
+            shortcut_targets: &shortcuts,
+            root_exes: &HashMap::new(),
+            arg_exes: &HashMap::new(),
+            service_exes: &HashSet::new(),
+        };
+        explain_match(&input, &ProgramId(id.to_string())).into_iter().map(|e| e.outcome).collect()
+    }
+
+    #[test]
+    fn explains_hit_outside_install_dir_as_no_candidate() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Elsewhere\foo.exe", 1, UsageSource::Bam), hit(r"\ELSEWHERE\FOO.EXE", 1, UsageSource::Prefetch)];
+        assert_eq!(explain(&programs, &hits, "Foo"), ["no-candidate", "drive-less-unmatched"]);
+    }
+
+    #[test]
+    fn explains_excluded_updater() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\FooUpdater.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 2, UsageSource::Bam)];
+        assert_eq!(explain(&programs, &hits, "Foo"), ["excluded:NamePattern", "counted:main"]);
+    }
+
+    #[test]
+    fn explains_filetime_ignored_beside_real_hits() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\FooUpdater.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 2, UsageSource::FileTime)];
+        assert_eq!(explain(&programs, &hits, "Foo"), ["excluded:NamePattern", "filetime-ignored"]);
+        assert_eq!(explain(&programs, &hits[1..], "Foo"), ["counted:main"]);
+    }
+
+    #[test]
+    fn explains_hit_assigned_to_other_program() {
+        let programs = [prog("Outer", Some(r"C:\Apps\Suite")), prog("Inner", Some(r"C:\Apps\Suite\Plugin"))];
+        let hits = [hit(r"C:\Apps\Suite\Plugin\plug.exe", 1, UsageSource::Bam)];
+        assert_eq!(explain(&programs, &hits, "Outer"), ["assigned-to:Inner"]);
+        assert_eq!(explain(&programs, &hits, "Inner"), ["excluded:NotMain"]);
+    }
+
+    fn input<'a>(
+        programs: &'a [Program],
+        hits: &'a [UsageHit],
+        shortcuts: &'a [ShortcutTarget],
+        roots: &'a HashMap<ProgramId, Vec<(PathBuf, u64)>>,
+        args: &'a HashMap<ProgramId, Vec<PathBuf>>,
+        services: &'a HashSet<String>,
+    ) -> MatchInput<'a> {
+        MatchInput { programs, hits, shortcut_targets: shortcuts, root_exes: roots, arg_exes: args, service_exes: services }
+    }
+
+    /// Observed live: Steam's Uninstall entry has no InstallLocation, only
+    /// `C:\Program Files (x86)\Steam\uninstall.exe`; BAM/Prefetch/UserAssist hits on `steam.exe`
+    /// were claimed by name by a Steam game whose uninstall string runs `steam.exe`, and
+    /// `steamwebhelper.exe` matched nothing.
+    #[test]
+    fn program_without_install_location_matches_in_its_uninstallers_folder() {
+        let mut steam = prog("Steam", None);
+        steam.display_icon = Some(PathBuf::from(r"C:\Program Files (x86)\Steam\uninstall.exe"));
+        steam.uninstall_string = Some(r"C:\Program Files (x86)\Steam\uninstall.exe".into());
+        let mut game = prog("Dota Underlords", None);
+        game.uninstall_string = Some(r#""C:\Program Files (x86)\Steam\steam.exe" steam://uninstall/1046930"#.into());
+        let steam_exe = r"C:\Program Files (x86)\Steam\steam.exe";
+        let hits = [
+            hit(steam_exe, 1, UsageSource::Bam),
+            hit(r"\PROGRAM FILES (X86)\STEAM\STEAM.EXE", 1, UsageSource::Prefetch),
+            hit(r"C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe", 0, UsageSource::Bam),
+        ];
+        let roots = HashMap::from([(
+            ProgramId("Steam".into()),
+            vec![(PathBuf::from(steam_exe), 4_000_000), (PathBuf::from(r"C:\Program Files (x86)\Steam\uninstall.exe"), 9_000_000)],
+        )]);
+        let (none, services) = (HashMap::new(), HashSet::new());
+        let programs = [steam.clone(), game];
+        let r = match_usage(&input(&programs, &hits, &[], &roots, &none, &services));
+        let u = usage(&r, "Steam");
+        assert_eq!(u.last_used.when, Some(days_ago(1)));
+        assert!(u.exes.iter().any(|e| norm(&e.exe_path) == norm(Path::new(steam_exe)) && e.is_main && e.excluded.is_none()));
+        assert_eq!(u.exes.len(), 2, "steam.exe (BAM + Prefetch merged) and steamwebhelper.exe: {:?}", u.exes);
+        assert!(usage(&r, "Dota Underlords").exes.is_empty());
+        assert!(r.unmatched.is_empty());
+        assert_eq!(usage_install_dir(&steam, &[]), Some(PathBuf::from(r"C:\Program Files (x86)\Steam")));
+    }
+
+    /// Observed live: Google Chrome is an MSI entry with no InstallLocation, DisplayIcon or
+    /// uninstaller path (`MsiExec.exe /X{E9AB118B-…}`); the only link to its files is the Start
+    /// Menu shortcut `Google Chrome.lnk` -> `C:\Program Files\Google\Chrome\Application\chrome.exe`.
+    #[test]
+    fn msi_entry_without_paths_uses_start_menu_shortcut_named_like_it() {
+        let mut chrome = prog("Google Chrome", None);
+        chrome.name = "Google Chrome".into();
+        chrome.is_msi = true;
+        chrome.uninstall_string = Some("MsiExec.exe /X{E9AB118B-2341-3DD2-BD45-27B55F5F3802}".into());
+        let exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        let shortcuts = [
+            ShortcutTarget {
+                path: PathBuf::from(exe),
+                arguments: String::new(),
+                lnk: PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk"),
+            },
+            // A shortcut with another name into a shared root never gives a folder.
+            ShortcutTarget {
+                path: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                arguments: String::new(),
+                lnk: PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Paint.NET.lnk"),
+            },
+        ];
+        assert_eq!(usage_install_dir(&chrome, &shortcuts), Some(PathBuf::from(r"C:\Program Files\Google\Chrome\Application")));
+        let mut paint = prog("Paint.NET", None);
+        paint.is_msi = true;
+        assert_eq!(usage_install_dir(&paint, &shortcuts), None, "shortcut target in System32");
+        // Observed live: Chrome/Edge web apps ("YouTube", "Messenger") are non-MSI entries with
+        // a same-named Start Menu shortcut to the browser's `chrome_proxy.exe`; they must not
+        // take the browser's folder (and with it the browser's usage).
+        let mut youtube = prog("YouTube", None);
+        youtube.uninstall_string = Some(r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --uninstall-app-id=agimnkijcaahngcdmfeangaknmldooml"#.into());
+        let pwa = [ShortcutTarget {
+            path: PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe"),
+            arguments: "--profile-directory=Default --app-id=agimnkijcaahngcdmfeangaknmldooml".into(),
+            lnk: PathBuf::from(r"C:\Users\X\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Chrome Apps\YouTube.lnk"),
+        }];
+        assert_eq!(usage_install_dir(&youtube, &pwa), None);
+
+        let hits = [
+            hit(exe, 0, UsageSource::Bam),
+            hit(r"C:\Program Files\Google\Chrome\Application\141.0.7390.108\Installer\setup.exe", 0, UsageSource::Bam),
+        ];
+        let (no_roots, no_args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let r = match_usage(&input(std::slice::from_ref(&chrome), &hits, &shortcuts, &no_roots, &no_args, &services));
+        let u = usage(&r, "Google Chrome");
+        assert_eq!(u.last_used.when, Some(days_ago(0)));
+        assert!(u.exes.iter().any(|e| e.exe_path == Path::new(exe) && e.is_main && e.excluded.is_none()));
+    }
+
+    /// Observed live: Toggl Track (Squirrel) has a root stub `TogglTrack.exe` (picked as the
+    /// largest root exe) while BAM records `app-10.18.1\TogglTrack.exe`.
+    #[test]
+    fn squirrel_versioned_app_folder_counts_as_main() {
+        let install = r"C:\Users\Jobb\AppData\Local\TogglTrack";
+        let toggl = prog("Toggl Track", Some(install));
+        let roots = HashMap::from([(
+            ProgramId("Toggl Track".into()),
+            vec![(PathBuf::from(format!(r"{install}\TogglTrack.exe")), 600_000), (PathBuf::from(format!(r"{install}\Update.exe")), 1_900_000)],
+        )]);
+        let hits = [hit(&format!(r"{install}\app-10.18.1\TogglTrack.exe"), 0, UsageSource::Bam)];
+        let (none, services) = (HashMap::new(), HashSet::new());
+        let r = match_usage(&input(std::slice::from_ref(&toggl), &hits, &[], &roots, &none, &services));
+        let u = usage(&r, "Toggl Track");
+        assert_eq!(u.last_used.when, Some(days_ago(0)));
+        assert!(u.exes[0].is_main);
+
+        // Also when the main exe was found in an older app folder (Discord's shortcut arguments).
+        let discord = prog("Discord", Some(r"C:\Users\Jimmy\AppData\Local\Discord"));
+        let args = HashMap::from([(
+            ProgramId("Discord".into()),
+            vec![PathBuf::from(r"C:\Users\Jimmy\AppData\Local\Discord\app-1.0.9253\Discord.exe")],
+        )]);
+        let shortcuts = [ShortcutTarget {
+            path: PathBuf::from(r"C:\Users\Jimmy\AppData\Local\Discord\Update.exe"),
+            arguments: "--processStart Discord.exe".into(),
+            lnk: PathBuf::new(),
+        }];
+        let hits = [hit(r"C:\Users\Jimmy\AppData\Local\Discord\app-1.0.9254\Discord.exe", 2, UsageSource::Bam)];
+        let r = match_usage(&input(std::slice::from_ref(&discord), &hits, &shortcuts, &HashMap::new(), &args, &services));
+        assert_eq!(usage(&r, "Discord").last_used.when, Some(days_ago(2)));
+    }
+
+    /// Observed live: Battlefield 6's largest root exe is `EAAntiCheat.Installer.exe`, so `bf6.exe`
+    /// (in BAM) was "not main".
+    #[test]
+    fn largest_root_exe_skips_installers() {
+        let install = r"H:\SteamLibrary\steamapps\common\Battlefield 6";
+        let p = prog("Battlefield 6", Some(install));
+        let roots = vec![
+            (PathBuf::from(format!(r"{install}\EAAntiCheat.Installer.exe")), 90_000_000),
+            (PathBuf::from(format!(r"{install}\EAAntiCheat.GameServiceLauncher.exe")), 5_000_000),
+            (PathBuf::from(format!(r"{install}\GameSetup.exe")), 80_000_000),
+            (PathBuf::from(format!(r"{install}\bf6.exe")), 2_000_000),
+        ];
+        assert_eq!(main_exes_with_rule(&p, &[], &roots, &[]), (vec![PathBuf::from(format!(r"{install}\bf6.exe"))], MainRule::LargestRootExe));
     }
 
     #[test]
