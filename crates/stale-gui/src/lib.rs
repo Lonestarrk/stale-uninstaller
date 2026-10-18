@@ -2,6 +2,7 @@
 //! the admin manifest that `build.rs` embeds into the `stale` binary.
 
 pub mod app;
+pub mod cleanup_dialog;
 pub mod filter;
 pub mod flow;
 pub mod format;

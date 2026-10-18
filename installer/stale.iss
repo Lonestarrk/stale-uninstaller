@@ -68,7 +68,8 @@ Filename: "{app}\StaleUninstaller.exe"; Description: "{cm:LaunchProgram,Stale Un
 //     nobody is asked and a quarantine is kept. If the exe cannot run, everything is kept.
 //  2. CurUninstallStepChanged(usUninstall), after the confirmation and before any file is removed:
 //     for 10 or 11, --apply remove|purge does the work (it re-checks the quarantine and never
-//     purges one it was not asked about).
+//     purges one it was not asked about). Its exit code, logged below, is 0 when done and 1 when
+//     something could not be purged or removed.
 var
   CleanupCode: Integer;
 

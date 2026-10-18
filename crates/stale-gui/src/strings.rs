@@ -88,6 +88,11 @@ pub struct Strings {
     pub e2e_build_refused: &'static str,
     /// `--uninstall-cleanup`: some quarantines could not be purged, so the data folder is kept.
     pub uninstall_cleanup_failed: &'static str,
+    /// `--uninstall-cleanup --ask` task dialog: the question under the size, and the three buttons.
+    pub uninstall_cleanup_question: &'static str,
+    pub uninstall_cleanup_purge: &'static str,
+    pub uninstall_cleanup_keep: &'static str,
+    pub uninstall_cleanup_cancel: &'static str,
     pub loading: &'static str,
     pub no_programs: &'static str,
     pub warnings: &'static str,
@@ -380,6 +385,10 @@ pub static SV: Strings = Strings {
     already_running: "Stale Uninstaller körs redan.",
     e2e_build_refused: "Den här versionen är byggd med testfunktionen e2e-overrides och kan inte köras. Bygg om utan den.",
     uninstall_cleanup_failed: "Allt i karantänen kunde inte tas bort. Stales data och karantänen behålls.",
+    uninstall_cleanup_question: "Stale Uninstaller avinstalleras. Vad ska hända med karantänen och Stales data?",
+    uninstall_cleanup_purge: "Töm karantänen och ta bort allt",
+    uninstall_cleanup_keep: "Behåll karantänen och datan",
+    uninstall_cleanup_cancel: "Avbryt avinstallationen",
     loading: "Läser installerade program…",
     no_programs: "Inga program hittades.",
     warnings: "Varningar",
@@ -634,6 +643,10 @@ pub static EN: Strings = Strings {
     already_running: "Stale Uninstaller is already running.",
     e2e_build_refused: "This build was made with the test feature e2e-overrides and cannot run. Rebuild it without the feature.",
     uninstall_cleanup_failed: "Not everything in the quarantine could be removed. Stale's data and the quarantine are kept.",
+    uninstall_cleanup_question: "Stale Uninstaller is being uninstalled. What should happen to the quarantine and Stale's data?",
+    uninstall_cleanup_purge: "Empty the quarantine and remove everything",
+    uninstall_cleanup_keep: "Keep the quarantine and the data",
+    uninstall_cleanup_cancel: "Cancel the uninstall",
     loading: "Reading installed programs…",
     no_programs: "No programs found.",
     warnings: "Warnings",
@@ -1159,7 +1172,22 @@ pub fn purge_all_confirm(size: &str) -> String {
     }
 }
 
-/// The `--uninstall-cleanup` question when the quarantine holds `total_bytes` (Yes/No/Cancel).
+/// The `--uninstall-cleanup` task dialog's main text when the quarantine holds `total_bytes`.
+pub fn uninstall_cleanup_heading(total_bytes: u64) -> String {
+    uninstall_cleanup_heading_in(lang(), total_bytes)
+}
+
+/// [`uninstall_cleanup_heading`] in `lang`.
+pub fn uninstall_cleanup_heading_in(lang: Lang, total_bytes: u64) -> String {
+    let size = crate::format::human_size_in(lang, Some(total_bytes));
+    match lang {
+        Lang::Sv => format!("Karantänen innehåller {size}."),
+        Lang::En => format!("The quarantine holds {size}."),
+    }
+}
+
+/// The `--uninstall-cleanup` question when the quarantine holds `total_bytes` (Yes/No/Cancel), for
+/// the message box shown when the task dialog is not available.
 pub fn uninstall_cleanup_prompt(total_bytes: u64) -> String {
     uninstall_cleanup_prompt_in(lang(), total_bytes)
 }
@@ -1290,6 +1318,22 @@ mod tests {
 
     // The language is process-wide and tests run in parallel: no test here switches it. The
     // default is Swedish; English is checked through the `_in`/`texts` variants.
+
+    #[test]
+    fn uninstall_cleanup_dialog_texts_in_both_languages() {
+        let gib = 2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+        assert_eq!(uninstall_cleanup_heading_in(Lang::Sv, gib), "Karantänen innehåller 2,5 GB.");
+        assert_eq!(uninstall_cleanup_heading_in(Lang::En, gib), "The quarantine holds 2.5 GB.");
+        let (sv, en) = (texts(Lang::Sv), texts(Lang::En));
+        assert_eq!(
+            [sv.uninstall_cleanup_purge, sv.uninstall_cleanup_keep, sv.uninstall_cleanup_cancel],
+            ["Töm karantänen och ta bort allt", "Behåll karantänen och datan", "Avbryt avinstallationen"]
+        );
+        assert_eq!(
+            [en.uninstall_cleanup_purge, en.uninstall_cleanup_keep, en.uninstall_cleanup_cancel],
+            ["Empty the quarantine and remove everything", "Keep the quarantine and the data", "Cancel the uninstall"]
+        );
+    }
 
     #[test]
     fn uninstall_cleanup_prompt_names_the_size_in_both_languages() {

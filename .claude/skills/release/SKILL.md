@@ -100,3 +100,7 @@ in two phases (`installer/stale.iss`):
 2. `CurUninstallStepChanged(usUninstall)`, after the confirmation and before files are removed,
    runs `--uninstall-cleanup --apply remove|purge` for 10 or 11. It re-checks the quarantine: a
    quarantine that appeared since phase 1 is kept under `remove`, never purged without consent.
+   It exits 0 when done and 1 when something could not be purged or removed.
+
+A quarantine folder Stale cannot trust (not owned by Administrators, or unreadable) counts as a
+quarantine too: it is never deleted, and while one exists the data folder is kept.

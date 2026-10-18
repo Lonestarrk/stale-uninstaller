@@ -37,15 +37,19 @@ fn single_instance() -> bool {
     }
 }
 
-/// `text` in a message box titled with the app's name; `error` picks the error icon.
-fn message_box(text: &str, error: bool) {
+/// `text` in a message box titled with the app's name; `error` picks the error icon. `on_top`
+/// keeps it above other windows (the uninstall cleanup runs without a window of its own).
+fn message_box(text: &str, error: bool, on_top: bool) {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MESSAGEBOX_STYLE,
+    };
     let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let title: Vec<u16> = t().app_title.encode_utf16().chain(std::iter::once(0)).collect();
     let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
+    let top = if on_top { MB_TOPMOST | MB_SETFOREGROUND } else { MESSAGEBOX_STYLE(0) };
     // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
-    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | icon) };
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | icon | top) };
 }
 
 fn main() -> eframe::Result {
@@ -55,7 +59,7 @@ fn main() -> eframe::Result {
     // A build whose stale-core has the test-only environment overrides (e.g. `--all-features`)
     // would trust whatever STALE_E2E_* says: never run it.
     if stale_core::E2E_OVERRIDES {
-        message_box(t().e2e_build_refused, true);
+        message_box(t().e2e_build_refused, true, false);
         std::process::exit(1);
     }
     // Run by Stale's own uninstaller: no window and no single-instance check (the uninstaller
@@ -65,7 +69,7 @@ fn main() -> eframe::Result {
         std::process::exit(uninstall_cleanup(&args[1..]));
     }
     if !single_instance() {
-        message_box(t().already_running, false);
+        message_box(t().already_running, false, false);
         return Ok(());
     }
     // Before anything (the log included) is written below the data folder.
@@ -102,7 +106,8 @@ fn main() -> eframe::Result {
 ///   quarantine unless `--silent`) and exits with [`selfclean::exit_code_for`]: 10 remove the
 ///   data folder, 11 purge then remove, 12 keep everything, 2 stop the uninstall.
 /// - `--apply remove|purge [--silent]` once the uninstall is confirmed: does the work
-///   ([`selfclean::apply`], which re-checks the quarantine) and exits 0.
+///   ([`selfclean::apply`], which re-checks the quarantine) and exits 0, or 1 when anything could
+///   not be purged or removed (the installer's log records the code).
 ///
 /// Anything else changes nothing and exits [`selfclean::EXIT_KEEP`].
 fn uninstall_cleanup(args: &[std::ffi::OsString]) -> i32 {
@@ -133,7 +138,7 @@ fn uninstall_cleanup(args: &[std::ffi::OsString]) -> i32 {
     let ops = QuarantineOps::live();
     let Some(mode) = apply_mode else {
         let action = selfclean::decide(&ops, &mut |total| {
-            if silent { None } else { ask_yes_no_cancel(&strings::uninstall_cleanup_prompt(total)) }
+            if silent { None } else { stale_gui::cleanup_dialog::ask(total) }
         });
         return selfclean::exit_code_for(action);
     };
@@ -141,29 +146,13 @@ fn uninstall_cleanup(args: &[std::ffi::OsString]) -> i32 {
     for e in &out.errors {
         eprintln!("{e}");
     }
+    if out.untrusted > 0 {
+        eprintln!("{} quarantine folder(s) could not be trusted: kept, with the data folder", out.untrusted);
+    }
     if out.purge_failed && !silent {
-        message_box(t().uninstall_cleanup_failed, true);
+        message_box(t().uninstall_cleanup_failed, true, true);
     }
-    0
-}
-
-/// `text` in a Yes/No/Cancel message box (No is the default button); `None` when it could not be shown.
-fn ask_yes_no_cancel(text: &str) -> Option<selfclean::Choice> {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDCANCEL, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNOCANCEL,
-    };
-    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = t().app_title.encode_utf16().chain(std::iter::once(0)).collect();
-    let style = MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST;
-    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
-    let answer = unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) };
-    match answer {
-        IDYES => Some(selfclean::Choice::Yes),
-        IDNO => Some(selfclean::Choice::No),
-        IDCANCEL => Some(selfclean::Choice::Cancel),
-        _ => None,
-    }
+    out.exit_code()
 }
 
 /// Purges quarantines older than `days` on the "stale-auto-purge" thread, so the window never waits.
