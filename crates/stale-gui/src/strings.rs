@@ -132,6 +132,19 @@ pub const REMOVE_CHECKED: &str = "Ta bort markerade";
 pub const SERVICE_REBOOT: &str = "Tjänster tas bort helt först efter omstart";
 pub const QUARANTINE_THREAD_FAILED: &str = "Kunde inte starta borttagningen";
 pub const QUARANTINE_ABORTED: &str = "Borttagningen avbröts oväntat – se loggfilen";
+/// `{X}` is the drive letter.
+pub const INSUFFICIENT_SPACE: &str = "Inte tillräckligt med ledigt utrymme på {X}:";
+pub const CONTINUE: &str = "Fortsätt";
+
+/// "E: saknar NTFS – 30 MB kopieras till C:" in the removal confirmation.
+pub fn fallback_notice(from: char, size: &str) -> String {
+    format!("{from}: saknar NTFS – {size} kopieras till C:")
+}
+
+/// [`INSUFFICIENT_SPACE`] for `drive`.
+pub fn insufficient_space(drive: char) -> String {
+    INSUFFICIENT_SPACE.replace("{X}", &drive.to_string())
+}
 
 /// "(3 träffar, 58 MB)" after a section title.
 pub fn section_counts(hits: usize, size: &str) -> String {
@@ -248,6 +261,12 @@ mod tests {
         assert_eq!(core_error("unknown-content-left"), UNKNOWN_CONTENT_LEFT);
         assert_eq!(core_error("something else"), "something else");
         assert_eq!(incomplete_count(2), "2 ofullständiga");
+    }
+
+    #[test]
+    fn removal_notices() {
+        assert_eq!(fallback_notice('E', "30 MB"), "E: saknar NTFS – 30 MB kopieras till C:");
+        assert_eq!(insufficient_space('C'), "Inte tillräckligt med ledigt utrymme på C:");
     }
 
     #[test]

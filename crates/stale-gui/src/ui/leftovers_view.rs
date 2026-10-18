@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
-use stale_core::quarantine::QuarantineManifest;
+use stale_core::quarantine::{DestinationPlan, QuarantineManifest};
 use stale_core::{Hive, RegKeyPath};
 
 use super::STALE_COLOR;
@@ -18,6 +18,8 @@ enum Action {
     Back,
     MarkSafe,
     Remove,
+    ConfirmRemove,
+    CancelRemove,
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
@@ -30,6 +32,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         }
     });
     ui.separator();
+    if let Some(plan) = &app.removal_plan {
+        removal_confirm_window(ui, plan, &mut action);
+    }
     if app.removal_done {
         removal_summary(ui, &app.last_manifests, &mut action);
     } else if let Some(sel) = app.leftovers.as_mut() {
@@ -45,7 +50,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             ui.horizontal(|ui| {
                 ui.label(strings::checked_summary(checked, total, &format::human_size(Some(bytes))));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(checked > 0 && !removing, egui::Button::new(strings::REMOVE_CHECKED)).clicked() {
+                    let asking = app.removal_plan.is_some();
+                    if ui.add_enabled(checked > 0 && !removing && !asking, egui::Button::new(strings::REMOVE_CHECKED)).clicked() {
                         action = Some(Action::Remove);
                     }
                     if ui.add_enabled(!removing, egui::Button::new(strings::CANCEL)).clicked() {
@@ -76,9 +82,39 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 sel.mark_safe();
             }
         }
-        Some(Action::Remove) => app.remove_checked_leftovers(),
+        Some(Action::Remove) => {
+            app.request_removal(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes)
+        }
+        Some(Action::ConfirmRemove) => app.confirm_removal(),
+        Some(Action::CancelRemove) => app.removal_plan = None,
         None => {}
     }
+}
+
+/// Before a removal that copies files to C: or lacks space: one line per fallback drive and per
+/// drive short of space; Fortsätt only when there is room.
+fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Option<Action>) {
+    egui::Window::new(strings::REMOVE_CHECKED)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui.ctx(), |ui| {
+            for (from, bytes) in &plan.fallbacks {
+                ui.label(strings::fallback_notice(*from, &format::human_size(Some(*bytes))));
+            }
+            for drive in &plan.insufficient {
+                ui.colored_label(STALE_COLOR, strings::insufficient_space(*drive));
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(strings::CANCEL).clicked() {
+                    *action = Some(Action::CancelRemove);
+                }
+                if ui.add_enabled(plan.insufficient.is_empty(), egui::Button::new(strings::CONTINUE)).clicked() {
+                    *action = Some(Action::ConfirmRemove);
+                }
+            });
+        });
 }
 
 /// One program's leftovers in three sections; check boxes are disabled while a removal runs.

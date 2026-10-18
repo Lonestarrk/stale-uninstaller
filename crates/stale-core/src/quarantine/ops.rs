@@ -443,6 +443,73 @@ fn covered_by_listed_dir(items: &[Leftover]) -> Vec<bool> {
         .collect()
 }
 
+/// Where the files of a removal will go, worked out before it starts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DestinationPlan {
+    /// Bytes stored on each target drive's payload root.
+    pub per_drive: BTreeMap<char, u64>,
+    /// Source drives that cannot hold a payload root (not NTFS, read-only, missing) and the bytes
+    /// from them that are copied to C: instead.
+    pub fallbacks: Vec<(char, u64)>,
+    /// Target drives without enough free space for the bytes copied to them (a same-drive move is
+    /// a rename and needs none).
+    pub insufficient: Vec<char>,
+}
+
+/// Plans where `items` (files, folders and shortcuts; the rest takes no disk space) will be
+/// stored: on their own drive when `volume_ok`, else on C:. Items inside a listed folder count
+/// with that folder. `free_bytes` is the free space of a drive (`None`: unknown, not checked).
+pub fn plan_destinations(
+    items: &[Leftover],
+    volume_ok: &dyn Fn(char) -> bool,
+    free_bytes: &dyn Fn(char) -> Option<u64>,
+) -> DestinationPlan {
+    let mut plan = DestinationPlan::default();
+    let mut copied: BTreeMap<char, u64> = BTreeMap::new();
+    let mut fallbacks: BTreeMap<char, u64> = BTreeMap::new();
+    for (it, covered) in items.iter().zip(covered_by_listed_dir(items)) {
+        let path = match &it.kind {
+            LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => path,
+            LeftoverKind::Shortcut { lnk, .. } => lnk,
+            _ => continue,
+        };
+        let Some(source) = drive_letter(path) else { continue };
+        if covered {
+            continue;
+        }
+        let bytes = it.size().unwrap_or(0);
+        let target = if volume_ok(source) { source } else { 'C' };
+        *plan.per_drive.entry(target).or_insert(0) += bytes;
+        if target != source {
+            *fallbacks.entry(source).or_insert(0) += bytes;
+            *copied.entry(target).or_insert(0) += bytes;
+        }
+    }
+    plan.fallbacks = fallbacks.into_iter().collect();
+    plan.insufficient =
+        copied.into_iter().filter(|&(d, bytes)| free_bytes(d).is_some_and(|free| free < bytes)).map(|(d, _)| d).collect();
+    plan
+}
+
+/// Free bytes available to this process on `<drive>:\`; `None` when it cannot be read.
+pub fn live_free_bytes(drive: char) -> Option<u64> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let root: Vec<u16> = format!(r"{}:\", drive.to_ascii_uppercase()).encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `root` is NUL-terminated and outlives the call; `free` is a valid out-pointer.
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(root.as_ptr()), Some(&mut free), None, None) }.ok()?;
+    Some(free)
+}
+
+/// Whether `<drive>:\` can hold a payload root (see [`FileMover::volume_ok`]).
+pub fn live_volume_ok(drive: char) -> bool {
+    RealFileMover.volume_ok(drive)
+}
+
 /// Locks the manifest folder down like a payload root (Administrators and SYSTEM only), so the
 /// `.reg`/XML backups a restore imports cannot be planted by an unprivileged user.
 fn secure_manifest_dir(ops: &QuarantineOps) -> Result<(), String> {
@@ -1618,5 +1685,44 @@ mod tests {
         assert!(e.mover.exists(&m.moved[1].stored), "nothing on C: was purged either");
         assert!(!e.mover.log.lock().unwrap().iter().any(|l| l.starts_with("remove") || l.starts_with("prune")));
         assert_eq!(list_manifests(e.dir.path()), vec![m]);
+    }
+
+    fn sized_dir(p: &str, size: u64) -> Leftover {
+        item(LeftoverKind::Dir { path: PathBuf::from(p), size: Some(size) })
+    }
+
+    #[test]
+    fn plan_destinations_reports_fallbacks_and_free_space() {
+        let items = [
+            sized_dir(r"D:\Games\Foo", 100),
+            sized_dir(r"D:\Games\Foo\sub", 40),
+            sized_dir(r"E:\Foo", 30),
+            item(LeftoverKind::File { path: PathBuf::from(r"F:\foo.cfg"), size: Some(5) }),
+            sized_dir(r"C:\Apps\Foo", 7),
+            key_item(r"SOFTWARE\Foo"),
+        ];
+        let not_ntfs = |d: char| !matches!(d, 'E' | 'F');
+        let plenty = |_: char| Some(1_000);
+        let plan = plan_destinations(&items, &not_ntfs, &plenty);
+        assert_eq!(plan.per_drive.into_iter().collect::<Vec<_>>(), vec![('C', 42), ('D', 100)], "sub counted with its parent");
+        assert_eq!(plan.fallbacks, vec![('E', 30), ('F', 5)]);
+        assert!(plan.insufficient.is_empty());
+
+        // C: has room for its own 7 bytes (a rename) but not for the 35 copied there.
+        let tight = |d: char| if d == 'C' { Some(20) } else { Some(0) };
+        assert_eq!(plan_destinations(&items, &not_ntfs, &tight).insufficient, vec!['C']);
+        // Unknown free space is not a reason to block.
+        assert!(plan_destinations(&items, &not_ntfs, &|_| None).insufficient.is_empty());
+        let all_ok = plan_destinations(&items, &|_| true, &|_| Some(0));
+        assert!(all_ok.fallbacks.is_empty() && all_ok.insufficient.is_empty(), "same-drive moves need no space");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_free_bytes_of_system_drive() {
+        let free = live_free_bytes('C');
+        println!("C: free {free:?}");
+        assert!(free.is_some_and(|f| f > 0));
+        assert_eq!(live_free_bytes('1'), None);
     }
 }

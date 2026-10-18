@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::leftovers::ProgramHint;
-use stale_core::quarantine::{Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
+use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
 use stale_core::settings::Settings;
 use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
@@ -103,6 +103,8 @@ pub struct StaleApp {
     pub confirm_purge_all: bool,
     /// The quarantine whose "Ta bort permanent" waits for confirmation.
     pub confirm_purge_one: Option<QuarantineId>,
+    /// "Ta bort markerade" waits for confirmation: files fall back to C: or space is short.
+    pub removal_plan: Option<DestinationPlan>,
     /// What the last partial restore could not put back, shown under its row.
     pub last_restore_failures: Option<(QuarantineId, Vec<Failure>)>,
     /// Every program from the scan, hidden ones included.
@@ -152,6 +154,7 @@ impl StaleApp {
             quarantine_admin_rx: None,
             confirm_purge_all: false,
             confirm_purge_one: None,
+            removal_plan: None,
             last_restore_failures: None,
             programs: Vec::new(),
             usage: HashMap::new(),
@@ -359,6 +362,7 @@ impl StaleApp {
     /// Back to the program list; a finished removal's results are dropped on the way.
     pub fn leave_leftovers(&mut self) {
         self.view = View::Programs;
+        self.removal_plan = None;
         if self.removal_done {
             self.leftovers = None;
             self.removal_done = false;
@@ -373,6 +377,34 @@ impl StaleApp {
     /// True while checked leftovers are being moved to quarantine.
     pub fn removal_running(&self) -> bool {
         self.quarantine_rx.is_some()
+    }
+
+    /// "Ta bort markerade": plans where the checked items will be stored (`volume_ok` and
+    /// `free_bytes` are live in production) and starts the removal, unless something falls back
+    /// to C: or a drive is short of space: then the confirmation opens instead.
+    pub fn request_removal(&mut self, volume_ok: &dyn Fn(char) -> bool, free_bytes: &dyn Fn(char) -> Option<u64>) {
+        if self.removal_running() {
+            return;
+        }
+        let Some(sel) = &self.leftovers else { return };
+        let items: Vec<_> = sel.checked_items().into_iter().flat_map(|(_, items)| items).collect();
+        if items.is_empty() {
+            return;
+        }
+        let plan = plan_destinations(&items, volume_ok, free_bytes);
+        if plan.fallbacks.is_empty() && plan.insufficient.is_empty() {
+            self.remove_checked_leftovers();
+        } else {
+            self.removal_plan = Some(plan);
+        }
+    }
+
+    /// "Fortsätt" in the removal confirmation; refused while a drive is short of space.
+    pub fn confirm_removal(&mut self) {
+        if self.removal_plan.as_ref().is_some_and(|p| p.insufficient.is_empty()) {
+            self.removal_plan = None;
+            self.remove_checked_leftovers();
+        }
     }
 
     /// Moves the checked leftovers to quarantine on a worker thread (nothing checked: no-op).
@@ -835,6 +867,31 @@ mod tests {
         app.leftovers = None;
         app.remove_checked_leftovers();
         assert!(app.quarantine_rx.is_none());
+    }
+
+    #[test]
+    fn removal_with_fallback_or_short_space_asks_first() {
+        use stale_core::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
+        let on = |path: &str, size| Leftover {
+            kind: LeftoverKind::Dir { path: path.into(), size: Some(size) },
+            confidence: Confidence::High,
+            note: None,
+        };
+        let mut app = StaleApp::empty(Settings::default());
+        let report = LeftoverReport { items: vec![on(r"E:\Foo", 30), on(r"C:\Apps\Foo", 7)] };
+        app.leftovers = Some(LeftoverSelection::from_reports(&[("A".into(), report)]));
+
+        app.request_removal(&|d| d != 'E', &|_| Some(10));
+        let plan = app.removal_plan.clone().expect("confirmation open");
+        assert_eq!((plan.fallbacks, plan.insufficient), (vec![('E', 30)], vec!['C']));
+        app.confirm_removal();
+        assert!(app.removal_plan.is_some() && app.quarantine_rx.is_none(), "blocked while space is short");
+        app.leave_leftovers();
+        assert!(app.removal_plan.is_none());
+
+        app.request_removal(&|d| d != 'E', &|_| Some(1_000));
+        assert_eq!(app.removal_plan.as_ref().map(|p| p.fallbacks.clone()), Some(vec![('E', 30)]));
+        assert!(app.quarantine_rx.is_none(), "nothing starts before the confirmation");
     }
 
     fn manifest(id: &str) -> QuarantineManifest {

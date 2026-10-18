@@ -4,7 +4,7 @@ pub mod fsmove;
 pub mod ops;
 pub mod store;
 
-pub use ops::{auto_purge, DRIVE_MISSING, UNKNOWN_CONTENT_LEFT, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
+pub use ops::{auto_purge, live_free_bytes, live_volume_ok, plan_destinations, DestinationPlan, DRIVE_MISSING, UNKNOWN_CONTENT_LEFT, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
 pub use store::{list_manifests, list_trusted_manifests, manifest_path, new_id, owned_by_admins};
 
 use std::collections::BTreeMap;
