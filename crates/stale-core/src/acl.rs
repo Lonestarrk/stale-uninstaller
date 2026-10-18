@@ -198,7 +198,8 @@ pub fn create_locked(path: &Path) -> Result<(), String> {
 /// FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES: data access, so the missing delete sharing is enforced
 /// (an open with attribute access only takes no part in sharing checks).
 const PIN_ACCESS: u32 = 0x1 | 0x80;
-const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+const FILE_SHARE_READ: u32 = 0x1;
+const FILE_SHARE_READ_WRITE: u32 = FILE_SHARE_READ | 0x2;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -328,6 +329,12 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
             let why = if reparse { "link or reparse point" } else { "not owned by Administrators or SYSTEM" };
             match std::fs::rename(&child, &aside) {
                 Ok(()) => warnings.push(format!("{} ({why}) moved aside to {}", child.display(), aside.display())),
+                Err(e) if !is_dir && !is_link => {
+                    // Neither taken over nor moved aside: never read (settings and keep list
+                    // fall back to their defaults).
+                    ignore_file(&child);
+                    warnings.push(format!("{} ({why}) could not be moved aside, ignored: {e}", child.display()));
+                }
                 Err(e) => warnings.push(format!("{} ({why}) could not be moved aside: {e}", child.display())),
             }
         } else if is_dir {
@@ -339,6 +346,21 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
     Ok(warnings)
 }
 
+/// Plain files in a locked folder that could be neither taken over nor moved aside ([`norm`]ed).
+static IGNORED_FILES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn ignore_file(path: &Path) {
+    let mut ignored = IGNORED_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    ignored.push(crate::pathutil::norm(path));
+}
+
+/// True when [`secure_dir`] could neither take over nor move aside the file `path`: someone else
+/// controls it, so its content is never trusted (the settings and the keep list use defaults).
+pub fn is_ignored_file(path: &Path) -> bool {
+    let n = crate::pathutil::norm(path);
+    IGNORED_FILES.lock().unwrap_or_else(|e| e.into_inner()).contains(&n)
+}
+
 /// FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC.
 const REINHERIT_ACCESS: u32 = 0x80 | 0x2_0000 | 0x4_0000;
 /// [`REINHERIT_ACCESS`] | WRITE_OWNER.
@@ -347,14 +369,15 @@ const TAKE_OVER_ACCESS: u32 = REINHERIT_ACCESS | 0x8_0000;
 /// Makes Administrators the owner of the plain file `path` and resets its DACL to the inherited
 /// one (an empty, unprotected DACL: explicit ACEs go, the parent's inheritable ACEs apply). The
 /// file itself (never a link's target) is opened without delete sharing and changed through that
-/// handle; a link, reparse point or folder is refused.
+/// handle; a link, reparse point or folder is refused. Only read sharing is allowed, so nobody
+/// writes to the file while it changes hands.
 fn take_over_file(path: &Path) -> Result<(), String> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     let _privileges = OwnerPrivileges::enable();
     let file = std::fs::OpenOptions::new()
         .access_mode(TAKE_OVER_ACCESS)
-        .share_mode(FILE_SHARE_READ_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -633,6 +656,34 @@ mod tests {
         assert!(!dir.join("planted").exists(), "the untrusted folder is moved aside");
         // settings.json taken over; important.json failed and moved aside; planted moved aside.
         assert_eq!(warnings.len(), 4, "{warnings:?}");
+    }
+
+    #[test]
+    fn untakeable_settings_file_is_ignored() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        let keep = dir.join("important.json");
+        std::fs::write(&settings, br#"{"show_hidden":true,"quarantine_days":1}"#).unwrap();
+        std::fs::write(&keep, br#"{"names":["planted"]}"#).unwrap();
+        // Held open without delete sharing: neither can be renamed aside.
+        let hold = |p: &Path| std::fs::OpenOptions::new().read(true).share_mode(0x1).open(p).unwrap();
+        let (_s, _k) = (hold(&settings), hold(&keep));
+        let ops = DirOps {
+            is_reparse: &|_| false,
+            owned_by_admins: &|_| Some(false),
+            apply: &|_| Ok(()),
+            take_over: &|_| Err("access denied".to_string()),
+        };
+        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("settings.json") && w.contains("ignored")), "{warnings:?}");
+        assert!(settings.is_file() && keep.is_file(), "still in place");
+        assert!(is_ignored_file(&settings) && is_ignored_file(&keep));
+        assert_eq!(crate::settings::Settings::load_from(&settings), crate::settings::Settings::default());
+        assert_eq!(crate::keep::KeepList::load_from(&keep), crate::keep::KeepList::default());
+        assert!(!is_ignored_file(&dir.join("other.json")));
     }
 
     #[test]

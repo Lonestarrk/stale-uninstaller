@@ -28,8 +28,14 @@ fn same_key(a: &RegKeyPath, b: &RegKeyPath) -> bool {
 }
 
 impl KeepList {
-    /// Defaults when the file is missing or unparsable; unknown fields are ignored.
+    /// Defaults when the file is missing or unparsable; unknown fields are ignored. Defaults too
+    /// (with a warning) when the data folder's lock-down could not take the file over
+    /// ([`crate::acl::is_ignored_file`]).
     pub fn load_from(path: &Path) -> KeepList {
+        if crate::acl::is_ignored_file(path) {
+            log::warn!("{} is not ours and was not read; using defaults", path.display());
+            return KeepList::default();
+        }
         std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
