@@ -9,11 +9,12 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_INVALID_OWNER, ERROR_SUCCESS, HANDLE, HLOCAL, LUID};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW,
-    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
+    AddAce, AdjustTokenPrivileges, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW, ACE_HEADER, ACE_REVISION, INHERITED_ACE,
+    SE_DACL_PROTECTED, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     UNPROTECTED_DACL_SECURITY_INFORMATION,
@@ -388,9 +389,10 @@ fn take_over_file(path: &Path) -> Result<(), String> {
 /// `Err` of [`reinherit`] when `path` cannot be opened or is a link or reparse point.
 pub const REPARSE_OR_OPEN_FAILED: &str = "reparse-or-open-failed";
 
-/// Makes `path` inherit its parent's ACL again: an empty, unprotected DACL clears the explicit
-/// ACEs and turns inheritance back on (the inherited ACEs are recomputed, also below `path`). The
-/// owner is left as it is.
+/// Makes `path` inherit its parent's ACL again: a protected DACL is replaced by an unprotected one
+/// holding the same explicit (non-inherited) ACEs, so inheritance is back on (the inherited ACEs
+/// are recomputed, also below `path`) and the ACEs given to it on purpose survive. A DACL that is
+/// not protected already inherits and is left untouched. The owner is left as it is.
 ///
 /// `path` itself (never a link's target) is opened without delete sharing and the DACL is set
 /// through that handle, so a junction swapped in cannot redirect the change; a link, reparse point
@@ -415,28 +417,78 @@ pub fn reinherit(path: &Path) -> Result<(), String> {
             return Err(REPARSE_OR_OPEN_FAILED.to_string());
         }
     };
-    let mut empty = ACL::default();
-    // SAFETY: `empty` is an ACL header of exactly the size passed; an ACL with no ACEs fits in it.
-    unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
-        .map_err(|e| format!("initialize ACL: {}", e.message()))?;
-    // SAFETY: `file` is open with WRITE_DAC and READ_CONTROL and lives for the call; `empty` is an
+    let handle = HANDLE(file.as_raw_handle());
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut raw_sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `file` is open with READ_CONTROL; `raw_sd` receives a LocalAlloc'd descriptor that
+    // `Sd`'s drop frees, and `dacl` points into it.
+    let err = unsafe {
+        GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, Some(&mut dacl), None, Some(&mut raw_sd))
+    };
+    if err != ERROR_SUCCESS {
+        return Err(format!("read ACL of {}: {}", path.display(), windows::core::Error::from(err.to_hresult()).message()));
+    }
+    let sd = Sd(raw_sd);
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: `sd.0` is the valid descriptor just read; the out-pointers are valid locals.
+    unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) }
+        .map_err(|e| format!("read ACL of {}: {}", path.display(), e.message()))?;
+    if control & SE_DACL_PROTECTED.0 == 0 {
+        return Ok(());
+    }
+    let mut buf = explicit_aces_acl(dacl)?;
+    // SAFETY: `file` is open with WRITE_DAC and READ_CONTROL and lives for the call; `buf` holds an
     // initialized ACL.
     let err = unsafe {
         SetSecurityInfo(
-            HANDLE(file.as_raw_handle()),
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(&empty),
+            Some(buf.as_mut_ptr() as *const ACL),
             None,
         )
     };
+    drop(sd);
     if err == ERROR_SUCCESS {
         Ok(())
     } else {
         Err(format!("reset ACL of {}: {}", path.display(), windows::core::Error::from(err.to_hresult()).message()))
     }
+}
+
+/// A new ACL (in a DWORD-aligned buffer) holding the ACEs of `dacl` that are not inherited, in
+/// their order; an empty ACL for a null `dacl`.
+fn explicit_aces_acl(dacl: *const ACL) -> Result<Vec<u32>, String> {
+    let mut kept: Vec<(*const std::ffi::c_void, u16)> = Vec::new();
+    let mut acl_revision = ACL_REVISION;
+    if !dacl.is_null() {
+        // SAFETY: `dacl` is a valid ACL from GetSecurityInfo, alive while the caller holds its descriptor.
+        let (count, rev) = unsafe { ((*dacl).AceCount, (*dacl).AclRevision) };
+        acl_revision = ACE_REVISION(u32::from(rev));
+        for i in 0..u32::from(count) {
+            let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` is below the ACE count; `ace` receives a pointer into `dacl`.
+            unsafe { GetAce(dacl, i, &mut ace) }.map_err(|e| format!("read ACE: {}", e.message()))?;
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { std::ptr::read_unaligned(ace as *const ACE_HEADER) };
+            if u32::from(header.AceFlags) & INHERITED_ACE.0 == 0 {
+                kept.push((ace as *const _, header.AceSize));
+            }
+        }
+    }
+    let size = std::mem::size_of::<ACL>() + kept.iter().map(|(_, s)| usize::from(*s)).sum::<usize>();
+    let mut buf = vec![0u32; size.div_ceil(4)];
+    let acl = buf.as_mut_ptr() as *mut ACL;
+    // SAFETY: `buf` is DWORD-aligned and at least `size` bytes long, the length passed.
+    unsafe { InitializeAcl(acl, (buf.len() * 4) as u32, acl_revision) }
+        .map_err(|e| format!("initialize ACL: {}", e.message()))?;
+    for (ace, len) in kept {
+        // SAFETY: `acl` was initialized with room for every kept ACE; `ace` points at `len` bytes.
+        unsafe { AddAce(acl, acl_revision, u32::MAX, ace, u32::from(len)) }.map_err(|e| format!("copy ACE: {}", e.message()))?;
+    }
+    Ok(buf)
 }
 
 /// The owner and DACL of `path` as SDDL (e.g. `O:BAD:PAI(A;OICI;FA;;;BA)…`); `None` when unreadable.
@@ -612,12 +664,17 @@ mod tests {
     }
 
     #[test]
-    fn reinherit_drops_the_protected_dacl() {
+    fn reinherit_keeps_explicit_aces_and_unprotects() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("restored");
         std::fs::create_dir(&dir).unwrap();
-        // The locked DACL plus full control for the owner, so an unelevated test can open it too.
-        let sd = Sd::from_sddl("D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)").unwrap();
+        // An already unprotected (inheriting) DACL is left exactly as it is.
+        let before = sddl_of(&dir).unwrap();
+        reinherit(&dir).unwrap();
+        assert_eq!(sddl_of(&dir).unwrap(), before);
+        // A protected DACL with an explicit Users:Modify ACE, plus full control for the owner so
+        // an unelevated test can open it too.
+        let sd = Sd::from_sddl("D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)(A;OICI;0x1301bf;;;BU)").unwrap();
         let (_, locked_dacl) = sd.parts().unwrap();
         let name = wide(&dir);
         // SAFETY: `name` is NUL-terminated; `locked_dacl` points into `sd`, alive for the call.
@@ -640,7 +697,8 @@ mod tests {
         let dacl = &sddl[sddl.find("D:").unwrap()..];
         assert!(!dacl.starts_with("D:P"), "unprotected: {dacl}");
         assert!(dacl.contains("ID;"), "inherited ACEs: {dacl}");
-        assert!(!dacl.contains("(A;OICI;FA;;;BA)"), "explicit ACEs gone: {dacl}");
+        assert!(dacl.contains("(A;OICI;0x1301bf;;;BU)"), "the explicit Users:Modify ACE survives: {dacl}");
+        assert!(dacl.contains("(A;OICI;FA;;;BA)"), "explicit ACEs are kept: {dacl}");
     }
 
     #[test]
