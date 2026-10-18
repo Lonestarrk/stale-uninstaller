@@ -11,6 +11,19 @@ pub fn system32_tool(name: &str) -> PathBuf {
     PathBuf::from(root).join("System32").join(name)
 }
 
+/// Runs `program` without a window and returns its exit code and output (stdout, then stderr);
+/// only a failure to start it is an `Err`.
+pub fn run_hidden_output(program: &Path, args: &[&OsStr]) -> Result<(i32, String), String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), text))
+}
+
 /// Runs `program` without a window; spawn failure or a non-zero exit becomes `Err(<its output>)`.
 pub fn run_hidden(program: &Path, args: &[&OsStr]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -45,5 +58,7 @@ mod tests {
         let err = run_hidden(&cmd, &["/c".as_ref(), "echo boom 1>&2 & exit 3".as_ref()]).unwrap_err();
         assert_eq!(err, "boom");
         assert!(run_hidden(Path::new(r"C:\definitely\missing.exe"), &[]).is_err());
+        let (code, out) = run_hidden_output(&cmd, &["/c".as_ref(), "echo hello& exit 3".as_ref()]).unwrap();
+        assert_eq!((code, out.trim()), (3, "hello"));
     }
 }

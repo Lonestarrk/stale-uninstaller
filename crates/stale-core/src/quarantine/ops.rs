@@ -71,11 +71,47 @@ fn task_path(name: &str) -> String {
     if name.starts_with('\\') { name.to_string() } else { format!(r"\{name}") }
 }
 
-/// `sc stop` (a service that is not running, error 1062, is fine) then `sc delete`.
+/// The state name on the `STATE` line of `sc query` output (`"STOPPED"`, `"RUNNING"`,
+/// `"STOP_PENDING"`, ...); a line with only the number gives `"STOPPED"` for 1. `None` without
+/// such a line.
+fn parse_sc_state(output: &str) -> Option<String> {
+    let line = output.lines().find(|l| l.trim_start().starts_with("STATE"))?;
+    let (_, rest) = line.split_once(':')?;
+    let mut tokens = rest.split_whitespace();
+    let code = tokens.next()?;
+    match tokens.next() {
+        Some(state) => Some(state.to_string()),
+        None => (code == "1").then(|| "STOPPED".to_string()),
+    }
+}
+
+/// `sc query`'s exit code when the service does not exist.
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+const SERVICE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const SERVICE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `sc stop` (a service that is not running, error 1062, is fine), then `sc query` every 500 ms
+/// for up to 30 s until it is STOPPED (or gone), then `sc delete`. A service still running after
+/// that is `Err("service-still-running")` and is not deleted.
 fn live_stop_service(name: &str) -> Result<(), String> {
     match tool("sc.exe", &["stop".as_ref(), name.as_ref()]) {
         Err(e) if !e.contains("1062") => return Err(e),
         _ => {}
+    }
+    let sc = system32_tool("sc.exe");
+    let started = std::time::Instant::now();
+    loop {
+        let (code, out) = crate::proc::run_hidden_output(&sc, &["query".as_ref(), name.as_ref()])?;
+        if code == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(());
+        }
+        if parse_sc_state(&out).is_some_and(|s| s.contains("STOPPED")) {
+            break;
+        }
+        if started.elapsed() >= SERVICE_STOP_TIMEOUT {
+            return Err("service-still-running".to_string());
+        }
+        std::thread::sleep(SERVICE_POLL);
     }
     tool("sc.exe", &["delete".as_ref(), name.as_ref()])
 }
@@ -1110,6 +1146,16 @@ mod tests {
     /// The mover log line for locking down the manifest dir.
     fn ensure_manifest_dir(e: &Env) -> String {
         format!("ensure {}", e.dir.path().display())
+    }
+
+    #[test]
+    fn parse_sc_state_reads_the_state_line() {
+        let running = "SERVICE_NAME: Spooler \r\n        TYPE               : 110  WIN32_OWN_PROCESS  (interactive)\r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n";
+        assert_eq!(parse_sc_state(running).as_deref(), Some("RUNNING"));
+        assert_eq!(parse_sc_state("        STATE              : 3  STOP_PENDING\n").as_deref(), Some("STOP_PENDING"));
+        assert_eq!(parse_sc_state("        STATE              : 1  STOPPED\n").as_deref(), Some("STOPPED"));
+        assert_eq!(parse_sc_state("        STATE              : 1\n").as_deref(), Some("STOPPED"), "number only");
+        assert_eq!(parse_sc_state("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:"), None);
     }
 
     #[test]
