@@ -28,6 +28,10 @@ pub struct ExeUsage {
     /// Startup-folder shortcut.
     #[serde(default)]
     pub autostart: bool,
+    /// The exe would be excluded but the user launched it, so only its UserAssist launches date
+    /// it; its other traces (BAM, Prefetch) were dropped.
+    #[serde(default)]
+    pub user_launch_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +512,7 @@ fn group_hits(
                 is_main: main,
                 excluded,
                 autostart: listed(task_exes, &exe) || listed(autostart_exes, &exe),
+                user_launch_only: user_launched && !installer,
             })
         })
         .collect();
@@ -590,7 +595,8 @@ pub struct HitExplanation {
     pub hit: UsageHit,
     /// `counted:main`, `counted`, `excluded:<ExcludeReason>`, `superseded` (a file time hidden by
     /// a real source for the same exe), `filetime-ignored` (file times only date a program without
-    /// other hits, see `summarize`), `assigned-to:<other program names>`,
+    /// other hits, see `summarize`), `ignored:user-launch-only` (a BAM/Prefetch trace of an exe
+    /// that only the user's UserAssist launches date), `assigned-to:<other program names>`,
     /// `drive-less-unmatched` (volume-stripped path no install location claims) or `no-candidate`.
     pub outcome: String,
 }
@@ -619,6 +625,10 @@ pub fn explain_match(input: &MatchInput, program: &ProgramId) -> Vec<HitExplanat
                         Some(_) if file_time && has_real => "filetime-ignored".to_string(),
                         Some(e) => match e.excluded {
                             Some(r) => format!("excluded:{r:?}"),
+                            // Dropped: only the user's launches date this exe.
+                            None if e.user_launch_only && hit.source != UsageSource::UserAssist => {
+                                "ignored:user-launch-only".to_string()
+                            }
                             None if e.is_main => "counted:main".to_string(),
                             None => "counted".to_string(),
                         },
@@ -1110,6 +1120,18 @@ mod tests {
         let hits = [hit(r"C:\Apps\Suite\Plugin\plug.exe", 1, UsageSource::Bam)];
         assert_eq!(explain(&programs, &hits, "Outer"), ["assigned-to:Inner"]);
         assert_eq!(explain(&programs, &hits, "Inner"), ["counted"]);
+    }
+
+    #[test]
+    fn explain_marks_hits_dropped_by_user_launch_rule() {
+        // An updater the user once started: only its UserAssist launch dates it.
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\FooUpdater.exe";
+        let hits = [hit(exe, 3, UsageSource::UserAssist), hit(exe, 5, UsageSource::Bam), hit(exe, 5, UsageSource::Prefetch)];
+        assert_eq!(explain(&programs, &hits, "Foo"), ["counted", "ignored:user-launch-only", "ignored:user-launch-only"]);
+        // A main exe with UserAssist and BAM hits counts both.
+        let main = [hit(r"C:\Apps\Foo\foo.exe", 5, UsageSource::UserAssist), hit(r"C:\Apps\Foo\foo.exe", 3, UsageSource::Bam)];
+        assert_eq!(explain(&programs, &main, "Foo"), ["counted:main", "counted:main"]);
     }
 
     fn input<'a>(

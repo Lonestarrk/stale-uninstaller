@@ -168,6 +168,7 @@ mod tests {
             is_main,
             excluded,
             autostart: false,
+            user_launch_only: false,
         };
         assert_eq!(counted_label(&exe(true, None)), strings::t().counted_yes);
         assert_eq!(counted_label(&exe(false, None)), "räknas");
