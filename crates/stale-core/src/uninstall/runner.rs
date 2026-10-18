@@ -319,22 +319,43 @@ impl ProcessRunner for FakeProcessRunner {
     }
 }
 
+/// Subfolder levels below the install folder that [`still_installed`] searches for an exe.
+const STILL_INSTALLED_DEPTH: usize = 4;
+
+/// Whether `dir` or a folder up to [`STILL_INSTALLED_DEPTH`] levels below it holds a `*.exe`.
+/// Links are not followed (`list_dir` reports them as non-folders).
+fn has_exe(fs: &dyn FsReader, dir: &Path) -> bool {
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        for e in fs.list_dir(&dir) {
+            if e.is_dir {
+                if depth < STILL_INSTALLED_DEPTH {
+                    stack.push((e.path, depth + 1));
+                }
+            } else if e.path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Spec §6.2: the program counts as installed while its Uninstall key exists and its install folder
-/// (when it has one) still holds at least one `*.exe`.
+/// (when it has one) still holds at least one `*.exe`, directly or up to four folder levels below
+/// (e.g. `bin\x64\app.exe`).
 pub fn still_installed(reg: &dyn RegistryReader, fs: &dyn FsReader, p: &Program) -> bool {
     if !reg.key_exists(&p.key) {
         return false;
     }
     match &p.install_location {
         None => true,
-        Some(dir) => {
-            fs.is_dir(dir)
-                && fs.list_dir(dir).iter().any(|e| {
-                    !e.is_dir && e.path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe"))
-                })
-        }
+        Some(dir) => fs.is_dir(dir) && has_exe(fs, dir),
     }
 }
+
+/// MSI's "user cancelled" (1602) and "fatal error" (1603): the uninstall did not happen, whatever
+/// the registry and the folder look like.
+const MSI_NOT_UNINSTALLED: [i32; 2] = [1602, 1603];
 
 /// Runs `p`'s own uninstaller, waits for its whole process tree, then checks whether it is gone.
 pub fn run_vendor_uninstaller(
@@ -351,7 +372,9 @@ pub fn run_vendor_uninstaller(
             log::warn!("{}: uninstaller failed to run: {e}", p.name);
             VendorResult::NotUninstalled { exit_code: None }
         }
-        Ok(code) if still_installed(reg, fs, p) => VendorResult::NotUninstalled { exit_code: Some(code) },
+        Ok(code) if MSI_NOT_UNINSTALLED.contains(&code) || still_installed(reg, fs, p) => {
+            VendorResult::NotUninstalled { exit_code: Some(code) }
+        }
         Ok(code) => VendorResult::Uninstalled { exit_code: code },
     }
 }
@@ -542,6 +565,29 @@ mod tests {
         let r = run_vendor_uninstaller(&p, &runner, &FakeRegistry::new(), &FakeFs::new());
         assert_eq!(r, VendorResult::NoUninstaller);
         assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn still_installed_finds_exe_in_bin_subfolder() {
+        let p = program("Foo", Some(r"C:\Foo\u.exe"), false, Some(r"C:\Foo"));
+        let reg = registry_with(&p);
+        let fs = FakeFs::new().dir(r"C:\Foo", 0).file(r"C:\Foo\readme.txt", 1).file(r"C:\Foo\bin\x64\foo.exe", 10);
+        assert!(still_installed(&reg, &fs, &p));
+        let deep = FakeFs::new().dir(r"C:\Foo", 0).file(r"C:\Foo\a\b\c\d\foo.exe", 10);
+        assert!(still_installed(&reg, &deep, &p), "four levels down");
+        let too_deep = FakeFs::new().dir(r"C:\Foo", 0).file(r"C:\Foo\a\b\c\d\e\foo.exe", 10);
+        assert!(!still_installed(&reg, &too_deep, &p), "five levels down is not searched");
+    }
+
+    #[test]
+    fn msi_1602_is_not_uninstalled_even_if_key_gone() {
+        let p = program(GUID, Some(&format!("MsiExec.exe /X{GUID}")), true, None);
+        for code in [1602, 1603] {
+            let r = run_vendor_uninstaller(&p, &fake_runner(code), &FakeRegistry::new(), &FakeFs::new());
+            assert_eq!(r, VendorResult::NotUninstalled { exit_code: Some(code) });
+        }
+        let r = run_vendor_uninstaller(&p, &fake_runner(0), &FakeRegistry::new(), &FakeFs::new());
+        assert_eq!(r, VendorResult::Uninstalled { exit_code: 0 });
     }
 
     #[test]
