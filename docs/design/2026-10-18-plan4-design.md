@@ -51,7 +51,7 @@ Beslutat i samtalet: ett program räknas som använt när **någon** av dess exe
 
 Förtydligat under genomförandet (2026-10-18):
 - Bara exe-filer i programmets egen installationsmapp räknas som delkomponenter. En träff som hör till programmet bara via filnamnet räknas bara om den är huvudprogrammet.
-- Ett program som autostartar räknas som använt, eftersom det körs. En schemalagd uppgift som startar programmets eget huvudprogram räknas.
+- Ett program som autostartar räknas som använt, eftersom det körs. En schemalagd uppgift som startar programmets eget huvudprogram räknas. Datumet märks då "(autostart)" när senaste körningen kom från BAM eller Prefetch och exe-filen startas av en schemalagd uppgift, en Run-nyckel eller Autostart-mappen, till exempel "Idag (autostart)".
 - Schemalagda underhållsjobb som inte är huvudprogrammet räknas inte, till exempel Office ActionsServer och Firefox default-browser-agent.
 - Tjänster räknas aldrig, inte ens när tjänsten är programmets ikonfil (Office ClickToRun).
 - En installationsfil räknas bara när den är programmets eget huvudprogram och körningen syns i Prefetch eller BAM. Ett program vars enda spår är dess egen cachade installationsfil räknas som aldrig använt.
