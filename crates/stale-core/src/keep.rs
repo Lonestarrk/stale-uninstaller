@@ -27,19 +27,29 @@ fn same_key(a: &RegKeyPath, b: &RegKeyPath) -> bool {
     a.hive == b.hive && key_str(a) == key_str(b)
 }
 
+/// The largest keep list read (1 MiB); a larger file is ignored.
+pub const MAX_KEEP_LIST_BYTES: u64 = 1024 * 1024;
+
 impl KeepList {
-    /// Defaults when the file is missing or unparsable; unknown fields are ignored. Defaults too
-    /// (with a warning) when the data folder's lock-down could not take the file over
-    /// ([`crate::acl::is_ignored_file`]).
+    /// Defaults when the file is missing or unparsable; unknown fields are ignored. Defaults with
+    /// a warning when it is larger than [`MAX_KEEP_LIST_BYTES`] or the data folder's lock-down
+    /// could not take it over ([`crate::acl::is_ignored_file`]).
     pub fn load_from(path: &Path) -> KeepList {
         if crate::acl::is_ignored_file(path) {
             log::warn!("{} is not ours and was not read; using defaults", path.display());
             return KeepList::default();
         }
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(file) = std::fs::File::open(path) else { return KeepList::default() };
+        let mut text = String::new();
+        // One byte past the cap tells an oversized file apart without reading all of it.
+        if std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_KEEP_LIST_BYTES + 1), &mut text).is_err() {
+            return KeepList::default();
+        }
+        if text.len() as u64 > MAX_KEEP_LIST_BYTES {
+            log::warn!("{} is larger than {MAX_KEEP_LIST_BYTES} bytes and was not read; using defaults", path.display());
+            return KeepList::default();
+        }
+        serde_json::from_str(&text).unwrap_or_default()
     }
 
     /// Writes pretty JSON atomically (`<path>.tmp`, flushed to disk, then renamed over `path`).
@@ -146,6 +156,21 @@ mod tests {
         assert_eq!(KeepList::load_from(&path), KeepList::default());
         std::fs::write(&path, r#"{"names":["x"],"future":1}"#).unwrap();
         assert_eq!(KeepList::load_from(&path).names, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn oversized_keep_list_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        // Valid JSON, padded with whitespace to just over 1 MiB.
+        let body = r#"{"names":["x"]}"#;
+        let padded = format!("{body}{}", " ".repeat(MAX_KEEP_LIST_BYTES as usize + 1 - body.len()));
+        std::fs::write(&path, &padded).unwrap();
+        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        // Exactly at the cap it is still read.
+        std::fs::write(&path, &padded[..MAX_KEEP_LIST_BYTES as usize]).unwrap();
+        assert_eq!(KeepList::load_from(&path).names, vec!["x".to_string()]);
+        assert_eq!(MAX_KEEP_LIST_BYTES, 1024 * 1024);
     }
 
     #[test]
