@@ -30,3 +30,16 @@ pub fn logs_dir() -> PathBuf {
 pub fn user_profiles_root() -> PathBuf {
     PathBuf::from(format!(r"{}\Users", env_or("SystemDrive", "C:")))
 }
+
+/// `data_dir()\quarantine`: one manifest per quarantine. Created on demand (creation errors are ignored).
+pub fn quarantine_manifest_dir() -> PathBuf {
+    let dir = data_dir().join("quarantine");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// `<drive>:\Stale Uninstaller\quarantine`: where files moved from that drive are stored, so a move
+/// stays a same-volume rename. Not created here; `FileMover::ensure_payload_root` creates and locks it down.
+pub fn quarantine_payload_root(drive: char) -> PathBuf {
+    PathBuf::from(format!(r"{}:\Stale Uninstaller\quarantine", drive.to_ascii_uppercase()))
+}
