@@ -47,6 +47,9 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

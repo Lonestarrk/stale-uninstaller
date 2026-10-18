@@ -71,7 +71,7 @@ mod tests {
         let target = dir.path().join("elsewhere");
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("linked.json");
-        crate::trusted::tests::junction(&link, &target);
+        assert!(crate::testutil::junction(&link, &target), "mklink /J failed");
         assert_eq!(Settings::load_from_with(&link, &trust_all), Settings::default());
         assert!(Settings::default().save_to(&link).is_err());
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);

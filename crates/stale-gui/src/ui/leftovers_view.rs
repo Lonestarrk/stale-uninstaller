@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
 use stale_core::quarantine::{DestinationPlan, QuarantineManifest};
-use stale_core::{Hive, RegKeyPath};
+use stale_core::RegKeyPath;
 
 use super::STALE_COLOR;
 use crate::app::{StaleApp, View};
@@ -251,12 +251,7 @@ fn kind_label(kind: &LeftoverKind) -> &'static str {
 
 /// `HKLM\<path>`, `HKCU\<path>` or `HKU\<path>`.
 pub(crate) fn key_text(key: &RegKeyPath) -> String {
-    let hive = match key.hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    };
-    format!(r"{hive}\{}", key.path)
+    format!(r"{}\{}", key.hive.short_name(), key.path)
 }
 
 /// The path, key or name that identifies a leftover.
@@ -298,6 +293,7 @@ pub(crate) fn note_text(note: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stale_core::Hive;
 
     #[test]
     fn notes_map_to_swedish_and_unknown_pass_through() {

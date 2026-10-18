@@ -224,12 +224,7 @@ pub struct Collected {
 /// `HIVE\path` (`HKLM\SOFTWARE\Foo`, `HKCU\…`, `HKU\…`), the form [`Evidence::DanglingRef`]
 /// uses for a registry location.
 pub fn format_location(k: &RegKeyPath) -> String {
-    let hive = match k.hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    };
-    format!(r"{hive}\{}", k.path)
+    format!(r"{}\{}", k.hive.short_name(), k.path)
 }
 
 /// The key a registry [`Evidence::DanglingRef`] location names; `None` for any other location

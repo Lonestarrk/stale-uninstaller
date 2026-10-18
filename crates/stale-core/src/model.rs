@@ -9,6 +9,17 @@ pub enum Hive {
     Users,
 }
 
+impl Hive {
+    /// `HKLM`, `HKCU` or `HKU`, as `reg.exe` and Regedit's address bar write them.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Hive::LocalMachine => "HKLM",
+            Hive::CurrentUser => "HKCU",
+            Hive::Users => "HKU",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RegKeyPath {
     pub hive: Hive,

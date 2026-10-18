@@ -243,7 +243,7 @@ impl ProcessRunner for JobObjectRunner {
         if cmd.is_empty() {
             return Err("empty command".into());
         }
-        let mut line: Vec<u16> = command_line(cmd).encode_utf16().chain(once(0)).collect();
+        let mut line = crate::pathutil::wide(command_line(cmd));
         // SAFETY: `line` is a NUL-terminated, writable UTF-16 buffer that outlives CreateProcessW;
         // `si`/`pi` are valid for the call. Every returned handle is wrapped in `Owned` at once, so
         // it is closed on every path out of this block.

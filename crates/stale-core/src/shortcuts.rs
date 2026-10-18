@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, PCWSTR};
@@ -74,7 +73,7 @@ fn from_wide(buf: &[u16]) -> String {
 /// The shortcut's target exactly as stored (may contain `%VAR%`; empty if it has none) and
 /// its arguments.
 fn raw_target(lnk: &Path) -> windows::core::Result<(String, String)> {
-    let wide: Vec<u16> = lnk.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide = crate::pathutil::wide(lnk);
     let mut path = [0u16; 1024];
     let mut args = [0u16; 2048];
     // SAFETY: COM is initialized by the caller; `wide` is NUL-terminated and outlives `Load`;

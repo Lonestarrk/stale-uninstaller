@@ -100,6 +100,8 @@ impl ScanSources {
     /// The real machine: registry, BAM, UserAssist, Prefetch, Start Menu shortcuts, file system.
     pub fn live() -> ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
+        // Usage matching rejects other profiles' Temp folders as install folders.
+        crate::leftovers::init_profile_roots(&crate::fsys::RealFs::live());
         let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
         let services_reg = reg.clone();
         let autostart_reg = reg.clone();
@@ -118,7 +120,7 @@ impl ScanSources {
                 FileTimeProvider { exes: exes.to_vec() }.collect().unwrap_or_default()
             }),
             service_exes: Box::new(move || service_exes(&*services_reg)),
-            task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs, &crate::paths::tasks_root())),
+            task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs::default(), &crate::paths::tasks_root())),
             autostart_exes: Box::new(move || {
                 let mut exes = crate::leftovers::reg_scan::run_value_exes(&*autostart_reg);
                 exes.extend(

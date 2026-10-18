@@ -18,7 +18,7 @@ impl WinDeviceMap {
     pub fn new() -> Self {
         let mut map = HashMap::new();
         for letter in 'A'..='Z' {
-            let name: Vec<u16> = format!("{letter}:").encode_utf16().chain(std::iter::once(0)).collect();
+            let name = crate::pathutil::wide(format!("{letter}:"));
             let mut buf = [0u16; 1024];
             // SAFETY: `name` is NUL-terminated and outlives the call; `buf` is a valid writable slice.
             let n = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut buf)) };

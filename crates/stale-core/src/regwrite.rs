@@ -97,12 +97,7 @@ pub struct FakeRegistryWriter {
 }
 
 fn short_key(key: &RegKeyPath) -> String {
-    let hive = match key.hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    };
-    format!(r"{hive}\{}", trimmed(key))
+    format!(r"{}\{}", key.hive.short_name(), trimmed(key))
 }
 
 impl FakeRegistryWriter {

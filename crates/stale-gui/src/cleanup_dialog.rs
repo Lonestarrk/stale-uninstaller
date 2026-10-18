@@ -2,6 +2,7 @@
 //! labelled buttons, or a Yes/No/Cancel message box when task dialogs are not available (no Common
 //! Controls 6 activated, see the exe manifest).
 
+use stale_core::pathutil::wide;
 use stale_core::selfclean::Choice;
 
 use crate::strings::{self, t, Lang};
@@ -40,10 +41,6 @@ pub fn ask(total: u64) -> Option<Choice> {
         Some(answer) => answer,
         None => message_box(&strings::uninstall_cleanup_prompt(total)),
     }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Brings the dialog to the front and keeps it above other windows: the uninstaller that runs
@@ -88,7 +85,7 @@ fn task_dialog(total: u64) -> Option<Option<Choice>> {
 
     let lang = strings::lang();
     let title = wide(t().app_title);
-    let heading = wide(&strings::uninstall_cleanup_heading(total));
+    let heading = wide(strings::uninstall_cleanup_heading(total));
     let question = wide(t().uninstall_cleanup_question);
     let labels: Vec<(i32, Vec<u16>)> = buttons_in(lang).iter().map(|(id, text)| (*id, wide(text))).collect();
     let buttons: Vec<TASKDIALOG_BUTTON> = labels

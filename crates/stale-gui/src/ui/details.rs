@@ -4,7 +4,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use stale_core::provenance::Provenance;
 use stale_core::usage::matching::{ExcludeReason, ExeUsage, ProgramUsage};
-use stale_core::{Hive, Scope};
+use stale_core::Scope;
 
 use crate::app::Row;
 use crate::strings::Lang;
@@ -31,14 +31,6 @@ fn counted_label(exe: &ExeUsage) -> String {
         None => strings::t().counted_subcomponent,
     };
     if exe.autostart { format!("{label} ({})", strings::t().autostart) } else { label.to_string() }
-}
-
-fn hive_label(hive: Hive) -> &'static str {
-    match hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    }
 }
 
 /// "2026-10-18 (BAM)", plus the table's notes: "2026-10-18 (BAM) (autostart, via x.exe)".
@@ -97,7 +89,7 @@ pub fn details_panel(ui: &mut egui::Ui, row: &Row, provenance: Option<&Provenanc
     let or_dash = |s: Option<String>| s.unwrap_or_else(|| strings::t().unknown_value.to_string());
     egui::Grid::new("details_grid").num_columns(2).show(ui, |ui| {
         let location = p.install_location.as_ref().map(|l| l.display().to_string());
-        let mut key = format!("{}\\{}", hive_label(p.key.hive), p.key.path);
+        let mut key = format!("{}\\{}", p.key.hive.short_name(), p.key.path);
         if p.scope == Scope::OtherUser {
             key.push_str(strings::t().other_user_suffix);
         }

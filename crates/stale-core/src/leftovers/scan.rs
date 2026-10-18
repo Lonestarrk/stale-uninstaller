@@ -28,7 +28,8 @@ pub struct LeftoverSources {
 impl LeftoverSources {
     pub fn live() -> LeftoverSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
-        let fs: Arc<dyn FsReader> = Arc::new(RealFs);
+        let fs: Arc<dyn FsReader> = Arc::new(RealFs::live());
+        crate::leftovers::init_profile_roots(&*fs);
         LeftoverSources {
             fs_roots: FsScanRoots::from_env(&*fs),
             reg_roots: RegScanRoots::standard(&*reg),

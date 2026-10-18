@@ -112,6 +112,12 @@ fn has_file_extension(p: &Path) -> bool {
     })
 }
 
+/// `s` as UTF-16 with a terminating NUL, for Win32 string arguments (`PCWSTR`).
+pub fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+}
+
 /// Uppercase drive letter of a path; `None` for UNC or relative paths.
 pub fn drive_letter(p: &Path) -> Option<char> {
     let s = p.to_str()?;
@@ -433,6 +439,19 @@ mod tests {
             return p.to_path_buf();
         }
         PathBuf::from(String::from_utf16_lossy(&buf[..len]))
+    }
+
+    #[test]
+    fn wide_is_nul_terminated_utf16() {
+        assert_eq!(wide("aå"), vec![0x61, 0xE5, 0]);
+        assert_eq!(wide(Path::new(r"C:\")), vec![0x43, 0x3A, 0x5C, 0]);
+        assert_eq!(wide(""), vec![0]);
+    }
+
+    #[test]
+    fn hive_short_names() {
+        use crate::model::Hive;
+        assert_eq!([Hive::LocalMachine, Hive::CurrentUser, Hive::Users].map(Hive::short_name), ["HKLM", "HKCU", "HKU"]);
     }
 
     #[test]

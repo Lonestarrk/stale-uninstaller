@@ -40,10 +40,9 @@ pub enum ExcludeReason {
     Service,
     /// The exe is the action of a scheduled task (background maintenance, not a user launch).
     ScheduledTask,
-    /// Kept for deserialisation. Only produced for a hit that belongs to a program through a
-    /// file-name claim alone (no install folder) and is not its main exe: that is the
-    /// uninstaller's or icon's name, not proof of a subcomponent. Inside the install folder a
-    /// non-main exe counts.
+    /// A hit the program claimed by file name alone (outside any install folder: the
+    /// uninstaller's or display icon's name) on an exe that is not its main exe: a name match is
+    /// no proof of a subcomponent. Inside the install folder a non-main exe counts.
     NotMain,
 }
 
@@ -69,8 +68,9 @@ pub struct ProgramUsage {
     /// Sorted by `last_run`, newest first.
     pub exes: Vec<ExeUsage>,
     /// One of the program's main exes ([`program_main_exes`]), whether or not it ran: the one
-    /// the display icon names, else the most recently used, else the first. The details panel
-    /// reads the signature and version info from it.
+    /// the display icon names, else the one the program's own shortcut names, else the most
+    /// recently used, else the first. The details panel reads the signature and version info
+    /// from it.
     #[serde(default)]
     pub main_exe: Option<PathBuf>,
 }
@@ -122,7 +122,8 @@ fn dedupe(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     paths.into_iter().filter(|p| seen.insert(norm(p))).collect()
 }
 
-/// The exe(s) that represent the program itself, first non-empty tier wins:
+/// The exe(s) that represent the program itself, and the rule that picked them. First non-empty
+/// tier wins:
 /// 1. shortcut targets under the install location that are not name-excluded;
 /// 2. for name-excluded shortcut targets under it (Squirrel's `Update.exe --processStart
 ///    App.exe`), the exes in `arg_exes` (found under the install location by the caller)
@@ -131,30 +132,10 @@ fn dedupe(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// 4. the largest exe in the install root that is neither name-excluded nor an installer/setup.
 ///
 /// "Install location" is [`usage_install_dir`]; empty without one.
-pub fn main_exes(
-    p: &Program,
-    shortcut_targets: &[ShortcutTarget],
-    root_exes: &[(PathBuf, u64)],
-    arg_exes: &[PathBuf],
-) -> Vec<PathBuf> {
-    main_exes_with_rule(p, shortcut_targets, root_exes, arg_exes).0
-}
-
-/// [`main_exes`] that never picks an exe `skip` refuses (services, scheduled-task actions): the
-/// rule that would have picked it falls through to the next candidate or tier.
-pub fn main_exes_skipping(
-    p: &Program,
-    shortcut_targets: &[ShortcutTarget],
-    root_exes: &[(PathBuf, u64)],
-    arg_exes: &[PathBuf],
-    skip: &dyn Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, skip).0
-}
-
-/// The main exe(s) and rule usage matching really uses: [`main_exes_rule_skipping`] that skips
-/// service exes (a `norm()`ed set, see `listed`). A scheduled task may start the main exe
-/// (an autostart at logon): the program is then running, so it stays the main exe.
+///
+/// Service exes (a `norm()`ed set, see `listed`) are never picked: the rule that would have
+/// picked one falls through to the next candidate or tier. A scheduled task may start the main
+/// exe (an autostart at logon): the program is then running, so it stays the main exe.
 pub fn program_main_exes(
     p: &Program,
     shortcut_targets: &[ShortcutTarget],
@@ -165,7 +146,7 @@ pub fn program_main_exes(
     main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, &|e| listed(service_exes, e))
 }
 
-/// The tier of [`main_exes`] that picked the main exe(s).
+/// The tier of [`program_main_exes`] that picked the main exe(s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainRule {
     Shortcut,
@@ -176,18 +157,8 @@ pub enum MainRule {
     None,
 }
 
-/// [`main_exes`] plus the rule that picked them.
-pub fn main_exes_with_rule(
-    p: &Program,
-    shortcut_targets: &[ShortcutTarget],
-    root_exes: &[(PathBuf, u64)],
-    arg_exes: &[PathBuf],
-) -> (Vec<PathBuf>, MainRule) {
-    main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, &|_| false)
-}
-
-/// [`main_exes_with_rule`] with a `skip` filter, see [`main_exes_skipping`].
-pub fn main_exes_rule_skipping(
+/// [`program_main_exes`] with any `skip` filter (an exe it refuses is never picked).
+fn main_exes_rule_skipping(
     p: &Program,
     shortcut_targets: &[ShortcutTarget],
     root_exes: &[(PathBuf, u64)],
@@ -357,6 +328,40 @@ pub fn exclude_reason(exe: &Path, service_exes: &HashSet<String>) -> Option<Excl
     }
 }
 
+/// `name` lowercased and trimmed, without trailing parenthesised parts such as " (x64)" or
+/// " (64-bit)".
+fn display_name_key(name: &str) -> String {
+    let mut key = name.trim().to_lowercase();
+    while key.ends_with(')') {
+        match key.rfind(" (") {
+            Some(i) => key = key[..i].trim_end().to_string(),
+            None => break,
+        }
+    }
+    key
+}
+
+/// The main exe in `mains` that the program's own shortcut names: a shortcut whose file name is
+/// the program's display name ("Google Chrome.lnk" → `chrome.exe`, not the web apps'
+/// `chrome_proxy.exe`; case and " (x64)"-style suffixes ignored), else a main exe whose file stem
+/// is the first word of the display name (`notepad++.exe` for "Notepad++ (64-bit x64)").
+fn named_main_exe(p: &Program, mains: &[PathBuf], shortcut_targets: &[ShortcutTarget]) -> Option<PathBuf> {
+    let name = display_name_key(&p.name);
+    if name.is_empty() {
+        return None;
+    }
+    let in_mains = |exe: &Path| mains.iter().find(|m| norm(m) == norm(exe));
+    let by_shortcut = shortcut_targets
+        .iter()
+        .filter(|t| t.lnk.file_stem().is_some_and(|s| display_name_key(&s.to_string_lossy()) == name))
+        .find_map(|t| in_mains(&t.path));
+    if let Some(m) = by_shortcut {
+        return Some(m.clone());
+    }
+    let first_word = name.split_whitespace().next()?;
+    mains.iter().find(|m| m.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase() == first_word)).cloned()
+}
+
 /// A program prepared for matching, with everything normalized once.
 struct Candidate<'a> {
     program: &'a Program,
@@ -366,6 +371,8 @@ struct Candidate<'a> {
     main: HashSet<String>,
     /// The main exes as found on disk, in rule order (see [`Candidate::main_exe`]).
     mains: Vec<PathBuf>,
+    /// The main exe a shortcut names as the program itself ([`named_main_exe`]).
+    named_main: Option<PathBuf>,
     /// Without an install folder: uppercased display-icon exe name (counts as main).
     icon_name: Option<String>,
     /// Without an install folder: uppercased uninstaller exe name (never MsiExec).
@@ -378,6 +385,7 @@ impl<'a> Candidate<'a> {
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
         let mains = program_main_exes(program, input.shortcut_targets, roots, args, input.service_exes).0;
+        let named_main = named_main_exe(program, &mains, input.shortcut_targets);
         let main = mains
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
@@ -401,11 +409,12 @@ impl<'a> Candidate<'a> {
         } else {
             None
         };
-        Candidate { program, install, main, mains, icon_name, uninstaller_name }
+        Candidate { program, install, main, mains, named_main, icon_name, uninstaller_name }
     }
 
     /// The one main exe provenance reads ([`ProgramUsage::main_exe`]): the one the display icon
-    /// names, else the most recently used one (`exes` is newest first), else the first.
+    /// names, else the one a shortcut names as the program ([`named_main_exe`]), else the most
+    /// recently used one (`exes` is newest first), else the first.
     fn main_exe(&self, exes: &[ExeUsage]) -> Option<PathBuf> {
         let neutral = |p: &Path| squirrel_neutral(&norm(p), self.install.as_deref().unwrap_or_default());
         let icon = self.program.display_icon.as_deref().map(|i| norm(&strip_icon_index(i)));
@@ -413,6 +422,9 @@ impl<'a> Candidate<'a> {
             if let Some(m) = self.mains.iter().find(|m| norm(m) == icon) {
                 return Some(m.clone());
             }
+        }
+        if let Some(named) = &self.named_main {
+            return Some(named.clone());
         }
         let used = exes.iter().filter(|e| e.is_main).find_map(|e| {
             let hit = neutral(&e.exe_path);
@@ -737,6 +749,15 @@ mod tests {
         match_usage(&input(programs, hits, &shortcuts, &roots, &args, services))
     }
 
+    /// [`program_main_exes`] with no service exes.
+    fn mains(p: &Program, shortcuts: &[ShortcutTarget], roots: &[(PathBuf, u64)], args: &[PathBuf]) -> Vec<PathBuf> {
+        mains_rule(p, shortcuts, roots, args).0
+    }
+
+    fn mains_rule(p: &Program, shortcuts: &[ShortcutTarget], roots: &[(PathBuf, u64)], args: &[PathBuf]) -> (Vec<PathBuf>, MainRule) {
+        program_main_exes(p, shortcuts, roots, args, &HashSet::new())
+    }
+
     fn usage<'a>(r: &'a MatchResult, id: &str) -> &'a ProgramUsage {
         &r.by_program[&ProgramId(id.to_string())]
     }
@@ -747,19 +768,19 @@ mod tests {
         a.display_icon = Some(PathBuf::from(r"C:\Apps\A\icon.exe"));
         let shortcuts = targets(&[r"C:\Apps\A\a.exe", r"c:\apps\a\A.EXE", r"C:\Apps\A\bin\tool.exe", r"C:\Other\z.exe"]);
         let roots = vec![(PathBuf::from(r"C:\Apps\A\big.exe"), 100)];
-        assert_eq!(main_exes(&a, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\A\a.exe", r"C:\Apps\A\bin\tool.exe"]));
+        assert_eq!(mains(&a, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\A\a.exe", r"C:\Apps\A\bin\tool.exe"]));
 
         let mut b = prog("B", Some(r"C:\Apps\B"));
         b.display_icon = Some(PathBuf::from(r"C:\Apps\B\b.EXE,0"));
-        assert_eq!(main_exes(&b, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\B\b.EXE"]));
+        assert_eq!(mains(&b, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\B\b.EXE"]));
         b.display_icon = Some(PathBuf::from(r"C:\Apps\B\b.exe"));
-        assert_eq!(main_exes(&b, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\B\b.exe"]));
+        assert_eq!(mains(&b, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\B\b.exe"]));
 
         let mut c = prog("C", Some(r"C:\Apps\C"));
         c.display_icon = Some(PathBuf::from(r"C:\Apps\C\c.ico"));
         let roots = vec![(PathBuf::from(r"C:\Apps\C\small.exe"), 10), (PathBuf::from(r"C:\Apps\C\big.exe"), 99)];
-        assert_eq!(main_exes(&c, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\C\big.exe"]));
-        assert_eq!(main_exes(&c, &shortcuts, &[], &[]), Vec::<PathBuf>::new());
+        assert_eq!(mains(&c, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\C\big.exe"]));
+        assert_eq!(mains(&c, &shortcuts, &[], &[]), Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -768,7 +789,7 @@ mod tests {
         let mut p = prog("P", Some(r"C:\Apps\P"));
         p.display_icon = Some(PathBuf::from(r"C:\Windows\Installer\{1234}\ARPPRODUCTICON.exe"));
         let roots = vec![(PathBuf::from(r"C:\Apps\P\p.exe"), 5)];
-        assert_eq!(main_exes(&p, &[], &roots, &[]), paths(&[r"C:\Apps\P\p.exe"]));
+        assert_eq!(mains(&p, &[], &roots, &[]), paths(&[r"C:\Apps\P\p.exe"]));
     }
 
     #[test]
@@ -778,10 +799,10 @@ mod tests {
         p.display_icon = Some(pf.join("Foo").join("foo.exe"));
         let shortcuts = vec![ShortcutTarget::new(pf.join("Foo").join("foo.exe"))];
         let roots = vec![(pf.join("x.exe"), 5)];
-        assert!(main_exes(&p, &shortcuts, &roots, &[]).is_empty());
+        assert!(mains(&p, &shortcuts, &roots, &[]).is_empty());
         let mut none = prog("N", None);
         none.display_icon = Some(pf.join("Foo").join("foo.exe"));
-        assert!(main_exes(&none, &shortcuts, &roots, &[]).is_empty());
+        assert!(mains(&none, &shortcuts, &roots, &[]).is_empty());
     }
 
     #[test]
@@ -973,7 +994,7 @@ mod tests {
         p.display_icon = Some(PathBuf::from(r"C:\Apps\Foo\uninstall.exe,0"));
         let shortcuts = targets(&[r"C:\Apps\Foo\unins000.exe", r"C:\Apps\Foo\Uninstall Foo.exe"]);
         let roots = vec![(PathBuf::from(r"C:\Apps\Foo\unins000.exe"), 900), (PathBuf::from(r"C:\Apps\Foo\foo.exe"), 100)];
-        assert_eq!(main_exes(&p, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\Foo\foo.exe"]));
+        assert_eq!(mains(&p, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\Foo\foo.exe"]));
         let services = HashSet::new();
         assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\unins000.exe"), &services), Some(ExcludeReason::NamePattern));
         assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\Uninstall.exe"), &services), Some(ExcludeReason::NamePattern));
@@ -1047,6 +1068,39 @@ mod tests {
         assert!(usage(&r, "VS").exes.iter().all(|e| e.is_main));
     }
 
+    /// Chrome's web-app shortcuts ("YouTube.lnk" → `chrome_proxy.exe`) make `chrome_proxy.exe` a
+    /// main exe too, and the newest used; provenance still describes `chrome.exe`, the target of
+    /// "Google Chrome.lnk".
+    #[test]
+    fn provenance_main_exe_prefers_the_programs_own_shortcut() {
+        let app = r"C:\Program Files\Google\Chrome\Application";
+        let proxy = format!(r"{app}\chrome_proxy.exe");
+        let chrome = format!(r"{app}\chrome.exe");
+        let lnk = |name: &str, exe: &str| ShortcutTarget { path: PathBuf::from(exe), arguments: String::new(), lnk: PathBuf::from(format!(r"C:\Start\{name}.lnk")) };
+        let shortcuts = [lnk("YouTube", &proxy), lnk("google chrome (x64)", &chrome)];
+        let (roots, args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let programs = [prog("Google Chrome", Some(app))];
+        let hits = [hit(&proxy, 1, UsageSource::Bam), hit(&chrome, 5, UsageSource::Bam)];
+        assert_eq!(mains(&programs[0], &shortcuts, &[], &[]), paths(&[proxy.as_str(), chrome.as_str()]));
+        let r = match_usage(&input(&programs, &hits, &shortcuts, &roots, &args, &services));
+        assert_eq!(usage(&r, "Google Chrome").main_exe, Some(PathBuf::from(&chrome)));
+
+        // Without such a shortcut: the main exe named like the display name's first word.
+        let shortcuts = [lnk("YouTube", &proxy), lnk("Chrome Beta", &chrome)];
+        let r = match_usage(&input(&programs, &hits, &shortcuts, &roots, &args, &services));
+        assert_eq!(usage(&r, "Google Chrome").main_exe, Some(PathBuf::from(&proxy)), "no name match: newest used");
+        let programs = [prog("Chrome (64-bit)", Some(app))];
+        let r = match_usage(&input(&programs, &hits, &shortcuts, &roots, &args, &services));
+        assert_eq!(usage(&r, "Chrome (64-bit)").main_exe, Some(PathBuf::from(&chrome)));
+    }
+
+    #[test]
+    fn display_name_key_drops_case_and_suffixes() {
+        assert_eq!(display_name_key("  Google Chrome (x64) "), "google chrome");
+        assert_eq!(display_name_key("7-Zip 24.08 (x64) (beta)"), "7-zip 24.08");
+        assert_eq!(display_name_key("Foo(bar)"), "foo(bar)");
+    }
+
     #[test]
     fn squirrel_update_exe_falls_through_to_process_start_target() {
         let p = prog("Discord", Some(r"C:\Users\X\AppData\Local\Discord"));
@@ -1054,7 +1108,7 @@ mod tests {
         let shortcuts = [ShortcutTarget { path: update.clone(), arguments: "--processStart Discord.exe".into(), lnk: PathBuf::new() }];
         let main = PathBuf::from(r"C:\Users\X\AppData\Local\Discord\app-1.0\Discord.exe");
         let roots = vec![(update.clone(), 2_000_000)];
-        assert_eq!(main_exes(&p, &shortcuts, &roots, std::slice::from_ref(&main)), vec![main.clone()]);
+        assert_eq!(mains(&p, &shortcuts, &roots, std::slice::from_ref(&main)), vec![main.clone()]);
         assert_eq!(exclude_reason(&update, &HashSet::new()), Some(ExcludeReason::NamePattern));
 
         let hits = [hit(main.to_str().unwrap(), 3, UsageSource::Bam), hit(update.to_str().unwrap(), 1, UsageSource::Bam)];
@@ -1221,7 +1275,7 @@ mod tests {
         );
         assert_eq!(usage_install_dir(&chrome, &[]), Some(PathBuf::from(r"C:\Program Files\Google\Chrome\Application")));
         let exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
-        assert_eq!(main_exes_with_rule(&chrome, &[], &[], &[]), (vec![PathBuf::from(exe)], MainRule::DisplayIcon));
+        assert_eq!(mains_rule(&chrome, &[], &[], &[]), (vec![PathBuf::from(exe)], MainRule::DisplayIcon));
         let hits = [hit(exe, 0, UsageSource::Bam)];
         let (no_roots, no_args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
         let r = match_usage(&input(std::slice::from_ref(&chrome), &hits, &[], &no_roots, &no_args, &services));
@@ -1376,7 +1430,7 @@ mod tests {
             (PathBuf::from(format!(r"{install}\GameSetup.exe")), 80_000_000),
             (PathBuf::from(format!(r"{install}\bf6.exe")), 2_000_000),
         ];
-        assert_eq!(main_exes_with_rule(&p, &[], &roots, &[]), (vec![PathBuf::from(format!(r"{install}\bf6.exe"))], MainRule::LargestRootExe));
+        assert_eq!(mains_rule(&p, &[], &roots, &[]), (vec![PathBuf::from(format!(r"{install}\bf6.exe"))], MainRule::LargestRootExe));
     }
 
     fn via_of(u: &ProgramUsage) -> (Option<DateTime<Utc>>, Option<&str>) {
@@ -1477,7 +1531,7 @@ mod tests {
         let tasks = HashSet::from([norm(Path::new(svc))]);
         let r = run_with_tasks(std::slice::from_ref(&p), &hits[..1], &tasks);
         assert_eq!(usage(&r, "Office").last_used.when, Some(days_ago(0)));
-        assert_eq!(main_exes_skipping(&p, &[], &[], &[], &|e| norm(e) == norm(Path::new(svc))), Vec::<PathBuf>::new());
+        assert_eq!(main_exes_rule_skipping(&p, &[], &[], &[], &|e| norm(e) == norm(Path::new(svc))).0, Vec::<PathBuf>::new());
     }
 
     #[test]

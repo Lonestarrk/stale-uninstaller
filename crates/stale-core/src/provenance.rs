@@ -254,7 +254,6 @@ impl ProvenanceProbe for WinProbe {
 
 mod win {
     use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
@@ -278,9 +277,7 @@ mod win {
     };
     use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 
-    fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
-        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
-    }
+    use crate::pathutil::wide;
 
     /// Runs `WinVerifyTrust` with revocation checks off, no UI and no network retrieval, and
     /// always closes the state handle.

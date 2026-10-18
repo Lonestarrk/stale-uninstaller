@@ -1,7 +1,7 @@
 //! Locking folders down to Administrators and SYSTEM: owner and a protected DACL holding exactly
 //! two inheritable full-control ACEs, replacing whatever was there (explicit ACEs included).
 
-use std::os::windows::ffi::OsStrExt;
+use crate::pathutil::wide;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -28,10 +28,6 @@ pub const LOCKED_SDDL: &str = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)";
 /// The same DACL without an owner, for creating a folder when the token cannot name Administrators
 /// as owner (unelevated); the creator then stays owner.
 const LOCKED_SDDL_NO_OWNER: &str = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)";
-
-fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
-    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
-}
 
 /// A security descriptor parsed from SDDL, freed with `LocalFree` on drop.
 struct Sd(PSECURITY_DESCRIPTOR);
@@ -663,9 +659,7 @@ mod tests {
         let target = tmp.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let link = tmp.path().join("link");
-        let mklink = crate::proc::system32_tool("cmd.exe");
-        crate::proc::run_hidden(&mklink, &["/c".as_ref(), "mklink".as_ref(), "/J".as_ref(), link.as_os_str(), target.as_os_str()])
-            .unwrap();
+        assert!(crate::testutil::junction(&link, &target), "mklink /J failed");
         assert_eq!(reinherit(&link), Err(REPARSE_OR_OPEN_FAILED.to_string()));
         assert_eq!(reinherit(&tmp.path().join("missing")), Err(REPARSE_OR_OPEN_FAILED.to_string()));
         std::fs::remove_dir(&link).unwrap();

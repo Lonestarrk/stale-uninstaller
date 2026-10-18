@@ -254,7 +254,7 @@ impl FileMover for RealFileMover {
         if !Path::new(&root).exists() {
             return false;
         }
-        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide = crate::pathutil::wide(&root);
         let mut flags = 0u32;
         let mut fs_name = [0u16; 64];
         // SAFETY: `wide` is NUL-terminated and outlives the call; the out-pointers are valid locals.
@@ -513,18 +513,7 @@ mod tests {
         src
     }
 
-    /// Creates a directory junction (no privilege needed); `false` if this machine refuses.
-    fn junction(link: &Path, target: &Path) -> bool {
-        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-            return true;
-        }
-        std::process::Command::new(crate::proc::system32_tool("cmd.exe"))
-            .args(["/c", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
+    use crate::testutil::junction;
 
     #[test]
     fn real_mover_moves_tree_and_creates_parents() {

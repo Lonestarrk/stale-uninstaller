@@ -208,13 +208,6 @@ pub(crate) mod tests {
         Some(false)
     }
 
-    /// `mklink /J link target`.
-    pub(crate) fn junction(link: &Path, target: &Path) {
-        let cmd = crate::proc::system32_tool("cmd.exe");
-        crate::proc::run_hidden(&cmd, &["/c".as_ref(), "mklink".as_ref(), "/J".as_ref(), link.as_os_str(), target.as_os_str()])
-            .unwrap();
-    }
-
     #[test]
     fn untrusted_owner_and_reparse_points_are_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -228,7 +221,7 @@ pub(crate) mod tests {
         let target = dir.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("important.json");
-        junction(&link, &target);
+        assert!(crate::testutil::junction(&link, &target), "mklink /J failed");
         assert!(matches!(read_trusted(&link, 100, &trust_all), TrustedRead::Refused(_)));
         // And never written through.
         assert!(write_replacing(&link, b"{}").is_err());

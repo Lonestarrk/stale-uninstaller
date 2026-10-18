@@ -4,6 +4,7 @@
 use chrono::Utc;
 use eframe::egui;
 use stale_core::quarantine::{auto_purge, QuarantineOps};
+use stale_core::pathutil::wide;
 use stale_core::selfclean;
 use stale_core::settings::Settings;
 use stale_gui::app::StaleApp;
@@ -22,7 +23,7 @@ fn single_instance() -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = INSTANCE_MUTEX.encode_utf16().chain(std::iter::once(0)).collect();
+    let name = wide(INSTANCE_MUTEX);
     // SAFETY: `name` is NUL-terminated and outlives the call; the handle is deliberately leaked
     // so the mutex lives as long as the process.
     unsafe {
@@ -44,8 +45,8 @@ fn message_box(text: &str, error: bool, on_top: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MESSAGEBOX_STYLE,
     };
-    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = t().app_title.encode_utf16().chain(std::iter::once(0)).collect();
+    let text = wide(text);
+    let title = wide(t().app_title);
     let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
     let top = if on_top { MB_TOPMOST | MB_SETFOREGROUND } else { MESSAGEBOX_STYLE(0) };
     // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.

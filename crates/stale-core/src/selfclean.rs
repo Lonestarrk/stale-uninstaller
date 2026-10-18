@@ -306,7 +306,7 @@ pub fn live_payload_parents() -> Vec<PathBuf> {
         .filter(|i| mask & (1 << i) != 0)
         .map(|i| char::from(b'A' + i))
         .filter(|d| {
-            let root: Vec<u16> = format!(r"{d}:\").encode_utf16().chain(std::iter::once(0)).collect();
+            let root = crate::pathutil::wide(format!(r"{d}:\"));
             // SAFETY: `root` is NUL-terminated and outlives the call.
             unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_FIXED }
         })
@@ -343,15 +343,7 @@ mod tests {
         assert_eq!(cleanup_action(2, None), CleanupAction::KeepAll);
     }
 
-    /// `mklink /J link target`; false when it could not be created.
-    fn junction(link: &Path, target: &Path) -> bool {
-        std::process::Command::new(crate::proc::system32_tool("cmd.exe"))
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
+    use crate::testutil::junction;
 
     #[test]
     fn removal_unlinks_a_junction_and_keeps_its_target() {

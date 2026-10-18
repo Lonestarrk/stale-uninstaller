@@ -90,7 +90,26 @@ pub(crate) fn merge_profiles(listed: Vec<PathBuf>, registered: Vec<PathBuf>, is_
         .collect()
 }
 
-pub struct RealFs;
+/// The real file system. Its profile folders are the Users folder's children plus
+/// `registered_profiles`, which the caller passes in ([`RealFs::live`] reads them from the
+/// registry's ProfileList): the reader itself never reads the registry.
+#[derive(Clone, Debug, Default)]
+pub struct RealFs {
+    registered_profiles: Vec<PathBuf>,
+}
+
+impl RealFs {
+    /// The real file system with the profile folders of the registry's ProfileList
+    /// ([`profile_list_dirs`]), read once, here.
+    pub fn live() -> RealFs {
+        RealFs::with_registered_profiles(profile_list_dirs(&crate::registry::WinRegistry))
+    }
+
+    /// The real file system with `registered` as the ProfileList's profile folders.
+    pub fn with_registered_profiles(registered: Vec<PathBuf>) -> RealFs {
+        RealFs { registered_profiles: registered }
+    }
+}
 
 impl FsReader for RealFs {
     fn list_dir(&self, dir: &Path) -> Vec<DirEntryInfo> {
@@ -123,8 +142,7 @@ impl FsReader for RealFs {
     fn profile_dirs(&self) -> Vec<PathBuf> {
         let listed: Vec<PathBuf> =
             self.list_dir(&crate::paths::user_profiles_root()).into_iter().filter(|e| e.is_dir).map(|e| e.path).collect();
-        let registered = profile_list_dirs(&crate::registry::WinRegistry);
-        merge_profiles(listed, registered, &|p| p.is_dir(), &crate::pathutil::norm(&crate::paths::windows_dir()))
+        merge_profiles(listed, self.registered_profiles.clone(), &|p| p.is_dir(), &crate::pathutil::norm(&crate::paths::windows_dir()))
     }
 
     fn env(&self, var: &str) -> Option<String> {
@@ -345,16 +363,16 @@ mod tests {
     #[test]
     fn real_fs_modified_reads_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let got = RealFs.modified(dir.path()).expect("modified time");
+        let got = RealFs::default().modified(dir.path()).expect("modified time");
         assert!((Utc::now() - got).num_minutes().abs() < 5);
-        assert_eq!(RealFs.modified(&dir.path().join("missing")), None);
+        assert_eq!(RealFs::default().modified(&dir.path().join("missing")), None);
     }
 
     #[test]
     #[ignore]
     fn real_fs_lists_program_files() {
-        let pf = RealFs.env("ProgramFiles").unwrap();
-        assert!(!RealFs.list_dir(Path::new(&pf)).is_empty());
+        let pf = RealFs::default().env("ProgramFiles").unwrap();
+        assert!(!RealFs::default().list_dir(Path::new(&pf)).is_empty());
     }
 
     fn utf16le(s: &str) -> Vec<u8> {

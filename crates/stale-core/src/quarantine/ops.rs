@@ -239,7 +239,7 @@ impl QuarantineOps {
             mover,
             regw: Arc::new(WinRegistryWriter),
             reg: Arc::new(WinRegistry),
-            fs: Arc::new(RealFs),
+            fs: Arc::new(RealFs::live()),
             manifest_dir: crate::paths::quarantine_manifest_dir(),
             payload_root_for: Box::new(crate::paths::quarantine_payload_root),
             tasks_root: system32_tool("Tasks"),
@@ -267,12 +267,7 @@ pub enum RestoreOutcome {
 
 /// `HKLM\<path>`.
 fn key_text(k: &RegKeyPath) -> String {
-    let hive = match k.hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    };
-    format!(r"{hive}\{}", k.path.trim_matches('\\'))
+    format!(r"{}\{}", k.hive.short_name(), k.path.trim_matches('\\'))
 }
 
 fn describe(kind: &LeftoverKind) -> String {
@@ -645,7 +640,7 @@ pub fn live_free_bytes(drive: char) -> Option<u64> {
     if !drive.is_ascii_alphabetic() {
         return None;
     }
-    let root: Vec<u16> = format!(r"{}:\", drive.to_ascii_uppercase()).encode_utf16().chain(std::iter::once(0)).collect();
+    let root = crate::pathutil::wide(format!(r"{}:\", drive.to_ascii_uppercase()));
     let mut free = 0u64;
     // SAFETY: `root` is NUL-terminated and outlives the call; `free` is a valid out-pointer.
     unsafe { GetDiskFreeSpaceExW(PCWSTR(root.as_ptr()), Some(&mut free), None, None) }.ok()?;

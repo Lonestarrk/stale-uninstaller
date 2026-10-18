@@ -4,7 +4,6 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::Write;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -85,7 +84,7 @@ pub fn owned_by_admins(path: &Path) -> Option<bool> {
     if super::fsmove::is_reparse_point(path) {
         return Some(false);
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide = crate::pathutil::wide(path);
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `wide` is NUL-terminated and outlives the call; `owner` points into `sd`, which the
@@ -178,15 +177,7 @@ mod tests {
         assert!(!checked.borrow().contains(&link), "a reparse entry is refused before its owner is read");
     }
 
-    /// `mklink /J link target`; false when it could not be created.
-    fn junction(link: &Path, target: &Path) -> bool {
-        std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
+    use crate::testutil::junction;
 
     /// Run with `cargo test -p stale-core -- --ignored junction`.
     #[test]
