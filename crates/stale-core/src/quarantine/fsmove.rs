@@ -50,6 +50,8 @@ pub trait FileMover: Send + Sync {
     /// Bytes of a file, or of all files below a folder; 0 when missing.
     fn size_of(&self, p: &Path) -> u64;
     fn exists(&self, p: &Path) -> bool;
+    /// Whether `p` itself is a symlink, junction or other reparse point (false when missing).
+    fn is_reparse(&self, p: &Path) -> bool;
     /// Deletes a file or folder tree; a missing path is not an error.
     fn remove_all(&self, p: &Path) -> Result<(), String>;
     /// Whether `<drive>:\` is a writable NTFS volume that can hold a payload root (else use C:).
@@ -205,6 +207,10 @@ impl FileMover for RealFileMover {
         std::fs::symlink_metadata(p).is_ok()
     }
 
+    fn is_reparse(&self, p: &Path) -> bool {
+        is_reparse_point(p)
+    }
+
     fn remove_all(&self, p: &Path) -> Result<(), String> {
         match remove_any(p) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -244,6 +250,10 @@ pub struct FakeFileMover {
     /// norm(path) → path.
     locked: Mutex<BTreeMap<String, PathBuf>>,
     volumes: Mutex<BTreeMap<char, bool>>,
+    /// norm(path) of reparse points.
+    reparse: Mutex<BTreeMap<String, PathBuf>>,
+    /// norm(path) of sources whose move copies but cannot delete the source.
+    partial: Mutex<BTreeMap<String, PathBuf>>,
     /// `"move <from> -> <to>"`, `"remove <p>"`, `"ensure <root>"`.
     pub log: Mutex<Vec<String>>,
 }
@@ -279,6 +289,19 @@ impl FakeFileMover {
         self.volumes.lock().unwrap().insert(drive.to_ascii_uppercase(), ok);
     }
 
+    /// Marks `path` as a symlink/junction for [`FileMover::is_reparse`].
+    pub fn set_reparse(&self, path: &str) {
+        let p = PathBuf::from(path);
+        self.reparse.lock().unwrap().insert(norm(&p), p);
+    }
+
+    /// Makes a move of exactly `path` copy it to the destination but keep the source,
+    /// returning [`MoveError::PartialMove`] like a failed cross-volume delete.
+    pub fn fail_partially(&self, path: &str) {
+        let p = PathBuf::from(path);
+        self.partial.lock().unwrap().insert(norm(&p), p);
+    }
+
     fn locked_under(&self, p: &Path) -> Option<PathBuf> {
         let base = norm(p);
         self.locked.lock().unwrap().iter().find(|(k, _)| under(k, &base)).map(|(_, path)| path.clone())
@@ -298,13 +321,17 @@ impl FileMover for FakeFileMover {
             return Err(MoveError::Locked(locked));
         }
         let base = norm(from);
+        let keep_source = self.partial.lock().unwrap().contains_key(&base);
         let depth = from.components().count();
         let mut entries = self.entries.lock().unwrap();
         let moving: Vec<String> = entries.keys().filter(|k| under(k, &base)).cloned().collect();
         for k in moving {
-            let (path, size) = entries.remove(&k).unwrap();
+            let (path, size) = if keep_source { entries[&k].clone() } else { entries.remove(&k).unwrap() };
             let dest: PathBuf = to.components().chain(path.components().skip(depth)).collect();
             entries.insert(norm(&dest), (dest, size));
+        }
+        if keep_source {
+            return Err(MoveError::PartialMove { stored: to.to_path_buf(), detail: "forced partial move".to_string() });
         }
         Ok(())
     }
@@ -325,6 +352,10 @@ impl FileMover for FakeFileMover {
     fn exists(&self, p: &Path) -> bool {
         let base = norm(p);
         self.entries.lock().unwrap().keys().any(|k| under(k, &base))
+    }
+
+    fn is_reparse(&self, p: &Path) -> bool {
+        self.reparse.lock().unwrap().contains_key(&norm(p))
     }
 
     fn remove_all(&self, p: &Path) -> Result<(), String> {

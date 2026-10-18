@@ -1,6 +1,11 @@
 //! Quarantine: leftovers moved aside (files) or exported and deleted (registry) so they can be restored.
 
 pub mod fsmove;
+pub mod ops;
+pub mod store;
+
+pub use ops::{auto_purge, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
+pub use store::{list_manifests, manifest_path, new_id};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,6 +77,9 @@ pub struct QuarantineManifest {
     pub services: Vec<RemovedService>,
     pub tasks: Vec<RemovedTask>,
     pub failures: Vec<Failure>,
+    /// Language-free notes for the GUI, e.g. `"service-needs-reboot:<name>"` after a restore.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl QuarantineManifest {
@@ -121,6 +129,7 @@ mod tests {
             services: vec![],
             tasks: vec![],
             failures: vec![],
+            notes: vec![],
         };
         let per = m.size_per_drive();
         assert_eq!(per.into_iter().collect::<Vec<_>>(), vec![('C', 25), ('D', 100), ('E', 7)]);
