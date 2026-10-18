@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use chrono::Utc;
-use stale_core::ghosts::{scan_ghosts, Ghost, GhostSources};
+use stale_core::ghosts::{merge_programs, scan_ghosts, Ghost, GhostSources};
 use stale_core::leftovers::{scan_leftovers, Leftover, LeftoverReport, LeftoverSources, ProgramHint};
 use stale_core::quarantine::{
     list_trusted_manifests, purge, quarantine, restore, QuarantineId, QuarantineManifest, QuarantineOps,
@@ -246,13 +246,18 @@ pub enum GhostEvent {
 }
 
 /// Looks for ghost programs on the "stale-ghosts" thread; `programs` are every installed program
-/// (hidden ones included) and `unmatched` the execution traces the usage scan matched to none.
+/// (hidden ones included) as of the last program scan and `unmatched` the execution traces the
+/// usage scan matched to none. The uninstall list is read again on the thread and joined with
+/// `programs` ([`merge_programs`]), so a program installed since the last scan is no ghost.
 pub fn spawn_ghost_scan(programs: Vec<Program>, unmatched: Vec<UsageHit>) -> Receiver<GhostEvent> {
     let (tx, rx) = channel();
     let fallback = tx.clone();
     let spawned = std::thread::Builder::new().name("stale-ghosts".into()).spawn(move || {
         // Built here, not on the UI thread: it resolves every Start Menu and desktop shortcut.
-        let run = catch_unwind(AssertUnwindSafe(|| scan_ghosts(&GhostSources::live(programs, unmatched))));
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            let fresh = stale_core::programs::enumerate_programs(&stale_core::registry::WinRegistry);
+            scan_ghosts(&GhostSources::live(merge_programs(programs, fresh), unmatched))
+        }));
         let ev = match run {
             Ok(ghosts) => GhostEvent::Done(ghosts),
             // The panic hook has logged the details.

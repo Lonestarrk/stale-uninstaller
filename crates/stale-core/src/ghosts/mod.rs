@@ -8,7 +8,7 @@ pub mod registry;
 pub mod scan;
 
 pub use group::{ghost_name_of, group, to_leftovers, Assessment, Ghost, NameRoots};
-pub use scan::{scan_ghosts, GhostSources};
+pub use scan::{merge_programs, scan_ghosts, GhostSources};
 
 use crate::leftovers::names::{child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, normalize_name};
 use crate::leftovers::{program_locations, system_root_norm};

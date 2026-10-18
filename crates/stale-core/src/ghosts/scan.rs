@@ -5,7 +5,8 @@ use super::refs::{service_collect, shortcut_collect, task_collect, usage_collect
 use super::registry::registry_collect;
 use super::{group, Collected, Evidence, Ghost, InstalledIndex, LiveRefs, NameRoots};
 use crate::leftovers::LeftoverSources;
-use crate::model::Program;
+use crate::model::{Program, ProgramId};
+use std::collections::HashSet;
 use crate::shortcuts::ShortcutTarget;
 use crate::usage::UsageHit;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,16 @@ impl GhostSources {
         };
         GhostSources { leftovers: LeftoverSources::live(), programs, unmatched_hits, drive_present: Box::new(drive_present) }
     }
+}
+
+/// The cached program list joined with a fresh enumeration, by [`ProgramId`]: every fresh
+/// program (its current data wins), then the cached ones the fresh list lacks. A program
+/// installed since the last scan is then never mistaken for a ghost.
+pub fn merge_programs(cached: Vec<Program>, fresh: Vec<Program>) -> Vec<Program> {
+    let ids: HashSet<ProgramId> = fresh.iter().map(|p| p.id.clone()).collect();
+    let mut out = fresh;
+    out.extend(cached.into_iter().filter(|p| !ids.contains(&p.id)));
+    out
 }
 
 /// Runs every collector (orphan folders, registry, services, scheduled tasks, Start Menu and
@@ -125,6 +136,39 @@ mod tests {
 
     fn by_name<'a>(ghosts: &'a [Ghost], name: &str) -> &'a Ghost {
         ghosts.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("no {name} in {ghosts:?}"))
+    }
+
+    fn program(id: &str, name: &str) -> Program {
+        Program {
+            account: None,
+            id: crate::model::ProgramId(id.into()),
+            key: key(Hive::LocalMachine, &format!(r"Software\{id}")),
+            name: name.into(),
+            publisher: None,
+            version: None,
+            install_location: None,
+            install_date: None,
+            uninstall_string: None,
+            quiet_uninstall_string: None,
+            display_icon: None,
+            is_msi: false,
+            estimated_size_bytes: None,
+            drive: None,
+            hidden: false,
+            scope: crate::model::Scope::Machine,
+        }
+    }
+
+    #[test]
+    fn merge_programs_unions_by_id_fresh_first() {
+        let cached = vec![program("a", "Old A"), program("b", "B")];
+        let fresh = vec![program("a", "New A"), program("c", "C")];
+        let names: Vec<String> = merge_programs(cached, fresh).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["New A", "C", "B"]);
+        let merged = merge_programs(vec![program("x", "X")], Vec::new());
+        // The merged list goes straight into the live sources.
+        let src = GhostSources { programs: merged, ..sources(base_fs(), FakeRegistry::new()) };
+        assert_eq!(src.programs.len(), 1);
     }
 
     /// Regression: a running Win32 service's own folder was a pre-checked LeftoversOnly ghost.
