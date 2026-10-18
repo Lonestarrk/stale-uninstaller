@@ -50,12 +50,14 @@ impl Drop for ComGuard {
 pub struct ShortcutTarget {
     pub path: PathBuf,
     pub arguments: String,
+    /// The `.lnk` file this target was read from (empty when not from a file).
+    pub lnk: PathBuf,
 }
 
 impl ShortcutTarget {
     /// A target without arguments.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        ShortcutTarget { path: path.into(), arguments: String::new() }
+        ShortcutTarget { path: path.into(), arguments: String::new(), lnk: PathBuf::new() }
     }
 }
 
@@ -90,7 +92,7 @@ pub fn resolve_lnk(lnk: &Path) -> Option<ShortcutTarget> {
     let (path, arguments) = raw_target(lnk).ok()?;
     let path = PathBuf::from(expand_env(&path));
     let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
-    is_exe.then(|| ShortcutTarget { path, arguments: arguments.trim().to_string() })
+    is_exe.then(|| ShortcutTarget { path, arguments: arguments.trim().to_string(), lnk: lnk.to_path_buf() })
 }
 
 /// Every `.exe` target of the `*.lnk` files under `dirs` (recursive), deduped by path

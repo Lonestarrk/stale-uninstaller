@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::Hive;
 use crate::pathutil::{drive_letter, expand_env, first_path_in_command, norm};
@@ -12,7 +12,6 @@ pub fn service_exes(reg: &dyn RegistryReader) -> HashSet<String> {
     let Ok(names) = reg.subkeys(&key(Hive::LocalMachine, SERVICES_ROOT)) else {
         return HashSet::new();
     };
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     names
         .iter()
         .filter_map(|name| {
@@ -21,7 +20,7 @@ pub fn service_exes(reg: &dyn RegistryReader) -> HashSet<String> {
                 RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ImagePath") => Some(s),
                 _ => None,
             })?;
-            image_path_exe(&image_path, &system_root)
+            normalize_image_path(&image_path).map(|p| norm(&p))
         })
         .collect()
 }
@@ -31,10 +30,11 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.get(..prefix.len()).filter(|head| head.eq_ignore_ascii_case(prefix)).map(|_| &s[prefix.len()..])
 }
 
-/// `ImagePath` -> `norm()`ed exe path. Handles `%VAR%`, NT `\??\` paths, `\SystemRoot\…`
+/// `ImagePath` -> exe path. Handles `%VAR%`, NT `\??\` paths, `\SystemRoot\…`
 /// and paths relative to the Windows folder (`System32\drivers\x.sys`).
-fn image_path_exe(image_path: &str, system_root: &str) -> Option<String> {
-    let expanded = expand_env(image_path.trim());
+pub fn normalize_image_path(raw: &str) -> Option<PathBuf> {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let expanded = expand_env(raw.trim());
     let mut cmd = expanded.as_str();
     if let Some(rest) = strip_prefix_ci(cmd, r"\??\") {
         cmd = rest;
@@ -44,12 +44,11 @@ fn image_path_exe(image_path: &str, system_root: &str) -> Option<String> {
         None => cmd.to_string(),
     };
     let exe = first_path_in_command(&cmd)?;
-    let exe = if drive_letter(&exe).is_none() && !exe.to_string_lossy().starts_with('\\') {
-        Path::new(system_root).join(exe)
+    Some(if drive_letter(&exe).is_none() && !exe.to_string_lossy().starts_with('\\') {
+        Path::new(&system_root).join(exe)
     } else {
         exe
-    };
-    Some(norm(&exe))
+    })
 }
 
 #[cfg(test)]

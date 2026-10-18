@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use super::{RegError, RegValue, RegistryReader};
 use crate::model::{Hive, RegKeyPath};
@@ -20,6 +21,8 @@ struct Node {
 pub struct FakeRegistry {
     /// Keyed by lowercased `"{hive:?}\{path}"` (hive root has no trailing slash).
     keys: BTreeMap<String, Node>,
+    /// Key paths passed to `subkeys`/`values`; see [`FakeRegistry::reads`].
+    reads: Mutex<Vec<String>>,
 }
 
 fn hive_prefix(hive: Hive) -> String {
@@ -52,6 +55,15 @@ impl FakeRegistry {
         }
     }
 
+    /// Every key path (`"{hive:?}\{path}"`) passed to `subkeys`/`values`, in call order.
+    pub fn reads(&self) -> Vec<String> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn record_read(&self, key: &RegKeyPath) {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{:?}{SEP}{}", key.hive, key.path));
+    }
+
     pub fn set(&mut self, key: RegKeyPath, name: &str, value: RegValue) {
         self.add_key(key.clone());
         if let Some(node) = self.keys.get_mut(&norm(&key)) {
@@ -63,6 +75,7 @@ impl FakeRegistry {
 
 impl RegistryReader for FakeRegistry {
     fn subkeys(&self, key: &RegKeyPath) -> Result<Vec<String>, RegError> {
+        self.record_read(key);
         if !self.key_exists(key) {
             return Err(RegError::NotFound);
         }
@@ -77,6 +90,7 @@ impl RegistryReader for FakeRegistry {
     }
 
     fn values(&self, key: &RegKeyPath) -> Result<Vec<(String, RegValue)>, RegError> {
+        self.record_read(key);
         if key.path.trim_matches(SEP).is_empty() {
             return Ok(Vec::new());
         }

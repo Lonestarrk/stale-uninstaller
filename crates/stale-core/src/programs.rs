@@ -50,7 +50,7 @@ fn uninstall_key_names(reg: &dyn RegistryReader, hive: Hive, path: &str) -> Vec<
 
 /// SIDs under `HKU` other than `.DEFAULT`, `*_Classes` and the current user. The current user
 /// is recognized by an Uninstall key with exactly the same subkey names as `HKCU`'s.
-fn other_user_sids(reg: &dyn RegistryReader) -> Vec<String> {
+pub(crate) fn other_user_sids(reg: &dyn RegistryReader) -> Vec<String> {
     let current = uninstall_key_names(reg, Hive::CurrentUser, USER_UNINSTALL);
     reg.subkeys(&key(Hive::Users, ""))
         .unwrap_or_default()

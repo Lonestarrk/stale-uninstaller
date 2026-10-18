@@ -1,15 +1,22 @@
+pub mod acl;
 pub mod devicepath;
+pub mod fsys;
 pub mod knownfolders;
+pub mod leftovers;
 pub mod model;
 pub mod pathutil;
 pub mod paths;
+pub mod proc;
 pub mod programs;
+pub mod quarantine;
 pub mod registry;
+pub mod regwrite;
 pub mod scan;
 pub mod services;
 pub mod settings;
 pub mod shortcuts;
 pub mod size;
+pub mod uninstall;
 pub mod usage;
 
 pub use model::*;

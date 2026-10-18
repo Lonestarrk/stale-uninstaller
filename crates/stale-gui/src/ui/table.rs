@@ -11,8 +11,8 @@ use crate::app::Row;
 use crate::filter::{is_stale, Sort, SortKey};
 use crate::{format, strings};
 
-/// Last-used text colour of rows unused for more than six months.
-const STALE_COLOR: egui::Color32 = egui::Color32::from_rgb(178, 58, 0);
+use super::STALE_COLOR;
+
 const ROW_HEIGHT: f32 = 22.0;
 
 /// The table's mutable view state.

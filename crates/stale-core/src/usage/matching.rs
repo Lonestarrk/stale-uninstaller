@@ -654,7 +654,7 @@ mod tests {
     fn squirrel_update_exe_falls_through_to_process_start_target() {
         let p = prog("Discord", Some(r"C:\Users\X\AppData\Local\Discord"));
         let update = PathBuf::from(r"C:\Users\X\AppData\Local\Discord\Update.exe");
-        let shortcuts = [ShortcutTarget { path: update.clone(), arguments: "--processStart Discord.exe".into() }];
+        let shortcuts = [ShortcutTarget { path: update.clone(), arguments: "--processStart Discord.exe".into(), lnk: PathBuf::new() }];
         let main = PathBuf::from(r"C:\Users\X\AppData\Local\Discord\app-1.0\Discord.exe");
         let roots = vec![(update.clone(), 2_000_000)];
         assert_eq!(main_exes(&p, &shortcuts, &roots, std::slice::from_ref(&main)), vec![main.clone()]);

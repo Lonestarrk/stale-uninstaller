@@ -355,6 +355,7 @@ mod tests {
         src.shortcut_targets = vec![ShortcutTarget {
             path: PathBuf::from(r"C:\Users\X\AppData\Local\Discord\Update.exe"),
             arguments: "--processStart Discord.exe".into(),
+            lnk: PathBuf::new(),
         }];
         let (tx_find, rx_find) = channel();
         let found = main.clone();
