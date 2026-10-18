@@ -26,7 +26,7 @@ pub(crate) fn valid_id(id: &QuarantineId) -> bool {
 /// Writes `dir\<id>\manifest.json` (via a temporary file, so a crash never leaves half a manifest).
 pub fn save_manifest(dir: &Path, m: &QuarantineManifest) -> Result<(), String> {
     if !valid_id(&m.id) {
-        return Err(format!("invalid quarantine id {:?}", m.id.0));
+        return Err(format!("{}: {:?}", super::codes::INVALID_ID, m.id.0));
     }
     let folder = dir.join(&m.id.0);
     std::fs::create_dir_all(&folder).map_err(|e| format!("create {}: {e}", folder.display()))?;

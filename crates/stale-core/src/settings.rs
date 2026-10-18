@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub show_hidden: bool,
     pub quarantine_days: u32,
+    /// The user interface language, `"sv"` or `"en"`; `None` follows the Windows display language.
+    pub language: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { show_hidden: false, quarantine_days: 30 }
+        Settings { show_hidden: false, quarantine_days: 30, language: None }
     }
 }
 
@@ -48,8 +50,8 @@ mod tests {
     fn settings_roundtrip_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("settings.json");
-        assert_eq!(Settings::load_from(&path), Settings { show_hidden: false, quarantine_days: 30 });
-        let s = Settings { show_hidden: true, quarantine_days: 7 };
+        assert_eq!(Settings::load_from(&path), Settings { show_hidden: false, quarantine_days: 30, language: None });
+        let s = Settings { show_hidden: true, quarantine_days: 7, language: None };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
     }
@@ -59,8 +61,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"show_hidden":true,"future":1}"#).unwrap();
-        assert_eq!(Settings::load_from(&path), Settings { show_hidden: true, quarantine_days: 30 });
+        assert_eq!(Settings::load_from(&path), Settings { show_hidden: true, quarantine_days: 30, language: None });
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    #[test]
+    fn settings_language_round_trips_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"show_hidden":false,"quarantine_days":30}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).language, None, "an old file has no language");
+        let s = Settings { language: Some("en".into()), ..Settings::default() };
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).language.as_deref(), Some("en"));
     }
 }

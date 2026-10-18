@@ -31,7 +31,7 @@ pub trait UsageProvider: Send {
 
     /// Like `collect`, plus warnings about partial results (shown to the user, the hits are
     /// still used). `Err` still means the provider produced nothing.
-    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
+    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<crate::scan::ScanWarning>) {
         (self.collect(), vec![])
     }
 }

@@ -1,10 +1,12 @@
 //! Quarantine: leftovers moved aside (files) or exported and deleted (registry) so they can be restored.
 
+pub mod codes;
 pub mod fsmove;
 pub mod ops;
 pub mod store;
 
-pub use ops::{auto_purge, live_free_bytes, live_volume_ok, plan_destinations, DestinationPlan, DRIVE_MISSING, UNKNOWN_CONTENT_LEFT, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
+pub use ops::{auto_purge, live_free_bytes, live_volume_ok, plan_destinations, DestinationPlan, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
+pub use codes::{DRIVE_MISSING, UNKNOWN_CONTENT_LEFT};
 pub use store::{list_manifests, list_trusted_manifests, manifest_path, new_id, owned_by_admins};
 
 use std::collections::BTreeMap;

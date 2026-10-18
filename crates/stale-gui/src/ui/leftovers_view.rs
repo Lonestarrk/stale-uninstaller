@@ -27,7 +27,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let mut action = None;
     let back = back_label(app.leftovers_origin);
     ui.horizontal(|ui| {
-        ui.heading(strings::LEFTOVERS_TITLE);
+        ui.heading(strings::t().leftovers_title);
         if ui.add_enabled(!removing, egui::Button::new(back)).clicked() {
             action = Some(Action::Back);
         }
@@ -52,13 +52,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 ui.label(strings::checked_summary(checked, total, &format::human_size(Some(bytes))));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let asking = app.removal_plan.is_some();
-                    if ui.add_enabled(checked > 0 && !removing && !asking, egui::Button::new(strings::REMOVE_CHECKED)).clicked() {
+                    if ui.add_enabled(checked > 0 && !removing && !asking, egui::Button::new(strings::t().remove_checked)).clicked() {
                         action = Some(Action::Remove);
                     }
-                    if ui.add_enabled(!removing, egui::Button::new(strings::CANCEL)).clicked() {
+                    if ui.add_enabled(!removing, egui::Button::new(strings::t().cancel)).clicked() {
                         action = Some(Action::Back);
                     }
-                    if ui.add_enabled(!removing, egui::Button::new(strings::MARK_SAFE)).clicked() {
+                    if ui.add_enabled(!removing, egui::Button::new(strings::t().mark_safe)).clicked() {
                         action = Some(Action::MarkSafe);
                     }
                 });
@@ -66,7 +66,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         });
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if total == 0 {
-                ui.label(strings::NO_LEFTOVERS);
+                ui.label(strings::t().no_leftovers);
             }
             for (gi, group) in sel.groups.iter_mut().enumerate() {
                 egui::CollapsingHeader::new(&group.program_name)
@@ -95,7 +95,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 /// Before a removal that copies files to C: or lacks space: one line per fallback drive and per
 /// drive short of space; Fortsätt only when there is room.
 fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Option<Action>) {
-    egui::Window::new(strings::REMOVE_CHECKED)
+    egui::Window::new(strings::t().remove_checked)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -108,10 +108,10 @@ fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Op
             }
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(strings::CANCEL).clicked() {
+                if ui.button(strings::t().cancel).clicked() {
                     *action = Some(Action::CancelRemove);
                 }
-                if ui.add_enabled(plan.insufficient.is_empty(), egui::Button::new(strings::CONTINUE)).clicked() {
+                if ui.add_enabled(plan.insufficient.is_empty(), egui::Button::new(strings::t().continue_button)).clicked() {
                     *action = Some(Action::ConfirmRemove);
                 }
             });
@@ -121,7 +121,7 @@ fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Op
 /// One program's leftovers in three sections; check boxes are disabled while a removal runs.
 fn group_body(ui: &mut egui::Ui, group: &mut LeftoverGroup, editable: bool) {
     for (section, title) in
-        [strings::SECTION_FILES, strings::SECTION_REGISTRY, strings::SECTION_OTHER].into_iter().enumerate()
+        [strings::t().section_files, strings::t().section_registry, strings::t().section_other].into_iter().enumerate()
     {
         let indices: Vec<usize> = (0..group.items.len()).filter(|&i| section_of(&group.items[i].kind) == section).collect();
         if indices.is_empty() {
@@ -142,8 +142,8 @@ fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bo
         ui.label(item_text(&item.kind));
         if item.confidence == Confidence::Low {
             let warning = match &item.note {
-                Some(note) => format!("{} {}", strings::WARNING_ICON, note_text(note)),
-                None => strings::WARNING_ICON.to_string(),
+                Some(note) => format!("{} {}", strings::t().warning_icon, note_text(note)),
+                None => strings::t().warning_icon.to_string(),
             };
             ui.colored_label(STALE_COLOR, warning);
         }
@@ -166,7 +166,7 @@ fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], back: &s
                 ui.colored_label(STALE_COLOR, format!("{}: {}", f.what, f.error));
             }
             if !m.services.is_empty() {
-                ui.label(strings::SERVICE_REBOOT);
+                ui.label(strings::t().service_reboot);
             }
             ui.add_space(6.0);
         }
@@ -183,25 +183,25 @@ pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     let ctx = ui.ctx().clone();
     let mut close = false;
     let mut start = false;
-    egui::Window::new(strings::SEARCH_TITLE)
+    egui::Window::new(strings::t().search_title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(&ctx, |ui| {
             egui::Grid::new("leftover_search").num_columns(2).show(ui, |ui| {
-                ui.label(strings::SEARCH_NAME);
+                ui.label(strings::t().search_name);
                 ui.add(egui::TextEdit::singleline(&mut search.name).desired_width(260.0));
                 ui.end_row();
-                ui.label(strings::SEARCH_DIR);
+                ui.label(strings::t().search_dir);
                 ui.add(egui::TextEdit::singleline(&mut search.dir).desired_width(260.0));
                 ui.end_row();
             });
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(strings::CANCEL).clicked() {
+                if ui.button(strings::t().cancel).clicked() {
                     close = true;
                 }
-                if ui.add_enabled(!search.name.trim().is_empty(), egui::Button::new(strings::SEARCH)).clicked() {
+                if ui.add_enabled(!search.name.trim().is_empty(), egui::Button::new(strings::t().search)).clicked() {
                     start = true;
                 }
             });
@@ -218,7 +218,7 @@ pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
 
 /// The back button's text: "Tillbaka" to the ghosts view, else "Till programlistan".
 fn back_label(origin: View) -> &'static str {
-    if origin == View::Ghosts { strings::BACK } else { strings::BACK_TO_PROGRAMS }
+    if origin == View::Ghosts { strings::t().back } else { strings::t().back_to_programs }
 }
 
 /// 0: folders and files, 1: registry, 2: everything else.
@@ -232,13 +232,13 @@ fn section_of(kind: &LeftoverKind) -> usize {
 
 fn kind_label(kind: &LeftoverKind) -> &'static str {
     match kind {
-        LeftoverKind::Dir { .. } => strings::KIND_DIR,
-        LeftoverKind::File { .. } => strings::KIND_FILE,
-        LeftoverKind::RegKey { .. } => strings::KIND_REGKEY,
-        LeftoverKind::RegValue { .. } => strings::KIND_REGVALUE,
-        LeftoverKind::Shortcut { .. } => strings::KIND_SHORTCUT,
-        LeftoverKind::Service { .. } => strings::KIND_SERVICE,
-        LeftoverKind::ScheduledTask { .. } => strings::KIND_TASK,
+        LeftoverKind::Dir { .. } => strings::t().kind_dir,
+        LeftoverKind::File { .. } => strings::t().kind_file,
+        LeftoverKind::RegKey { .. } => strings::t().kind_regkey,
+        LeftoverKind::RegValue { .. } => strings::t().kind_regvalue,
+        LeftoverKind::Shortcut { .. } => strings::t().kind_shortcut,
+        LeftoverKind::Service { .. } => strings::t().kind_service,
+        LeftoverKind::ScheduledTask { .. } => strings::t().kind_task,
     }
 }
 
@@ -268,21 +268,21 @@ pub(crate) fn note_text(note: &str) -> &str {
     use stale_core::ghosts::group as g;
     use stale_core::leftovers as l;
     match note {
-        "user-folder" => strings::NOTE_USER_FOLDER,
-        "shared-publisher-key" => strings::NOTE_SHARED_PUBLISHER,
-        l::NOTE_OTHER_PROGRAM => strings::NOTE_OTHER_PROGRAM,
-        l::NOTE_CONTAINS_USER_DATA => strings::NOTE_CONTAINS_USER_DATA,
-        l::NOTE_SUFFIX_MATCH => strings::NOTE_SUFFIX_MATCH,
-        l::NOTE_PROGID_OF_PROGRAM => strings::NOTE_PROGID_OF_PROGRAM,
-        g::REASON_APPDATA_ONLY => strings::NOTE_APPDATA_ONLY,
-        g::REASON_DATA_ONLY => strings::NOTE_DATA_ONLY,
-        g::REASON_OTHER_PROFILE => strings::NOTE_OTHER_PROFILE,
-        g::REASON_FIRST_WORD => strings::NOTE_FIRST_WORD,
-        g::REASON_WORD_OF_NAME => strings::NOTE_WORD_OF_INSTALLED,
-        g::REASON_SIBLING_OWNED => strings::NOTE_SIBLING_OWNED,
-        g::REASON_PUBLISHER_OF_INSTALLED => strings::NOTE_PUBLISHER_OF_INSTALLED,
-        g::REASON_IN_USE => strings::NOTE_IN_USE,
-        g::REASON_LAUNCHER_LIBRARY => strings::NOTE_LAUNCHER_LIBRARY,
+        "user-folder" => strings::t().note_user_folder,
+        "shared-publisher-key" => strings::t().note_shared_publisher,
+        l::NOTE_OTHER_PROGRAM => strings::t().note_other_program,
+        l::NOTE_CONTAINS_USER_DATA => strings::t().note_contains_user_data,
+        l::NOTE_SUFFIX_MATCH => strings::t().note_suffix_match,
+        l::NOTE_PROGID_OF_PROGRAM => strings::t().note_progid_of_program,
+        g::REASON_APPDATA_ONLY => strings::t().note_appdata_only,
+        g::REASON_DATA_ONLY => strings::t().note_data_only,
+        g::REASON_OTHER_PROFILE => strings::t().note_other_profile,
+        g::REASON_FIRST_WORD => strings::t().note_first_word,
+        g::REASON_WORD_OF_NAME => strings::t().note_word_of_installed,
+        g::REASON_SIBLING_OWNED => strings::t().note_sibling_owned,
+        g::REASON_PUBLISHER_OF_INSTALLED => strings::t().note_publisher_of_installed,
+        g::REASON_IN_USE => strings::t().note_in_use,
+        g::REASON_LAUNCHER_LIBRARY => strings::t().note_launcher_library,
         other => other,
     }
 }
@@ -293,22 +293,22 @@ mod tests {
 
     #[test]
     fn notes_map_to_swedish_and_unknown_pass_through() {
-        assert_eq!(note_text("user-folder"), strings::NOTE_USER_FOLDER);
-        assert_eq!(note_text("shared-publisher-key"), strings::NOTE_SHARED_PUBLISHER);
-        assert_eq!(note_text("used-by-other-program"), strings::NOTE_OTHER_PROGRAM);
+        assert_eq!(note_text("user-folder"), strings::t().note_user_folder);
+        assert_eq!(note_text("shared-publisher-key"), strings::t().note_shared_publisher);
+        assert_eq!(note_text("used-by-other-program"), strings::t().note_other_program);
         for (key, text) in [
-            ("contains-user-data", strings::NOTE_CONTAINS_USER_DATA),
-            ("suffix-match", strings::NOTE_SUFFIX_MATCH),
-            ("progid-of-program", strings::NOTE_PROGID_OF_PROGRAM),
-            ("appdata-only", strings::NOTE_APPDATA_ONLY),
-            ("data-only", strings::NOTE_DATA_ONLY),
-            ("other-profile", strings::NOTE_OTHER_PROFILE),
-            ("first-word-match", strings::NOTE_FIRST_WORD),
-            ("word-of-installed-name", strings::NOTE_WORD_OF_INSTALLED),
-            ("sibling-owned", strings::NOTE_SIBLING_OWNED),
-            ("publisher-of-installed", strings::NOTE_PUBLISHER_OF_INSTALLED),
-            ("in-use", strings::NOTE_IN_USE),
-            ("launcher-library", strings::NOTE_LAUNCHER_LIBRARY),
+            ("contains-user-data", strings::t().note_contains_user_data),
+            ("suffix-match", strings::t().note_suffix_match),
+            ("progid-of-program", strings::t().note_progid_of_program),
+            ("appdata-only", strings::t().note_appdata_only),
+            ("data-only", strings::t().note_data_only),
+            ("other-profile", strings::t().note_other_profile),
+            ("first-word-match", strings::t().note_first_word),
+            ("word-of-installed-name", strings::t().note_word_of_installed),
+            ("sibling-owned", strings::t().note_sibling_owned),
+            ("publisher-of-installed", strings::t().note_publisher_of_installed),
+            ("in-use", strings::t().note_in_use),
+            ("launcher-library", strings::t().note_launcher_library),
         ] {
             assert_eq!(note_text(key), text, "{key}");
         }
@@ -317,8 +317,8 @@ mod tests {
 
     #[test]
     fn back_button_names_its_destination() {
-        assert_eq!(back_label(View::Ghosts), strings::BACK);
-        assert_eq!(back_label(View::Programs), strings::BACK_TO_PROGRAMS);
+        assert_eq!(back_label(View::Ghosts), strings::t().back);
+        assert_eq!(back_label(View::Programs), strings::t().back_to_programs);
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
             item_text(&LeftoverKind::RegValue { key: key(Hive::CurrentUser), name: "Foo".into() }),
             r"HKCU\Software\Foo → Foo"
         );
-        assert_eq!(kind_label(&LeftoverKind::RegValue { key: key(Hive::Users), name: String::new() }), strings::KIND_REGVALUE);
+        assert_eq!(kind_label(&LeftoverKind::RegValue { key: key(Hive::Users), name: String::new() }), strings::t().kind_regvalue);
     }
 
     #[test]

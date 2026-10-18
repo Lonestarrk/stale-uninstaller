@@ -22,7 +22,7 @@ enum Action {
 
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let ctx = ui.ctx().clone();
-    let window = egui::Window::new(strings::QUEUE_TITLE)
+    let window = egui::Window::new(strings::t().queue_title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]);
@@ -55,7 +55,7 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
         for entry in &pending.entries {
             if entry.scope == Scope::OtherUser {
                 ui.label(strings::other_account_item(&entry.name, entry.account.as_deref()));
-                ui.weak(entry.uninstall_path.as_deref().unwrap_or(strings::UNKNOWN_VALUE));
+                ui.weak(entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
             } else {
                 ui.label(&entry.name);
             }
@@ -63,22 +63,22 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
     });
     if pending.entries.iter().any(|e| e.scope == Scope::OtherUser) {
         ui.separator();
-        ui.label(strings::OTHER_ACCOUNT_QUEUE);
+        ui.label(strings::t().other_account_queue);
     }
     ui.separator();
-    ui.checkbox(&mut pending.restore_point, strings::OPT_RESTORE_POINT);
+    ui.checkbox(&mut pending.restore_point, strings::t().opt_restore_point);
     let normal = pending.mode == UninstallMode::Normal;
     if !normal {
         pending.run_vendor = false;
     }
-    ui.add_enabled(normal, egui::Checkbox::new(&mut pending.run_vendor, strings::OPT_RUN_VENDOR));
+    ui.add_enabled(normal, egui::Checkbox::new(&mut pending.run_vendor, strings::t().opt_run_vendor));
     ui.separator();
     let mut action = None;
     ui.horizontal(|ui| {
-        if ui.button(strings::CANCEL).clicked() {
+        if ui.button(strings::t().cancel).clicked() {
             action = Some(Action::Cancel);
         }
-        if ui.button(strings::START).clicked() {
+        if ui.button(strings::t().start).clicked() {
             action = Some(Action::Start);
         }
     });
@@ -90,14 +90,14 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
     let mut action = None;
     ui.horizontal(|ui| {
         let steps = [
-            (Step::RestorePoint, strings::STEP_RESTORE_POINT),
-            (Step::Vendor, strings::STEP_VENDOR),
-            (Step::Leftovers, strings::STEP_LEFTOVERS),
-            (Step::Done, strings::STEP_DONE),
+            (Step::RestorePoint, strings::t().step_restore_point),
+            (Step::Vendor, strings::t().step_vendor),
+            (Step::Leftovers, strings::t().step_leftovers),
+            (Step::Done, strings::t().step_done),
         ];
         for (i, (step, label)) in steps.into_iter().enumerate() {
             if i > 0 {
-                ui.weak(strings::STEP_SEPARATOR);
+                ui.weak(strings::t().step_separator);
             }
             if step == flow.step {
                 ui.strong(label);
@@ -108,7 +108,7 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
     });
     ui.separator();
     if let Some(status) = &flow.restore_point {
-        ui.label(format!("{}: {}", strings::RESTORE_POINT_LABEL, restore_point_text(status)));
+        ui.label(format!("{}: {}", strings::t().restore_point_label, restore_point_text(status)));
     }
     egui::Grid::new("queue_items").num_columns(2).striped(true).show(ui, |ui| {
         for (id, name, state) in &flow.items {
@@ -116,8 +116,8 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
             ui.horizontal(|ui| {
                 ui.label(state_text(state));
                 if flow.finished && matches!(state, ItemState::NotUninstalled { .. }) {
-                    for (label, mode) in [(strings::RETRY, UninstallMode::Normal), (strings::FORCE_REMOVE, UninstallMode::Forced)] {
-                        let button = ui.add_enabled(can_requeue, egui::Button::new(label)).on_disabled_hover_text(strings::LOADING);
+                    for (label, mode) in [(strings::t().retry, UninstallMode::Normal), (strings::t().force_remove, UninstallMode::Forced)] {
+                        let button = ui.add_enabled(can_requeue, egui::Button::new(label)).on_disabled_hover_text(strings::t().loading);
                         if button.clicked() {
                             action = Some(Action::Requeue(id.clone(), mode));
                         }
@@ -138,16 +138,16 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
         if !flow.finished {
             ui.spinner();
             if flow.step == Step::Vendor
-                && ui.button(strings::STOP_WAITING).on_hover_text(strings::STOP_WAITING_TIP).clicked()
+                && ui.button(strings::t().stop_waiting).on_hover_text(strings::t().stop_waiting_tip).clicked()
             {
                 action = Some(Action::StopWaiting);
             }
             return;
         }
-        if ui.add_enabled(!flow.reports.is_empty(), egui::Button::new(strings::SHOW_LEFTOVERS)).clicked() {
+        if ui.add_enabled(!flow.reports.is_empty(), egui::Button::new(strings::t().show_leftovers)).clicked() {
             action = Some(Action::ShowLeftovers);
         }
-        if ui.button(strings::CLOSE).clicked() {
+        if ui.button(strings::t().close).clicked() {
             action = Some(Action::Close);
         }
     });
@@ -156,24 +156,24 @@ fn progress(ui: &mut egui::Ui, flow: &FlowState, can_requeue: bool) -> Option<Ac
 
 fn restore_point_text(status: &RestorePointStatus) -> String {
     match status {
-        RestorePointStatus::Created(_) => strings::RP_CREATED.to_string(),
-        RestorePointStatus::SkippedFrequency => strings::RP_SKIPPED.to_string(),
-        RestorePointStatus::Disabled => strings::RP_DISABLED.to_string(),
-        RestorePointStatus::Failed(e) => format!("{}: {e}", strings::RP_FAILED),
+        RestorePointStatus::Created(_) => strings::t().rp_created.to_string(),
+        RestorePointStatus::SkippedFrequency => strings::t().rp_skipped.to_string(),
+        RestorePointStatus::Disabled => strings::t().rp_disabled.to_string(),
+        RestorePointStatus::Failed(e) => format!("{}: {e}", strings::t().rp_failed),
     }
 }
 
 fn state_text(state: &ItemState) -> String {
     match state {
-        ItemState::Pending => strings::STATE_PENDING.to_string(),
-        ItemState::Running => strings::STATE_RUNNING.to_string(),
-        ItemState::Uninstalled => strings::STATE_UNINSTALLED.to_string(),
-        ItemState::Forced => strings::STATE_FORCED.to_string(),
+        ItemState::Pending => strings::t().state_pending.to_string(),
+        ItemState::Running => strings::t().state_running.to_string(),
+        ItemState::Uninstalled => strings::t().state_uninstalled.to_string(),
+        ItemState::Forced => strings::t().state_forced.to_string(),
         ItemState::NotUninstalled { exit_code: Some(code) } => {
-            format!("{} ({} {code})", strings::STATE_NOT_UNINSTALLED, strings::EXIT_CODE)
+            format!("{} ({} {code})", strings::t().state_not_uninstalled, strings::t().exit_code)
         }
-        ItemState::NotUninstalled { exit_code: None } => strings::STATE_NOT_UNINSTALLED.to_string(),
-        ItemState::Skipped => strings::STATE_SKIPPED.to_string(),
+        ItemState::NotUninstalled { exit_code: None } => strings::t().state_not_uninstalled.to_string(),
+        ItemState::Skipped => strings::t().state_skipped.to_string(),
     }
 }
 

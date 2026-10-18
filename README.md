@@ -1,6 +1,6 @@
 # Stale Uninstaller
 
-A Windows uninstaller that tells you **when you last used each program**, so you can find the ones that just take up space, remove them, and clean up what they leave behind. The user interface is in Swedish.
+A Windows uninstaller that tells you **when you last used each program**, so you can find the ones that just take up space, remove them, and clean up what they leave behind. The user interface is available in English and Swedish.
 
 ## Features
 
@@ -10,9 +10,10 @@ A Windows uninstaller that tells you **when you last used each program**, so you
 - **Leftover cleanup.** After uninstalling, Stale finds what was left behind in the file system, registry, services, scheduled tasks and shortcuts, grouped by confidence. Anything that might be your own data is unchecked by default.
 - **Quarantine instead of delete.** Removed files move to a quarantine folder on the same drive and registry keys are exported first, so everything can be undone with one click. Empty the quarantine when you need the space, or let it clean itself after 30 days.
 - **Ghost programs.** Finds programs that are already uninstalled but left folders, registry keys, dangling autostart, file-type, service, task or shortcut references, or execution traces behind. The evidence is grouped per program and rated "probably uninstalled", "leftovers only" or "uncertain". Uncertain ones, such as data that may belong to an installed program or another user, are never pre-checked.
-- **Keep list.** Mark any folder, key or program as "Behåll" and it is left alone in every future scan.
+- **Keep list.** Mark any folder, key or program as "Keep" and it is left alone in every future scan.
 - **Standalone leftover search** by name for programs that are no longer in the list.
 - **Safety first.** Runs as administrator and treats everything it touches with suspicion: system tools are loaded only from System32, quarantine folders are locked down to administrators, junctions are refused, and nothing is deleted outright.
+- **English and Swedish.** Follows the Windows display language on first start; switch any time in the settings menu.
 
 ## Future features
 

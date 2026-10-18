@@ -28,11 +28,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
     let removing = app.removal_running();
     let mut action = None;
     ui.horizontal(|ui| {
-        ui.heading(strings::GHOSTS_TITLE);
-        if ui.button(strings::BACK_TO_PROGRAMS).clicked() {
+        ui.heading(strings::t().ghosts_title);
+        if ui.button(strings::t().back_to_programs).clicked() {
             action = Some(Action::Back);
         }
-        if ui.add_enabled(!busy, egui::Button::new(strings::REFRESH)).clicked() {
+        if ui.add_enabled(!busy, egui::Button::new(strings::t().refresh)).clicked() {
             action = Some(Action::Refresh);
         }
     });
@@ -40,7 +40,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
     if let Some(kept) = &app.last_kept {
         ui.horizontal(|ui| {
             ui.label(strings::kept_notice(&kept.ghost.name));
-            if ui.button(strings::UNDO).clicked() {
+            if ui.button(strings::t().undo).clicked() {
                 action = Some(Action::UndoKeep);
             }
         });
@@ -48,13 +48,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
     if busy {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label(strings::GHOSTS_SCANNING);
+            ui.label(strings::t().ghosts_scanning);
         });
     } else if app.ghosts.is_none() {
-        ui.label(strings::GHOSTS_NOT_SCANNED);
+        ui.label(strings::t().ghosts_not_scanned);
     } else if let Some(sel) = app.ghosts.as_mut() {
         if sel.ghosts.is_empty() {
-            ui.label(strings::GHOSTS_EMPTY);
+            ui.label(strings::t().ghosts_empty);
         } else {
             let (checked, total, bytes) = sel.summary();
             let can_show = checked > 0 && !removing;
@@ -63,7 +63,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
                 ui.horizontal(|ui| {
                     ui.label(strings::ghost_summary(checked, total, &format::human_size(Some(bytes))));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(can_show, egui::Button::new(strings::SHOW_GHOST_LEFTOVERS)).clicked() {
+                        if ui.add_enabled(can_show, egui::Button::new(strings::t().show_ghost_leftovers)).clicked() {
                             action = Some(Action::ShowLeftovers);
                         }
                     });
@@ -108,15 +108,15 @@ pub fn keep_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     let ctx = ui.ctx().clone();
     let mut open = true;
     let mut remove = None;
-    egui::Window::new(strings::KEPT_TITLE).open(&mut open).collapsible(false).show(&ctx, |ui| {
+    egui::Window::new(strings::t().kept_title).open(&mut open).collapsible(false).show(&ctx, |ui| {
         if keep_entries(&app.keep).is_empty() {
-            ui.label(strings::KEPT_EMPTY);
+            ui.label(strings::t().kept_empty);
             return;
         }
         egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
             for (entry, text) in keep_entries(&app.keep) {
                 ui.horizontal(|ui| {
-                    if ui.button(strings::KEPT_REMOVE).clicked() {
+                    if ui.button(strings::t().kept_remove).clicked() {
                         remove = Some(entry.clone());
                     }
                     ui.label(text);
@@ -155,13 +155,13 @@ fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime
         ui.label(format::human_size(Some(ghost.total_size)));
         ui.label(format::relative_date(ghost.last_used, now));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(strings::KEEP).on_hover_text(strings::KEEP_TIP).clicked() {
+            if ui.button(strings::t().keep).on_hover_text(strings::t().keep_tip).clicked() {
                 *action = Some(Action::Keep(ghost.key.clone()));
             }
         });
     });
     if let Some(why) = uncertainty_text(ghost) {
-        ui.colored_label(STALE_COLOR, format!("{} {why}", strings::WARNING_ICON));
+        ui.colored_label(STALE_COLOR, format!("{} {why}", strings::t().warning_icon));
     }
     let lines: Vec<String> = ghost.evidence.iter().map(evidence_line).collect();
     egui::CollapsingHeader::new(strings::evidence_header(lines.len()))
@@ -185,30 +185,30 @@ fn section_title(a: Assessment, count: usize) -> String {
 
 fn assessment_label(a: Assessment) -> &'static str {
     match a {
-        Assessment::ProbablyUninstalled => strings::ASSESS_PROBABLY,
-        Assessment::LeftoversOnly => strings::ASSESS_LEFTOVERS,
-        Assessment::Uncertain => strings::ASSESS_UNCERTAIN,
+        Assessment::ProbablyUninstalled => strings::t().assess_probably,
+        Assessment::LeftoversOnly => strings::t().assess_leftovers,
+        Assessment::Uncertain => strings::t().assess_uncertain,
     }
 }
 
-/// The reasons and the note in Swedish, joined; `None` when there are none.
+/// The reasons and the note in the user's language, joined; `None` when there are none.
 fn uncertainty_text(ghost: &Ghost) -> Option<String> {
     let mut parts: Vec<&str> = ghost.reasons.iter().map(|r| note_text(r)).collect();
     if let Some(note) = ghost.note.as_deref().filter(|n| !ghost.reasons.iter().any(|r| r == n)) {
         parts.push(note_text(note));
     }
-    (!parts.is_empty()).then(|| parts.join(strings::LIST_SEPARATOR))
+    (!parts.is_empty()).then(|| parts.join(strings::t().list_separator))
 }
 
 fn ref_label(kind: RefKind) -> &'static str {
     match kind {
-        RefKind::Run => strings::REF_RUN,
-        RefKind::AppPaths => strings::REF_APP_PATHS,
-        RefKind::ClassesServer => strings::REF_CLASSES_SERVER,
-        RefKind::ShellCommand => strings::REF_SHELL_COMMAND,
-        RefKind::Service => strings::REF_SERVICE,
-        RefKind::ScheduledTask => strings::REF_TASK,
-        RefKind::Shortcut => strings::REF_SHORTCUT,
+        RefKind::Run => strings::t().ref_run,
+        RefKind::AppPaths => strings::t().ref_app_paths,
+        RefKind::ClassesServer => strings::t().ref_classes_server,
+        RefKind::ShellCommand => strings::t().ref_shell_command,
+        RefKind::Service => strings::t().ref_service,
+        RefKind::ScheduledTask => strings::t().ref_task,
+        RefKind::Shortcut => strings::t().ref_shortcut,
     }
 }
 
@@ -268,7 +268,7 @@ mod tests {
         };
         assert_eq!(
             evidence_line(&run),
-            strings::evidence_ref(strings::REF_RUN, r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", r"C:\Foo\foo.exe")
+            strings::evidence_ref(strings::t().ref_run, r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", r"C:\Foo\foo.exe")
         );
         let task = Evidence::DanglingRef {
             kind: RefKind::ScheduledTask,
@@ -276,12 +276,12 @@ mod tests {
             target: r"C:\Foo\up.exe".into(),
             value_name: None,
         };
-        assert_eq!(evidence_line(&task), strings::evidence_ref(strings::REF_TASK, r"Vendor\Updater", r"C:\Foo\up.exe"));
+        assert_eq!(evidence_line(&task), strings::evidence_ref(strings::t().ref_task, r"Vendor\Updater", r"C:\Foo\up.exe"));
         let when = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
         let usage = Evidence::UsageTrace { exe: r"C:\Foo\foo.exe".into(), last_run: when, source: UsageSource::Prefetch };
         assert_eq!(
             evidence_line(&usage),
-            strings::evidence_usage(&format::ymd(Some(format::local_date(when))), strings::SOURCE_PREFETCH, r"C:\Foo\foo.exe")
+            strings::evidence_usage(&format::ymd(Some(format::local_date(when))), strings::t().source_prefetch, r"C:\Foo\foo.exe")
         );
     }
 
@@ -291,10 +291,10 @@ mod tests {
         assert_eq!(uncertainty_text(&g), None);
         g.reasons = vec![REASON_SIBLING_OWNED.into(), REASON_OTHER_PROFILE.into()];
         g.note = Some(REASON_OTHER_PROFILE.into());
-        let both = format!("{}{}{}", strings::NOTE_SIBLING_OWNED, strings::LIST_SEPARATOR, strings::NOTE_OTHER_PROFILE);
+        let both = format!("{}{}{}", strings::t().note_sibling_owned, strings::t().list_separator, strings::t().note_other_profile);
         assert_eq!(uncertainty_text(&g), Some(both));
         g.reasons.clear();
-        assert_eq!(uncertainty_text(&g).as_deref(), Some(strings::NOTE_OTHER_PROFILE));
+        assert_eq!(uncertainty_text(&g).as_deref(), Some(strings::t().note_other_profile));
     }
 
     #[test]
@@ -321,13 +321,13 @@ mod tests {
 
     #[test]
     fn badges_and_ref_labels_are_swedish() {
-        assert_eq!(assessment_label(Assessment::ProbablyUninstalled), strings::ASSESS_PROBABLY);
-        assert_eq!(assessment_label(Assessment::LeftoversOnly), strings::ASSESS_LEFTOVERS);
-        assert_eq!(assessment_label(Assessment::Uncertain), strings::ASSESS_UNCERTAIN);
+        assert_eq!(assessment_label(Assessment::ProbablyUninstalled), strings::t().assess_probably);
+        assert_eq!(assessment_label(Assessment::LeftoversOnly), strings::t().assess_leftovers);
+        assert_eq!(assessment_label(Assessment::Uncertain), strings::t().assess_uncertain);
         assert_eq!(section_title(Assessment::ProbablyUninstalled, 2), "Troligen avinstallerade (2)");
         assert_eq!(section_title(Assessment::LeftoversOnly, 1), "Rester utan installation (bocka i själv) (1)");
         assert_eq!(section_title(Assessment::Uncertain, 3), "Osäkra (3)");
-        assert_eq!(ref_label(RefKind::ClassesServer), strings::REF_CLASSES_SERVER);
-        assert_eq!(ref_label(RefKind::Shortcut), strings::REF_SHORTCUT);
+        assert_eq!(ref_label(RefKind::ClassesServer), strings::t().ref_classes_server);
+        assert_eq!(ref_label(RefKind::Shortcut), strings::t().ref_shortcut);
     }
 }

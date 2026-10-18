@@ -39,12 +39,12 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
         .header(ROW_HEIGHT, |mut header| {
             header.col(|_| {});
             for (key, title) in [
-                (SortKey::Name, strings::COL_NAME),
-                (SortKey::Publisher, strings::COL_PUBLISHER),
-                (SortKey::Drive, strings::COL_DRIVE),
-                (SortKey::Size, strings::COL_SIZE),
-                (SortKey::Installed, strings::COL_INSTALLED),
-                (SortKey::LastUsed, strings::COL_LAST_USED),
+                (SortKey::Name, strings::t().col_name),
+                (SortKey::Publisher, strings::t().col_publisher),
+                (SortKey::Drive, strings::t().col_drive),
+                (SortKey::Size, strings::t().col_size),
+                (SortKey::Installed, strings::t().col_installed),
+                (SortKey::LastUsed, strings::t().col_last_used),
             ] {
                 header.col(|ui| {
                     let text = match (sort.key == key, sort.ascending) {
@@ -79,7 +79,7 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                     ui.label(&row.program.name);
                 });
                 table_row.col(|ui| {
-                    ui.label(row.program.publisher.as_deref().unwrap_or(strings::UNKNOWN_VALUE));
+                    ui.label(row.program.publisher.as_deref().unwrap_or(strings::t().unknown_value));
                 });
                 table_row.col(|ui| drive_badge(ui, row.program.drive));
                 table_row.col(|ui| {
@@ -90,7 +90,7 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                 });
                 table_row.col(|ui| {
                     if row.usage.is_none() {
-                        ui.label(strings::PENDING);
+                        ui.label(strings::t().pending);
                         return;
                     }
                     let last_used = row.last_used();
@@ -110,7 +110,7 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
 
 /// The drive letter in a small rounded frame.
 fn drive_badge(ui: &mut egui::Ui, drive: Option<char>) {
-    let text = drive.map_or_else(|| strings::UNKNOWN_DRIVE.to_string(), |d| format!("{d}:"));
+    let text = drive.map_or_else(|| strings::t().unknown_drive.to_string(), |d| format!("{d}:"));
     egui::Frame::new()
         .fill(ui.visuals().widgets.inactive.weak_bg_fill)
         .corner_radius(4)

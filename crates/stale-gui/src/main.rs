@@ -7,7 +7,7 @@ use stale_core::quarantine::{auto_purge, QuarantineOps};
 use stale_core::settings::Settings;
 use stale_gui::app::StaleApp;
 use stale_gui::logging;
-use stale_gui::strings::{ALREADY_RUNNING, APP_TITLE, E2E_BUILD_REFUSED};
+use stale_gui::strings::{self, t};
 
 /// Name of the machine-wide mutex that marks a running Stale Uninstaller.
 const INSTANCE_MUTEX: &str = r"Global\StaleUninstaller";
@@ -38,21 +38,24 @@ fn message_box(text: &str, error: bool) {
     use windows::core::PCWSTR;
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
     let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = APP_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = t().app_title.encode_utf16().chain(std::iter::once(0)).collect();
     let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
     // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
     unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | icon) };
 }
 
 fn main() -> eframe::Result {
+    // Before any text is shown: the saved language, else the Windows display language.
+    let settings = Settings::load_from(&Settings::path());
+    strings::set_lang(strings::startup_lang(settings.language.as_deref()));
     // A build whose stale-core has the test-only environment overrides (e.g. `--all-features`)
     // would trust whatever STALE_E2E_* says: never run it.
     if stale_core::E2E_OVERRIDES {
-        message_box(E2E_BUILD_REFUSED, true);
+        message_box(t().e2e_build_refused, true);
         std::process::exit(1);
     }
     if !single_instance() {
-        message_box(ALREADY_RUNNING, false);
+        message_box(t().already_running, false);
         return Ok(());
     }
     // Before anything (the log included) is written below the data folder.
@@ -67,12 +70,13 @@ fn main() -> eframe::Result {
         Ok(warnings) => warnings.iter().for_each(|w| log::warn!("data folder: {w}")),
         Err(e) => log::warn!("could not lock down the data folder: {e}"),
     }
-    spawn_auto_purge(Settings::load_from(&Settings::path()).quarantine_days);
+    log::info!("language: {}", strings::lang().code());
+    spawn_auto_purge(settings.quarantine_days);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(APP_TITLE),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(t().app_title),
         ..Default::default()
     };
-    eframe::run_native(APP_TITLE, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
+    eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
 }
 
 /// Purges quarantines older than `days` on the "stale-auto-purge" thread, so the window never waits.

@@ -34,8 +34,32 @@ pub enum ScanEvent {
     UnmatchedHits(Vec<UsageHit>),
     /// Measured install-folder sizes in bytes, only for programs without a registry estimate.
     Sizes(HashMap<ProgramId, u64>),
-    Warning(String),
+    Warning(ScanWarning),
     Done,
+}
+
+/// Something the user should know about a scan; the GUI words it in the user's language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanWarning {
+    /// `skipped` of the `total` Prefetch files could not be parsed; the rest were used.
+    PrefetchUnreadable { skipped: usize, total: usize },
+    /// The usage source `source` (e.g. `"BAM"`) produced nothing; `error` is the technical detail.
+    SourceFailed { source: String, error: String },
+    /// The scan thread could not be started; `error` is the technical detail.
+    ThreadFailed { error: String },
+}
+
+impl std::fmt::Display for ScanWarning {
+    /// English, for the log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanWarning::PrefetchUnreadable { skipped, total } => {
+                write!(f, "Prefetch: {skipped} of {total} files could not be read")
+            }
+            ScanWarning::SourceFailed { source, error } => write!(f, "{source}: {error}"),
+            ScanWarning::ThreadFailed { error } => write!(f, "could not start the scan thread: {error}"),
+        }
+    }
 }
 
 /// Lists `*.exe` files directly in a folder, with sizes.
@@ -146,7 +170,7 @@ pub struct UsageInputs {
     pub task_exes: HashSet<String>,
     pub autostart_exes: HashSet<String>,
     /// Provider failures and partial-result warnings, for the user.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<ScanWarning>,
 }
 
 impl UsageInputs {
@@ -195,7 +219,7 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
         warnings.extend(provider_warnings);
         match result {
             Ok(h) => hits.extend(h),
-            Err(e) => warnings.push(format!("{}: {}", provider.name(), e)),
+            Err(error) => warnings.push(ScanWarning::SourceFailed { source: provider.name().to_string(), error }),
         }
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
@@ -271,8 +295,8 @@ mod tests {
         fn collect(&self) -> Result<Vec<UsageHit>, String> {
             Ok(vec![])
         }
-        fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
-            (Ok(vec![]), vec!["Prefetch: 2 av 9 filer kunde inte läsas".to_string()])
+        fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<ScanWarning>) {
+            (Ok(vec![]), vec![ScanWarning::PrefetchUnreadable { skipped: 2, total: 9 }])
         }
     }
 
@@ -457,7 +481,8 @@ mod tests {
     #[test]
     fn scan_continues_when_provider_fails() {
         let events = run(sources(FixedProvider(Err("boom".into()))));
-        assert!(events.iter().any(|e| matches!(e, ScanEvent::Warning(w) if w.contains("boom") && w.contains("Fixed"))));
+        let failed = ScanWarning::SourceFailed { source: "Fixed".into(), error: "boom".into() };
+        assert!(events.iter().any(|e| matches!(e, ScanEvent::Warning(w) if *w == failed)));
         assert!(matches!(events.last(), Some(ScanEvent::Done)));
     }
 
@@ -468,7 +493,7 @@ mod tests {
         let events = run(src);
         let kinds: Vec<_> = events.iter().map(kind).collect();
         assert_eq!(kinds, ["Programs", "Warning", "Usage", "UnmatchedHits", "Sizes", "Done"]);
-        assert!(matches!(&events[1], ScanEvent::Warning(w) if w == "Prefetch: 2 av 9 filer kunde inte läsas"));
+        assert!(matches!(&events[1], ScanEvent::Warning(ScanWarning::PrefetchUnreadable { skipped: 2, total: 9 })));
     }
 
     #[test]

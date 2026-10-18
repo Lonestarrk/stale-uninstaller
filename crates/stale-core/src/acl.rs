@@ -216,7 +216,7 @@ fn pin_folder(path: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let md = file.metadata().map_err(|e| format!("read {}: {e}", path.display()))?;
     if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(format!("{} is a link or reparse point", path.display()));
+        return Err(format!("{}: {}", crate::quarantine::codes::IS_REPARSE, path.display()));
     }
     if !md.is_dir() {
         return Err(format!("{} is not a folder", path.display()));
@@ -269,7 +269,9 @@ pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, Strin
 fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec<String>, String> {
     let mut created_by_us = created_by_us;
     match std::fs::symlink_metadata(path) {
-        Ok(_) if (ops.is_reparse)(path) => return Err(format!("{} is a link or reparse point", path.display())),
+        Ok(_) if (ops.is_reparse)(path) => {
+            return Err(format!("{}: {}", crate::quarantine::codes::IS_REPARSE, path.display()))
+        }
         Ok(md) if !md.is_dir() => return Err(format!("{} is not a folder", path.display())),
         Ok(_) => {}
         Err(_) => {
