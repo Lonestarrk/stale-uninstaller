@@ -5,7 +5,7 @@ use super::folders::per_profile_kind;
 use super::{is_container_folder, is_skipped_folder, parse_location, Evidence, InstalledIndex, RefKind, RootKind};
 use crate::keep::KeepList;
 use crate::leftovers::fs_scan::FsScanRoots;
-use crate::leftovers::names::{is_matchable, normalize_name, publisher_matches};
+use crate::leftovers::names::{is_matchable, name_matches_exact, normalize_name, publisher_matches};
 use crate::leftovers::scan::{dedupe_key, kind_group, rank};
 use crate::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
 use crate::model::{Program, RegKeyPath};
@@ -50,8 +50,12 @@ pub const REASON_WORD_OF_NAME: &str = "word-of-installed-name";
 pub const REASON_SIBLING_OWNED: &str = "sibling-owned";
 /// A folder lies in another user's profile, whose per-user installs are invisible to us.
 pub const REASON_OTHER_PROFILE: &str = "other-profile";
+/// The name is an installed program's publisher (`Binary Fortress Software` for DisplayFusion).
+pub const REASON_PUBLISHER_OF_INSTALLED: &str = "publisher-of-installed";
 /// The only evidence is AppData folders.
 pub const REASON_APPDATA_ONLY: &str = "appdata-only";
+/// The only evidence is ProgramData and AppData folders (data, not a program).
+pub const REASON_DATA_ONLY: &str = "data-only";
 /// `Ghost::note` of a ghost with a folder in another user's profile.
 pub const NOTE_OTHER_PROFILE: &str = "other-profile";
 
@@ -64,6 +68,9 @@ pub struct NameRoots {
     pub roots: Vec<String>,
     /// Publishers of the installed programs.
     pub publishers: Vec<String>,
+    /// Folder names of the user profiles (`Jobb` for `C:\Users\Jobb`): a folder named like one is
+    /// another user's deploy root, never a ghost.
+    pub profile_names: Vec<String>,
 }
 
 impl NameRoots {
@@ -85,7 +92,17 @@ impl NameRoots {
                 publishers.push(p.to_string());
             }
         }
-        NameRoots { roots, publishers }
+        let profile_names = profiles.iter().filter_map(|p| file_name(p)).collect();
+        NameRoots { roots, publishers, profile_names }
+    }
+
+    fn is_profile_name(&self, name: &str) -> bool {
+        self.profile_names.iter().any(|p| p.eq_ignore_ascii_case(name))
+    }
+
+    /// True when `name` is (a form of) an installed publisher.
+    fn is_installed_publisher(&self, name: &str) -> bool {
+        self.publishers.iter().any(|p| publisher_matches(name, p))
     }
 
     /// True when `n` ([`norm`]ed) is one of the roots.
@@ -101,7 +118,7 @@ impl NameRoots {
     /// A publisher folder: in [`CONTAINER_FOLDERS`](super::CONTAINER_FOLDERS) or named after an
     /// installed publisher.
     fn is_publisher_folder(&self, name: &str) -> bool {
-        is_container_folder(name) || self.publishers.iter().any(|p| publisher_matches(name, p))
+        is_container_folder(name) || self.is_installed_publisher(name)
     }
 }
 
@@ -137,26 +154,23 @@ fn usable(name: &str) -> bool {
     is_matchable(name) && !has_id_token(name)
 }
 
-/// The program folder of `file`: the first folder below a known root, or the second when the
-/// first is a publisher folder. `None` when that folder is skipped or not matchable.
-fn name_below_root(file: &Path, roots: &NameRoots) -> Option<String> {
+/// The program folder of `file` and its name: the first folder below a known root, or the second
+/// when the first is a publisher folder (`root[\publisher]\name`). `None` when that folder is
+/// skipped or not matchable.
+fn program_folder(file: &Path, roots: &NameRoots) -> Option<(PathBuf, String)> {
     let dir = file.parent()?;
     drive_letter(dir)?;
     let root = roots.root_of(&norm(dir))?;
     let depth = root.split('\\').filter(|c| !c.is_empty()).count();
-    let below: Vec<String> = dir
-        .to_string_lossy()
-        .split(['\\', '/'])
-        .filter(|c| !c.is_empty())
-        .skip(depth)
-        .map(str::to_string)
-        .collect();
-    let first = below.first()?;
+    let dir = dir.to_string_lossy();
+    let parts: Vec<&str> = dir.split(['\\', '/']).filter(|c| !c.is_empty()).collect();
+    let first = *parts.get(depth)?;
     if is_skipped_folder(first) {
         return None;
     }
-    let name = if roots.is_publisher_folder(first) { below.get(1)? } else { first };
-    (usable(name) && !is_skipped_folder(name)).then(|| name.clone())
+    let at = if roots.is_publisher_folder(first) { depth + 1 } else { depth };
+    let name = *parts.get(at)?;
+    (usable(name) && !is_skipped_folder(name)).then(|| (PathBuf::from(parts[..=at].join(r"\")), name.to_string()))
 }
 
 /// The key leaf, or its parent's when the leaf is a version or a generic name.
@@ -170,11 +184,18 @@ fn key_name(k: &RegKeyPath) -> Option<String> {
 /// The program name a piece of evidence points at; `None` when nothing matchable names it.
 pub fn ghost_name_of(e: &Evidence, roots: &NameRoots) -> Option<String> {
     match e {
-        Evidence::Folder { path, .. } => file_name(path).filter(|n| usable(n)),
+        Evidence::Folder { path, .. } => file_name(path).filter(|n| usable(n) && !roots.is_profile_name(n)),
         Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => key_name(key),
-        Evidence::DanglingRef { target, .. } => name_below_root(target, roots),
-        Evidence::UsageTrace { exe, .. } => name_below_root(exe, roots),
+        Evidence::DanglingRef { target, .. } => program_folder(target, roots).map(|(_, name)| name),
+        Evidence::UsageTrace { exe, .. } => program_folder(exe, roots).map(|(_, name)| name),
     }
+}
+
+/// A dangling reference into a folder an installed program still occupies: that program's own
+/// broken registration (an old version's file handlers), not a leftover.
+fn is_installed_programs_own(e: &Evidence, installed: &InstalledIndex, roots: &NameRoots) -> bool {
+    let Evidence::DanglingRef { target, .. } = e else { return false };
+    program_folder(target, roots).is_some_and(|(folder, _)| installed.covers_path(&folder) || installed.holds_location(&folder))
 }
 
 /// The publisher folder a [`Evidence::Folder`] sits in: its parent, when that is not a root.
@@ -194,7 +215,8 @@ fn in_other_profile(e: &Evidence, current_profile: Option<&Path>) -> bool {
 }
 
 /// The assessment and, for [`Assessment::Uncertain`], the reasons. The name and folder reasons
-/// override strong evidence; [`REASON_APPDATA_ONLY`] can only hold without it.
+/// override strong evidence; [`REASON_APPDATA_ONLY`] and [`REASON_DATA_ONLY`] (folders only)
+/// can only hold without it.
 fn assess(
     name: &str,
     evidence: &[Evidence],
@@ -208,6 +230,9 @@ fn assess(
     } else if installed.is_word_of_name(name) {
         reasons.push(REASON_WORD_OF_NAME);
     }
+    if roots.is_installed_publisher(name) {
+        reasons.push(REASON_PUBLISHER_OF_INSTALLED);
+    }
     if evidence.iter().filter_map(|e| container_of(e, roots)).any(|c| installed.owns_sibling_in(&c)) {
         reasons.push(REASON_SIBLING_OWNED);
     }
@@ -217,9 +242,13 @@ fn assess(
     let strong = evidence.iter().any(|e| {
         matches!(e, Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } | Evidence::RegKeyMissingPath { .. })
     });
-    let appdata_only = evidence.iter().all(|e| matches!(e, Evidence::Folder { root_kind: RootKind::AppData, .. }));
-    if appdata_only {
+    let folder_in = |kinds: &[RootKind]| {
+        evidence.iter().all(|e| matches!(e, Evidence::Folder { root_kind, .. } if kinds.contains(root_kind)))
+    };
+    if folder_in(&[RootKind::AppData]) {
         reasons.push(REASON_APPDATA_ONLY);
+    } else if folder_in(&[RootKind::AppData, RootKind::ProgramData]) {
+        reasons.push(REASON_DATA_ONLY);
     }
     let assessment = if !reasons.is_empty() {
         Assessment::Uncertain
@@ -240,7 +269,8 @@ fn assessment_rank(a: Assessment) -> u8 {
 }
 
 /// Groups `evidence` by the [`normalize_name`] of [`ghost_name_of`] (spaces ignored, so
-/// `OldTool` joins `Old Tool`); evidence without a name is dropped. Groups whose name is kept, or
+/// `OldTool` joins `Old Tool`); evidence without a name, and dangling references into a folder
+/// an installed program still occupies, are dropped. Groups whose name is kept, or
 /// is exactly an installed program's name, are dropped. Sorted by assessment
 /// (ProbablyUninstalled, LeftoversOnly, Uncertain), then by size, largest first.
 /// `current_profile` is the running user's profile folder; per-profile folders outside it make a
@@ -254,6 +284,9 @@ pub fn group(
 ) -> Vec<Ghost> {
     let mut groups: BTreeMap<String, (Vec<String>, Vec<Evidence>)> = BTreeMap::new();
     for e in evidence {
+        if is_installed_programs_own(&e, installed, roots) {
+            continue;
+        }
         let Some(name) = ghost_name_of(&e, roots) else { continue };
         let slot = groups.entry(normalize_name(&name).replace(' ', "")).or_default();
         slot.0.push(name);
@@ -303,16 +336,25 @@ pub fn group(
     ghosts
 }
 
-/// `Leftover::note` of a ghost folder whose ghost is [`Assessment::Uncertain`].
-pub const NOTE_APPDATA_ONLY: &str = "appdata-only";
+/// The key a dangling shell command removes: the whole ProgID key when its name is the ghost's
+/// (`GoogleDriveFS.gdoc` for `GoogleDriveFS`), else only its `shell\open\command` (`http`).
+fn shell_command_key(location: &str, ghost_name: &str) -> Option<RegKeyPath> {
+    let mut key = parse_location(location)?;
+    let leaf = key.path.rsplit('\\').next().unwrap_or_default();
+    let stem = leaf.split('.').next().unwrap_or_default();
+    if !(name_matches_exact(leaf, ghost_name) || name_matches_exact(stem, ghost_name)) {
+        key.path.push_str(r"\shell\open\command");
+    }
+    Some(key)
+}
 
-fn leftover_of(e: &Evidence, assessment: Assessment, tasks_root: &Path) -> Option<Leftover> {
+fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
     let item = |kind, confidence| Leftover { kind, confidence, note: None };
     Some(match e {
         Evidence::Folder { path, size, .. } => {
             let kind = LeftoverKind::Dir { path: path.clone(), size: *size };
-            if assessment == Assessment::Uncertain {
-                Leftover { kind, confidence: Confidence::Low, note: Some(NOTE_APPDATA_ONLY.to_string()) }
+            if g.assessment == Assessment::Uncertain {
+                Leftover { kind, confidence: Confidence::Low, note: g.reasons.first().cloned() }
             } else {
                 item(kind, Confidence::Medium)
             }
@@ -323,9 +365,8 @@ fn leftover_of(e: &Evidence, assessment: Assessment, tasks_root: &Path) -> Optio
         Evidence::DanglingRef { kind, location, target, value_name } => {
             let kind = match kind {
                 RefKind::Run => LeftoverKind::RegValue { key: parse_location(location)?, name: value_name.clone()? },
-                RefKind::AppPaths | RefKind::ClassesServer | RefKind::ShellCommand => {
-                    LeftoverKind::RegKey { key: parse_location(location)? }
-                }
+                RefKind::AppPaths | RefKind::ClassesServer => LeftoverKind::RegKey { key: parse_location(location)? },
+                RefKind::ShellCommand => LeftoverKind::RegKey { key: shell_command_key(location, &g.name)? },
                 RefKind::Service => LeftoverKind::Service { name: location.clone(), image: target.clone() },
                 RefKind::ScheduledTask => LeftoverKind::ScheduledTask {
                     name: location.clone(),
@@ -341,13 +382,13 @@ fn leftover_of(e: &Evidence, assessment: Assessment, tasks_root: &Path) -> Optio
 }
 
 /// What removing `g` would remove, as leftover items: folders Medium (Low with
-/// [`NOTE_APPDATA_ONLY`] when the ghost is uncertain), vendor keys Medium, dangling references
+/// the first reason as note when the ghost is uncertain), vendor keys Medium, dangling references
 /// High; execution traces are evidence only. Duplicates are merged (higher confidence wins) and
 /// the items sorted like [`scan_leftovers`](crate::leftovers::scan_leftovers).
 pub fn to_leftovers(g: &Ghost, tasks_root: &Path) -> LeftoverReport {
     let mut items: Vec<Leftover> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    for item in g.evidence.iter().filter_map(|e| leftover_of(e, g.assessment, tasks_root)) {
+    for item in g.evidence.iter().filter_map(|e| leftover_of(e, g, tasks_root)) {
         match index.get(&dedupe_key(&item.kind)) {
             Some(&i) => {
                 if rank(item.confidence) < rank(items[i].confidence) {
@@ -396,13 +437,18 @@ mod tests {
     }
 
     fn roots(programs: &[Program]) -> NameRoots {
+        roots_for(&[r"C:\Users\A"], programs)
+    }
+
+    fn roots_for(profiles: &[&str], programs: &[Program]) -> NameRoots {
         let fs = FakeFs::new()
             .dir(r"C:\Program Files", 0)
             .dir(r"C:\Program Files (x86)", 0)
             .env("ProgramFiles", r"C:\Program Files")
             .env("ProgramFiles(x86)", r"C:\Program Files (x86)")
             .env("ProgramData", r"C:\ProgramData");
-        NameRoots::new(&FsScanRoots::from_env(&fs), &[PathBuf::from(r"C:\Users\A")], programs)
+        let profiles: Vec<PathBuf> = profiles.iter().map(PathBuf::from).collect();
+        NameRoots::new(&FsScanRoots::from_env(&fs), &profiles, programs)
     }
 
     fn folder(path: &str, size: u64, root_kind: RootKind) -> Evidence {
@@ -665,7 +711,7 @@ mod tests {
                 (LeftoverKind::RegValue { key: key(Hive::CurrentUser, RUN), name: "OldTool".into() }, high, None),
                 (LeftoverKind::RegKey { key: hklm(r"SOFTWARE\App Paths\o.exe") }, high, None),
                 (LeftoverKind::RegKey { key: hklm(r"SOFTWARE\Classes\CLSID\{1}") }, high, None),
-                (LeftoverKind::RegKey { key: hklm(r"SOFTWARE\Classes\oldfile") }, high, None),
+                (LeftoverKind::RegKey { key: hklm(r"SOFTWARE\Classes\oldfile\shell\open\command") }, high, None),
                 (LeftoverKind::Shortcut { lnk: r"C:\Menu\Old Tool.lnk".into(), target: exe.clone() }, high, None),
                 (LeftoverKind::Service { name: "OldSvc".into(), image: r"C:\Program Files\Old Tool\svc.exe".into() }, high, None),
                 (
@@ -683,7 +729,91 @@ mod tests {
             ]
         );
         g.assessment = Assessment::Uncertain;
+        g.reasons = vec![REASON_SIBLING_OWNED.into(), REASON_OTHER_PROFILE.into()];
         let dir = to_leftovers(&g, tasks).items.into_iter().find(|l| matches!(l.kind, LeftoverKind::Dir { .. })).unwrap();
-        assert_eq!((dir.confidence, dir.note.as_deref()), (Confidence::Low, Some("appdata-only")));
+        assert_eq!((dir.confidence, dir.note.as_deref()), (Confidence::Low, Some(REASON_SIBLING_OWNED)));
+    }
+
+    fn ghost_with(name: &str, evidence: Vec<Evidence>) -> Ghost {
+        Ghost {
+            name: name.into(),
+            key: normalize_name(name),
+            publisher: None,
+            evidence,
+            assessment: Assessment::ProbablyUninstalled,
+            total_size: 0,
+            last_used: None,
+            reasons: Vec::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn shell_command_removes_command_key_unless_progid_is_the_ghosts() {
+        let target = r"C:\Program Files\Google\Drive File Stream\117.0.0.0\GoogleDriveFS.exe";
+        let g = ghost_with(
+            "GoogleDriveFS",
+            vec![
+                dangling(RefKind::ShellCommand, r"CurrentUser\Software\Classes\http", target),
+                dangling(RefKind::ShellCommand, r"CurrentUser\Software\Classes\GoogleDriveFS.gdoc", target),
+            ],
+        );
+        let keys: Vec<LeftoverKind> = to_leftovers(&g, Path::new(r"C:\T")).items.into_iter().map(|l| l.kind).collect();
+        let hkcu = |p: &str| LeftoverKind::RegKey { key: key(Hive::CurrentUser, p) };
+        assert_eq!(
+            keys,
+            vec![hkcu(r"Software\Classes\http\shell\open\command"), hkcu(r"Software\Classes\GoogleDriveFS.gdoc")]
+        );
+    }
+
+    #[test]
+    fn programdata_only_folder_is_uncertain_data_only() {
+        let r = roots(&[]);
+        let ev = vec![
+            folder(r"C:\ProgramData\Vendor Cache", 10, RootKind::ProgramData),
+            folder(r"C:\Users\A\AppData\Local\Vendor Cache", 10, RootKind::AppData),
+        ];
+        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r, None);
+        assert_eq!(summary(&ghosts), vec![("Vendor Cache".to_string(), Assessment::Uncertain)]);
+        assert_eq!(reasons(&ghosts[0]), vec![REASON_DATA_ONLY]);
+    }
+
+    // Regressions from a real machine.
+
+    #[test]
+    fn publisher_of_installed_program_is_uncertain() {
+        let programs = [program("DisplayFusion", Some("Binary Fortress Software"), Some(r"C:\Program Files\DisplayFusion"))];
+        let r = roots(&programs);
+        let ev = vec![
+            folder(r"C:\Users\A\AppData\Local\Binary Fortress Software", 598, RootKind::AppData),
+            folder(r"C:\ProgramData\Binary Fortress Software", 4, RootKind::ProgramData),
+        ];
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, Some(Path::new(r"C:\Users\A")));
+        assert_eq!(summary(&ghosts), vec![("Binary Fortress Software".to_string(), Assessment::Uncertain)]);
+        assert_eq!(reasons(&ghosts[0]), vec![REASON_PUBLISHER_OF_INSTALLED, REASON_DATA_ONLY]);
+    }
+
+    #[test]
+    fn folder_named_like_a_profile_is_dropped() {
+        let r = roots_for(&[r"C:\Users\A", r"C:\Users\Jobb"], &[]);
+        let ev = vec![folder(r"C:\ProgramData\Jobb", 505, RootKind::ProgramData), pf(r"C:\Program Files\Old Tool", 1)];
+        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r, None);
+        assert_eq!(summary(&ghosts), vec![("Old Tool".to_string(), Assessment::LeftoversOnly)]);
+    }
+
+    #[test]
+    fn installed_programs_own_dangling_refs_are_dropped() {
+        let mut drive = program("Google Drive", Some("Google LLC"), None);
+        drive.display_icon = Some(PathBuf::from(r"C:\Program Files\Google\Drive File Stream\132.0.0.0\GoogleDriveFS.exe"));
+        let programs = [drive];
+        let r = roots(&programs);
+        let old = r"C:\Program Files\Google\Drive File Stream\117.0.0.0\GoogleDriveFS.exe";
+        let ev = vec![
+            dangling(RefKind::ShellCommand, r"CurrentUser\Software\Classes\GoogleDriveFS.gdoc", old),
+            dangling(RefKind::ClassesServer, r"CurrentUser\Software\Classes\CLSID\{1}", old),
+            dangling(RefKind::ShellCommand, r"CurrentUser\Software\Classes\gonefile", r"C:\Program Files\Gone App\g.exe"),
+        ];
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, None);
+        assert_eq!(summary(&ghosts), vec![("Gone App".to_string(), Assessment::ProbablyUninstalled)]);
     }
 }
