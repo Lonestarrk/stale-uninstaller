@@ -9,8 +9,8 @@ pub mod scan;
 pub use scan::{mark_safe, scan_leftovers, LeftoverSources};
 
 use crate::model::{Program, ProgramId, RegKeyPath};
-use crate::pathutil::{drive_letter, first_path_in_command, is_shared_root, norm, normed_under};
-use names::name_matches;
+use crate::pathutil::{drive_letter, expand_env, first_path_in_command, is_shared_root, norm, normed_under};
+use names::name_matches_exact;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -113,8 +113,10 @@ impl ProgramHint {
     }
 
     /// `exe`'s folder when `exe` has a drive letter, is not `msiexec` or inside `%SystemRoot%`,
-    /// the folder is not a shared root, and either the exe is named like an uninstaller
-    /// ([`UNINSTALLER_STEMS`]) or the folder is named like the program.
+    /// the folder is not a shared root, a temp or installer-cache folder
+    /// ([`in_temp_or_installer_cache`]) or at/under a profile's user folder (Desktop, Documents,
+    /// ...), and either the exe is named like an uninstaller ([`UNINSTALLER_STEMS`]) or the
+    /// folder is named exactly like the program.
     fn exe_dir(&self, exe: &Path) -> Option<PathBuf> {
         let stem = exe.file_stem()?.to_string_lossy().to_lowercase();
         let dir = exe.parent()?;
@@ -122,11 +124,14 @@ impl ProgramHint {
             || stem == "msiexec"
             || normed_under(&norm(exe), &system_root_norm())
             || is_shared_root(dir)
+            || in_temp_or_installer_cache(dir)
+            || in_user_folder(dir)
         {
             return None;
         }
         let named_like_uninstaller = UNINSTALLER_STEMS.iter().any(|u| stem.starts_with(u));
-        let dir_named_like_program = dir.file_name().is_some_and(|d| name_matches(&d.to_string_lossy(), &self.name));
+        let dir_named_like_program =
+            dir.file_name().is_some_and(|d| name_matches_exact(&d.to_string_lossy(), &self.name));
         (named_like_uninstaller || dir_named_like_program).then(|| dir.to_path_buf())
     }
 
@@ -146,6 +151,60 @@ impl ProgramHint {
 /// Lowercase file-name prefixes of uninstallers (`unins000`, `Uninstall Obsidian`, `uninst`,
 /// `setup`, `install`): such an exe sits in the program's own folder.
 const UNINSTALLER_STEMS: [&str; 5] = ["unins", "uninstall", "uninst", "setup", "install"];
+
+/// Folder names that hold installer caches, never a program's install folder.
+const INSTALLER_CACHE_NAMES: [&str; 3] = ["package cache", "downloaded installations", "installshield installation information"];
+
+/// `dir` is at or under `%TEMP%`, `%LOCALAPPDATA%\Temp`, `%ProgramData%\Package Cache`,
+/// `%LOCALAPPDATA%\Package Cache`, or has a `Package Cache`, `Downloaded Installations` or
+/// `InstallShield Installation Information` folder in its path: an uninstaller there is a cached
+/// setup, and its folder is not the install folder.
+fn in_temp_or_installer_cache(dir: &Path) -> bool {
+    let n = norm(dir);
+    let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%ProgramData%\Package Cache", r"%LOCALAPPDATA%\Package Cache"];
+    roots.iter().map(|r| expand_env(r)).filter(|r| !r.contains('%')).map(|r| norm(Path::new(&r))).any(|r| n == r || normed_under(&n, &r))
+        || dir.components().any(|c| INSTALLER_CACHE_NAMES.contains(&c.as_os_str().to_string_lossy().to_lowercase().as_str()))
+}
+
+/// `dir` is, holds or lies inside a user folder ([`USER_FOLDERS`]) of `%USERPROFILE%` or of the
+/// profile (`%SystemDrive%\Users\<name>`) it lies in.
+fn in_user_folder(dir: &Path) -> bool {
+    let mut profiles: Vec<PathBuf> = std::env::var_os("USERPROFILE").map(PathBuf::from).into_iter().collect();
+    let users = norm(&crate::paths::user_profiles_root());
+    if let Some(profile) = dir.ancestors().find(|a| a.parent().is_some_and(|p| norm(p) == users)) {
+        profiles.push(profile.to_path_buf());
+    }
+    let rel: Vec<PathBuf> = USER_FOLDERS.iter().map(PathBuf::from).collect();
+    user_folder_relation(&rel, &profiles, dir).is_some()
+}
+
+/// Profile folders that hold the user's own files.
+pub(crate) const USER_FOLDERS: [&str; 4] = ["Documents", "Pictures", "Desktop", "Downloads"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserFolderRelation {
+    /// The path is a user folder (Documents, Desktop, ...) or one of its ancestors.
+    IsFolderOrAncestor,
+    /// The path lies strictly inside a user folder.
+    Under,
+}
+
+/// How `path` relates to the `user_folders` (relative to each of `profiles`).
+pub(crate) fn user_folder_relation(user_folders: &[PathBuf], profiles: &[PathBuf], path: &Path) -> Option<UserFolderRelation> {
+    let n = norm(path);
+    for profile in profiles {
+        for rel in user_folders {
+            let folder = norm(&profile.join(rel));
+            if n == folder || normed_under(&folder, &n) {
+                return Some(UserFolderRelation::IsFolderOrAncestor);
+            }
+            if normed_under(&n, &folder) {
+                return Some(UserFolderRelation::Under);
+            }
+        }
+    }
+    None
+}
 
 /// `%SystemRoot%` [`norm`]ed (`C:\WINDOWS` when unset).
 pub(crate) fn system_root_norm() -> String {
@@ -307,6 +366,37 @@ mod tests {
         assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\MsiExec.exe /X{{ABC}}")), None).effective_install_dir(), None);
         assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\Obsidian\uninstall.exe")), None).effective_install_dir(), None);
         assert_eq!(hint_with(None, None, Some(&format!(r"{sys}\Installer\{{X}}\setup.exe"))).effective_install_dir(), None);
+    }
+
+    #[test]
+    fn effective_install_dir_rejects_temp_caches_and_user_folders() {
+        let drive = std::env::var("SystemDrive").unwrap();
+        let down = format!(r#""{drive}\Users\A\Downloads\Obsidian\Uninstall Obsidian.exe" /S"#);
+        assert_eq!(hint_with(None, Some(&down), None).effective_install_dir(), None);
+        let desk = format!(r"{drive}\Users\A\Desktop\Obsidian\Obsidian.exe");
+        assert_eq!(hint_with(None, None, Some(&desk)).effective_install_dir(), None);
+        let local = std::env::var("LOCALAPPDATA").unwrap();
+        assert_eq!(hint_with(None, Some(&format!(r"{local}\Temp\setup.exe")), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(&format!(r"{local}\Temp\Obsidian\uninstall.exe")), None).effective_install_dir(), None);
+        let pd = std::env::var("ProgramData").unwrap();
+        assert_eq!(hint_with(None, Some(&format!(r#""{pd}\Package Cache\{{GUID}}\setup.exe" /uninstall"#)), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(r"D:\Package Cache\{GUID}\setup.exe"), None).effective_install_dir(), None);
+        assert_eq!(
+            hint_with(None, Some(r"C:\Program Files (x86)\InstallShield Installation Information\{GUID}\setup.exe"), None).effective_install_dir(),
+            None
+        );
+        assert_eq!(hint_with(None, Some(r"D:\Downloaded Installations\{GUID}\setup.exe"), None).effective_install_dir(), None);
+        assert_eq!(hint_with(None, Some(r"C:\Windows\Installer\{GUID}\x.exe"), None).effective_install_dir(), None);
+        // A profile's own AppData is fine.
+        let obsidian = format!(r#""{drive}\Users\A\AppData\Local\Programs\Obsidian\Uninstall Obsidian.exe" /currentuser"#);
+        assert_eq!(
+            hint_with(None, Some(&obsidian), None).effective_install_dir(),
+            Some(PathBuf::from(format!(r"{drive}\Users\A\AppData\Local\Programs\Obsidian")))
+        );
+        // The folder-name branch needs an exact match, not the first-word rule.
+        let mut h = hint_with(None, None, Some(r"D:\Apps\Obsidian\Obsidian.exe"));
+        h.name = "Obsidian Publisher".into();
+        assert_eq!(h.effective_install_dir(), None);
     }
 
     #[test]

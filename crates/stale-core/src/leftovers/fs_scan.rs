@@ -4,9 +4,9 @@ use super::names::{
     child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, name_matches_suffixed,
     publisher_matches,
 };
-use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA, NOTE_SUFFIX_MATCH};
+use super::{mark_used_by_others, user_folder_relation, UserFolderRelation, USER_FOLDERS, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA, NOTE_SUFFIX_MATCH};
 use crate::fsys::FsReader;
-use crate::pathutil::{is_shared_root, norm, normed_under};
+use crate::pathutil::{is_shared_root, norm};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -34,37 +34,13 @@ impl FsScanRoots {
             program_files,
             program_data: fs.env("ProgramData").map(PathBuf::from).unwrap_or_default(),
             per_profile: rel(&[r"AppData\Roaming", r"AppData\Local", r"AppData\Local\Programs", r"AppData\Local\Temp"]),
-            user_folders: rel(&["Documents", "Pictures", "Desktop", "Downloads"]),
+            user_folders: rel(&USER_FOLDERS),
         }
     }
 }
 
 fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UserFolderRelation {
-    /// The path is a user folder (Documents, Desktop, ...) or one of its ancestors.
-    IsFolderOrAncestor,
-    /// The path lies strictly inside a user folder.
-    Under,
-}
-
-fn user_folder_relation(roots: &FsScanRoots, profiles: &[PathBuf], path: &Path) -> Option<UserFolderRelation> {
-    let n = norm(path);
-    for profile in profiles {
-        for rel in &roots.user_folders {
-            let folder = norm(&profile.join(rel));
-            if n == folder || normed_under(&folder, &n) {
-                return Some(UserFolderRelation::IsFolderOrAncestor);
-            }
-            if normed_under(&n, &folder) {
-                return Some(UserFolderRelation::Under);
-            }
-        }
-    }
-    None
 }
 
 /// Subfolder names (compared case-insensitively) that suggest an install folder keeps the user's
@@ -101,7 +77,7 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
 
     let profiles = fs.profile_dirs();
     if let Some(loc) = install.filter(|l| fs.is_dir(l)) {
-        match user_folder_relation(roots, &profiles, loc) {
+        match user_folder_relation(&roots.user_folders, &profiles, loc) {
             Some(UserFolderRelation::IsFolderOrAncestor) => {}
             Some(UserFolderRelation::Under) => push(loc, Confidence::Low, Some("user-folder")),
             None if holds_user_data(fs, loc) => push(loc, Confidence::Medium, Some(NOTE_CONTAINS_USER_DATA)),
