@@ -38,7 +38,7 @@ cargo build -p stale-gui --release
 .\target\release\StaleUninstaller.exe
 ```
 
-The release binary is a single statically linked exe. `cargo test --workspace` runs the unit tests without touching the registry or disk.
+The release binary is a single statically linked exe. `cargo test --workspace` runs the unit tests without changing the registry or files outside temporary folders.
 
 To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run its compiler on the script after the release build:
 
