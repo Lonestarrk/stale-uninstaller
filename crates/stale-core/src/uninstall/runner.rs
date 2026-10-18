@@ -4,7 +4,7 @@ use std::iter::once;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
@@ -156,17 +156,15 @@ pub trait ProcessRunner: Send + Sync {
 /// uninstallers that hand off to a temp copy of themselves (Inno Setup, NSIS) are waited for.
 /// The job has no kill-on-close: an uninstaller keeps running if we crash, and nothing is ever killed.
 ///
-/// The wait ends early only after the root process has exited: when `stop_waiting` is set (the user
-/// chose to move on), or [`Self::GRACE_AFTER_ROOT_EXIT`] later if children still linger (e.g. a
-/// browser the uninstaller opened). Either way the root's exit code is returned. While the root is
-/// still running the wait continues regardless of the flag.
+/// There is no time limit: the wait ends when the job is empty, or, once the root process has
+/// exited, when `stop_waiting` is set (the user chose to move on although children linger, e.g. a
+/// browser the uninstaller opened); the root's exit code is returned. While the root is still
+/// running the wait continues regardless of the flag.
 pub struct JobObjectRunner {
     stop_waiting: Arc<AtomicBool>,
 }
 
 impl JobObjectRunner {
-    pub const GRACE_AFTER_ROOT_EXIT: Duration = Duration::from_secs(60);
-
     pub fn new(stop_waiting: Arc<AtomicBool>) -> Self {
         JobObjectRunner { stop_waiting }
     }
@@ -219,20 +217,12 @@ fn root_exited(process: &Owned) -> bool {
 
 impl JobObjectRunner {
     /// Polls every [`POLL`] until the job is empty (without a job: until the root has exited), or
-    /// the root has exited and either `stop_waiting` is set or the grace period has passed.
+    /// the root has exited and `stop_waiting` is set.
     fn wait(&self, mut job: Option<&Owned>, process: &Owned) {
-        let mut root_exit_at: Option<Instant> = None;
         loop {
             let exited = root_exited(process);
-            if exited {
-                let since = *root_exit_at.get_or_insert_with(Instant::now);
-                if self.stop_waiting.load(Ordering::Relaxed) {
-                    return;
-                }
-                if since.elapsed() >= Self::GRACE_AFTER_ROOT_EXIT {
-                    log::warn!("uninstaller children still running after grace period");
-                    return;
-                }
+            if exited && self.stop_waiting.load(Ordering::Relaxed) {
+                return;
             }
             match job {
                 Some(j) => match active_processes(j) {
@@ -387,6 +377,7 @@ mod tests {
     use crate::proc::system32_tool;
     use crate::registry::FakeRegistry;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     const GUID: &str = "{12345678-ABCD-EF01-2345-6789ABCDEF01}";
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
