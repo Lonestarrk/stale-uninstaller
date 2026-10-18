@@ -118,7 +118,23 @@ pub const SKIP_FOLDERS: &[&str] = &[
 
 /// Publisher folders that hold one folder per product; the container itself is never a ghost,
 /// its children are examined instead.
-pub const CONTAINER_FOLDERS: &[&str] = &["Google", "Mozilla", "Adobe", "JetBrains", "Epic Games", "Unity", "Autodesk"];
+pub const CONTAINER_FOLDERS: &[&str] = &["Google", "Mozilla", "Adobe", "JetBrains", "Unity", "Autodesk"];
+
+/// Game launcher libraries: a folder that is, or lies under, one of these holds games a launcher
+/// manages, so its ghost is never more than Uncertain (reason `launcher-library`).
+pub const LAUNCHER_FOLDERS: &[&str] = &[
+    "Epic Games",
+    "Steam",
+    "steamapps",
+    "GOG Galaxy",
+    "XboxGames",
+    "Battle.net",
+    "Origin Games",
+    "EA Games",
+    "Ubisoft Game Launcher",
+    "Riot Games",
+    "Games",
+];
 
 /// True when `name` is in [`SKIP_FOLDERS`] or is a dot-folder.
 pub fn is_skipped_folder(name: &str) -> bool {
@@ -133,6 +149,47 @@ pub fn is_skipped_folder(name: &str) -> bool {
 /// True when `name` is in [`CONTAINER_FOLDERS`].
 pub fn is_container_folder(name: &str) -> bool {
     CONTAINER_FOLDERS.iter().any(|c| c.eq_ignore_ascii_case(name))
+}
+
+/// True when `name` is in [`LAUNCHER_FOLDERS`].
+pub fn is_launcher_folder(name: &str) -> bool {
+    LAUNCHER_FOLDERS.iter().any(|l| l.eq_ignore_ascii_case(name))
+}
+
+/// True when `p` or a folder above it is named in [`LAUNCHER_FOLDERS`].
+pub fn in_launcher_library(p: &Path) -> bool {
+    p.components().any(|c| is_launcher_folder(&c.as_os_str().to_string_lossy()))
+}
+
+/// The existing targets of every live reference the collectors read (service and driver
+/// `ImagePath`s, task commands, Run / App Paths / COM server / shell command targets, shortcut
+/// targets, executables that ran and still exist), [`norm`]ed. A folder holding one is in use.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveRefs {
+    pub paths: Vec<String>,
+}
+
+impl LiveRefs {
+    /// [`norm`]ed, sorted and deduplicated.
+    pub fn from_targets(targets: impl IntoIterator<Item = PathBuf>) -> LiveRefs {
+        let mut paths: Vec<String> = targets.into_iter().map(|p| norm(&p)).filter(|n| !n.is_empty()).collect();
+        paths.sort();
+        paths.dedup();
+        LiveRefs { paths }
+    }
+
+    /// True when a live target equals `folder` or lies under it.
+    pub fn holds(&self, folder: &Path) -> bool {
+        let n = norm(folder);
+        !n.is_empty() && self.paths.iter().any(|p| *p == n || normed_under(p, &n))
+    }
+}
+
+/// What one collector found: its evidence, and the targets of the references it read that exist.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Collected {
+    pub evidence: Vec<Evidence>,
+    pub live_targets: Vec<PathBuf>,
 }
 
 /// `Hive\path` (`LocalMachine\SOFTWARE\Foo`), the form [`Evidence::DanglingRef`] uses for a
@@ -303,6 +360,18 @@ mod tests {
         for n in ["Google", "Old Tool", "Macrosoft"] {
             assert!(!is_skipped_folder(n), "{n}");
         }
-        assert!(is_container_folder("epic games") && !is_container_folder("Epic"));
+        assert!(is_container_folder("google") && !is_container_folder("Epic Games"));
+        assert!(in_launcher_library(Path::new(r"C:\Program Files\Epic Games\Fortnite")));
+        assert!(in_launcher_library(Path::new(r"D:\SteamLibrary\steamapps\common\X")));
+        assert!(!in_launcher_library(Path::new(r"C:\Program Files\Old Tool")));
+    }
+
+    #[test]
+    fn live_refs_hold_equal_or_nested_targets() {
+        let live = LiveRefs::from_targets([PathBuf::from(r"c:\program files\Vendor\svc.exe"), PathBuf::from(r"C:\Tools\x.sys")]);
+        assert!(live.holds(Path::new(r"C:\Program Files\Vendor")));
+        assert!(live.holds(Path::new(r"C:\Tools\x.sys")));
+        assert!(!live.holds(Path::new(r"C:\Program Files\Vend")));
+        assert!(!live.holds(Path::new(r"C:\Program Files\Vendor\svc.exe\sub")));
     }
 }

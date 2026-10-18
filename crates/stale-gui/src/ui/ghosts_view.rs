@@ -60,17 +60,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
                 });
             });
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                let (uncertain, sure): (Vec<usize>, Vec<usize>) =
-                    (0..sel.ghosts.len()).partition(|&i| sel.ghosts[i].assessment == Assessment::Uncertain);
-                for i in sure {
-                    ghost_row(ui, &sel.ghosts[i], &mut sel.checked[i], now, &mut action);
-                }
-                if !uncertain.is_empty() {
-                    egui::CollapsingHeader::new(strings::uncertain_section(uncertain.len()))
-                        .id_salt("uncertain_ghosts")
-                        .default_open(false)
+                // Probably uninstalled and leftovers-only start open; uncertain starts collapsed.
+                for (assessment, open) in
+                    [(Assessment::ProbablyUninstalled, true), (Assessment::LeftoversOnly, true), (Assessment::Uncertain, false)]
+                {
+                    let rows: Vec<usize> = (0..sel.ghosts.len()).filter(|&i| sel.ghosts[i].assessment == assessment).collect();
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    egui::CollapsingHeader::new(section_title(assessment, rows.len()))
+                        .id_salt(("ghost_section", assessment_label(assessment)))
+                        .default_open(open)
                         .show(ui, |ui| {
-                            for i in uncertain {
+                            for i in rows {
                                 ghost_row(ui, &sel.ghosts[i], &mut sel.checked[i], now, &mut action);
                             }
                         });
@@ -119,6 +121,14 @@ fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime
             }
         });
     ui.add_space(4.0);
+}
+
+fn section_title(a: Assessment, count: usize) -> String {
+    match a {
+        Assessment::ProbablyUninstalled => strings::probably_section(count),
+        Assessment::LeftoversOnly => strings::leftovers_section(count),
+        Assessment::Uncertain => strings::uncertain_section(count),
+    }
 }
 
 fn assessment_label(a: Assessment) -> &'static str {
@@ -239,6 +249,9 @@ mod tests {
         assert_eq!(assessment_label(Assessment::ProbablyUninstalled), strings::ASSESS_PROBABLY);
         assert_eq!(assessment_label(Assessment::LeftoversOnly), strings::ASSESS_LEFTOVERS);
         assert_eq!(assessment_label(Assessment::Uncertain), strings::ASSESS_UNCERTAIN);
+        assert_eq!(section_title(Assessment::ProbablyUninstalled, 2), "Troligen avinstallerade (2)");
+        assert_eq!(section_title(Assessment::LeftoversOnly, 1), "Rester utan installation (bocka i själv) (1)");
+        assert_eq!(section_title(Assessment::Uncertain, 3), "Osäkra (3)");
         assert_eq!(ref_label(RefKind::ClassesServer), strings::REF_CLASSES_SERVER);
         assert_eq!(ref_label(RefKind::Shortcut), strings::REF_SHORTCUT);
     }

@@ -1,7 +1,7 @@
 //! Dangling references (services, scheduled tasks, shortcuts) and execution traces (Prefetch,
 //! BAM, UserAssist) of executables that no longer exist.
 
-use super::{Evidence, InstalledIndex, RefKind};
+use super::{Collected, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
 use crate::leftovers::other_scan::{task_commands, task_files};
@@ -37,7 +37,16 @@ impl Gate<'_> {
             && !self.keep.is_path_kept(p)
             && !self.fs.exists(p)
     }
+
+    /// An absolute path on a drive that exists: a live reference's target.
+    fn is_live(&self, p: &Path) -> bool {
+        p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p)
+    }
 }
+
+/// `SERVICE_WIN32_OWN_PROCESS | SERVICE_WIN32_SHARE_PROCESS`: a service run as a process. Kernel
+/// and file system drivers (`Type` 1 and 2) never count as ghost evidence.
+const SERVICE_WIN32: u32 = 0x10 | 0x20;
 
 fn gate<'a>(
     fs: &'a dyn FsReader,
@@ -52,7 +61,7 @@ fn dangling(kind: RefKind, location: String, target: PathBuf) -> Evidence {
     Evidence::DanglingRef { kind, location, target, value_name: None }
 }
 
-/// Services and drivers whose `ImagePath` executable is missing.
+/// [`service_collect`]'s evidence.
 pub fn service_evidence(
     reg: &dyn RegistryReader,
     fs: &dyn FsReader,
@@ -60,24 +69,45 @@ pub fn service_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
-    let g = gate(fs, installed, keep, drive_present);
-    let Ok(names) = reg.subkeys(&key(Hive::LocalMachine, SERVICES_ROOT)) else { return Vec::new() };
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let values = reg.values(&key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}"))).ok()?;
-            let raw = values.into_iter().find_map(|(n, v)| match v {
-                RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ImagePath") => Some(s),
-                _ => None,
-            })?;
-            let image = normalize_image_path(&raw)?;
-            let target = first_path_in_command(&image.to_string_lossy())?;
-            g.is_dead(&target).then(|| dangling(RefKind::Service, name, target))
-        })
-        .collect()
+    service_collect(reg, fs, installed, keep, drive_present).evidence
 }
 
-/// Scheduled tasks (one evidence per task file) with a missing `<Command>`.
+/// Win32 services (`Type` 16/32) whose `ImagePath` executable is missing. The existing
+/// `ImagePath` of every service and driver (kernel and file system drivers included) is a live
+/// target.
+pub fn service_collect(
+    reg: &dyn RegistryReader,
+    fs: &dyn FsReader,
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    drive_present: &dyn Fn(char) -> bool,
+) -> Collected {
+    let g = gate(fs, installed, keep, drive_present);
+    let mut out = Collected::default();
+    let Ok(names) = reg.subkeys(&key(Hive::LocalMachine, SERVICES_ROOT)) else { return out };
+    for name in names {
+        let Ok(values) = reg.values(&key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}"))) else { continue };
+        let mut raw = None;
+        let mut service_type = 0u32;
+        for (n, v) in values {
+            match v {
+                RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ImagePath") => raw = Some(s),
+                RegValue::Dword(t) if n.eq_ignore_ascii_case("Type") => service_type = t,
+                _ => {}
+            }
+        }
+        let image = raw.as_deref().and_then(normalize_image_path);
+        let Some(target) = image.and_then(|image| first_path_in_command(&image.to_string_lossy())) else { continue };
+        if g.is_live(&target) {
+            out.live_targets.push(target);
+        } else if service_type & SERVICE_WIN32 != 0 && g.is_dead(&target) {
+            out.evidence.push(dangling(RefKind::Service, name, target));
+        }
+    }
+    out
+}
+
+/// [`task_collect`]'s evidence.
 pub fn task_evidence(
     fs: &dyn FsReader,
     tasks_root: &Path,
@@ -85,21 +115,40 @@ pub fn task_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
+    task_collect(fs, tasks_root, installed, keep, drive_present).evidence
+}
+
+/// Scheduled tasks (one evidence per task file) with a missing `<Command>`; every existing
+/// command is a live target.
+pub fn task_collect(
+    fs: &dyn FsReader,
+    tasks_root: &Path,
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    drive_present: &dyn Fn(char) -> bool,
+) -> Collected {
     let g = gate(fs, installed, keep, drive_present);
     let mut files = Vec::new();
     task_files(fs, tasks_root, &mut files);
-    files
-        .into_iter()
-        .filter_map(|file| {
-            let target = task_commands(&fs.read_text(&file)?).into_iter().find(|c| g.is_dead(c))?;
-            let rel = file.strip_prefix(tasks_root).ok()?;
-            let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
-            Some(dangling(RefKind::ScheduledTask, name, target))
-        })
-        .collect()
+    let mut out = Collected::default();
+    for file in files {
+        let Some(xml) = fs.read_text(&file) else { continue };
+        let mut dead = None;
+        for command in task_commands(&xml) {
+            if g.is_live(&command) {
+                out.live_targets.push(command);
+            } else if dead.is_none() && g.is_dead(&command) {
+                dead = Some(command);
+            }
+        }
+        let (Some(target), Ok(rel)) = (dead, file.strip_prefix(tasks_root)) else { continue };
+        let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
+        out.evidence.push(dangling(RefKind::ScheduledTask, name, target));
+    }
+    out
 }
 
-/// Shortcuts that still exist but whose target is gone.
+/// [`shortcut_collect`]'s evidence.
 pub fn shortcut_evidence(
     fs: &dyn FsReader,
     targets: &[ShortcutTarget],
@@ -107,17 +156,30 @@ pub fn shortcut_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
-    let g = gate(fs, installed, keep, drive_present);
-    targets
-        .iter()
-        .filter(|t| fs.exists(&t.lnk) && g.is_dead(&t.path))
-        .map(|t| dangling(RefKind::Shortcut, t.lnk.to_string_lossy().into_owned(), t.path.clone()))
-        .collect()
+    shortcut_collect(fs, targets, installed, keep, drive_present).evidence
 }
 
-/// Execution traces of executables that no longer exist, the newest hit per executable.
-/// A drive-less (volume-stripped Prefetch) path is looked up on every present drive: it is a
-/// ghost only when none has it, and is reported on the first present drive.
+/// Shortcuts that still exist but whose target is gone; existing targets are live.
+pub fn shortcut_collect(
+    fs: &dyn FsReader,
+    targets: &[ShortcutTarget],
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    drive_present: &dyn Fn(char) -> bool,
+) -> Collected {
+    let g = gate(fs, installed, keep, drive_present);
+    let mut out = Collected::default();
+    for t in targets {
+        if g.is_live(&t.path) {
+            out.live_targets.push(t.path.clone());
+        } else if fs.exists(&t.lnk) && g.is_dead(&t.path) {
+            out.evidence.push(dangling(RefKind::Shortcut, t.lnk.to_string_lossy().into_owned(), t.path.clone()));
+        }
+    }
+    out
+}
+
+/// [`usage_collect`]'s evidence.
 pub fn usage_evidence(
     fs: &dyn FsReader,
     unmatched: &[UsageHit],
@@ -125,15 +187,31 @@ pub fn usage_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
+    usage_collect(fs, unmatched, installed, keep, drive_present).evidence
+}
+
+/// Execution traces of executables that no longer exist, the newest hit per executable; the
+/// executables that still exist are live targets.
+/// A drive-less (volume-stripped Prefetch) path is looked up on every present drive: it is a
+/// ghost only when none has it, and is reported on the first present drive.
+pub fn usage_collect(
+    fs: &dyn FsReader,
+    unmatched: &[UsageHit],
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    drive_present: &dyn Fn(char) -> bool,
+) -> Collected {
     let g = gate(fs, installed, keep, drive_present);
     let drives: Vec<char> = ('A'..='Z').filter(|&d| drive_present(d)).collect();
+    let mut live = Vec::new();
     let mut newest: BTreeMap<String, (PathBuf, DateTime<Utc>, UsageSource)> = BTreeMap::new();
     for hit in unmatched {
         let raw = hit.exe_path.to_string_lossy();
         // Drive-less, but not a UNC path (`\\server\share\...`).
         let exe = if raw.starts_with('\\') && !raw.starts_with(r"\\") {
             let on = |d: &char| PathBuf::from(format!("{d}:{raw}"));
-            if drives.iter().any(|d| fs.exists(&on(d))) {
+            if let Some(found) = drives.iter().map(on).find(|p| fs.exists(p)) {
+                live.push(found);
                 continue;
             }
             match drives.first() {
@@ -143,6 +221,10 @@ pub fn usage_evidence(
         } else {
             hit.exe_path.clone()
         };
+        if g.is_live(&exe) {
+            live.push(exe);
+            continue;
+        }
         if !g.is_dead(&exe) {
             continue;
         }
@@ -151,7 +233,9 @@ pub fn usage_evidence(
             *slot = (exe, hit.last_run, hit.source);
         }
     }
-    newest.into_values().map(|(exe, last_run, source)| Evidence::UsageTrace { exe, last_run, source }).collect()
+    let evidence =
+        newest.into_values().map(|(exe, last_run, source)| Evidence::UsageTrace { exe, last_run, source }).collect();
+    Collected { evidence, live_targets: live }
 }
 
 #[cfg(test)]
@@ -170,8 +254,60 @@ mod tests {
         (InstalledIndex::default(), KeepList::default())
     }
 
+    /// A Win32 own-process service (`Type` 16).
     fn svc(reg: &mut FakeRegistry, name: &str, image: &str) {
-        reg.set(key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}")), "ImagePath", RegValue::ExpandStr(image.into()));
+        svc_typed(reg, name, image, 16);
+    }
+
+    fn svc_typed(reg: &mut FakeRegistry, name: &str, image: &str, service_type: u32) {
+        let k = key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}"));
+        reg.set(k.clone(), "ImagePath", RegValue::ExpandStr(image.into()));
+        reg.set(k, "Type", RegValue::Dword(service_type));
+    }
+
+    #[test]
+    fn kernel_driver_is_never_evidence() {
+        let mut reg = FakeRegistry::new();
+        svc_typed(&mut reg, "GoneDrv", r"\??\C:\GoneVendor\gone.sys", 1);
+        svc_typed(&mut reg, "GoneFs", r"\??\C:\GoneVendor\fs.sys", 2);
+        svc_typed(&mut reg, "GoneShared", r"C:\GoneVendor\shared.exe -k x", 32);
+        svc_typed(&mut reg, "UserTemplate", r"C:\GoneVendor\user.exe", 0x50);
+        // An existing driver payload is a live target, never evidence.
+        svc_typed(&mut reg, "Ld9BoxSup", r"\??\C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
+        let fs = FakeFs::new().file(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        let mut evidence = got.evidence.clone();
+        evidence.sort_by_key(|e| format!("{e:?}"));
+        assert_eq!(
+            evidence,
+            vec![
+                dang(RefKind::Service, "GoneShared", r"C:\GoneVendor\shared.exe"),
+                dang(RefKind::Service, "UserTemplate", r"C:\GoneVendor\user.exe"),
+            ]
+        );
+        assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys")]);
+    }
+
+    #[test]
+    fn collectors_report_existing_targets_as_live() {
+        let root = r"C:\Windows\System32\Tasks";
+        let fs = FakeFs::new()
+            .text(&format!(r"{root}\Vendor\Updater"), r#"<Command>"C:\Live\up.exe"</Command><Command>C:\Gone\b.exe</Command>"#)
+            .file(r"C:\Live\up.exe", 1)
+            .file(r"C:\Live\app.exe", 1)
+            .file(r"C:\Menu\Live.lnk", 1)
+            .file(r"D:\RAN\RAN.EXE", 1);
+        let (i, k) = none();
+        let tasks = task_collect(&fs, Path::new(root), &i, &k, &all);
+        assert_eq!(tasks.live_targets, vec![PathBuf::from(r"C:\Live\up.exe")]);
+        assert_eq!(tasks.evidence, vec![dang(RefKind::ScheduledTask, r"Vendor\Updater", r"C:\Gone\b.exe")]);
+        let links = shortcut_collect(&fs, &[lnk(r"C:\Menu\Live.lnk", r"C:\Live\app.exe")], &i, &k, &all);
+        assert_eq!((links.evidence, links.live_targets), (vec![], vec![PathBuf::from(r"C:\Live\app.exe")]));
+        let hits = [hit(r"\RAN\RAN.EXE", 1, UsageSource::Prefetch), hit(r"C:\Live\app.exe", 1, UsageSource::Bam)];
+        let usage = usage_collect(&fs, &hits, &i, &k, &|c| c == 'C' || c == 'D');
+        assert_eq!(usage.evidence, vec![]);
+        assert_eq!(usage.live_targets, vec![PathBuf::from(r"D:\RAN\RAN.EXE"), PathBuf::from(r"C:\Live\app.exe")]);
     }
 
     fn dang(kind: RefKind, location: &str, target: &str) -> Evidence {

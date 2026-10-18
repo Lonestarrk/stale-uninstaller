@@ -1,7 +1,7 @@
 //! Registry ghosts: vendor keys whose install path is gone, and Run / App Paths / Classes
 //! entries that point at missing files.
 
-use super::{format_location, Evidence, InstalledIndex, RefKind};
+use super::{format_location, Collected, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
 use crate::leftovers::reg_scan::{child, default_string, path_in_value, string_value, RegScanRoots};
@@ -32,6 +32,8 @@ struct Ctx<'a> {
     keep: &'a KeepList,
     drive_present: &'a dyn Fn(char) -> bool,
     system_root: String,
+    /// Existing targets of the Run / App Paths / COM server / shell command entries read.
+    live: std::cell::RefCell<Vec<PathBuf>>,
 }
 
 impl Ctx<'_> {
@@ -47,6 +49,15 @@ impl Ctx<'_> {
             && !self.installed.covers_path(p)
             && !self.keep.is_path_kept(p)
             && !self.fs.exists(p)
+    }
+
+    /// [`Self::is_dead`] for a reference's target; an existing target is recorded as live instead.
+    fn is_dead_ref(&self, p: &Path) -> bool {
+        if p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p) {
+            self.live.borrow_mut().push(p.to_path_buf());
+            return false;
+        }
+        self.is_dead(p)
     }
 
     fn examines(&self, k: &RegKeyPath) -> bool {
@@ -69,7 +80,20 @@ pub fn registry_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
-    let cx = Ctx { reg, fs, installed, keep, drive_present, system_root: system_root_norm() };
+    registry_collect(reg, fs, roots, installed, keep, drive_present).evidence
+}
+
+/// [`registry_evidence`], plus the existing targets of the Run values, App Paths entries, COM
+/// servers and shell commands it read (live references).
+pub fn registry_collect(
+    reg: &dyn RegistryReader,
+    fs: &dyn FsReader,
+    roots: &RegScanRoots,
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    drive_present: &dyn Fn(char) -> bool,
+) -> Collected {
+    let cx = Ctx { reg, fs, installed, keep, drive_present, system_root: system_root_norm(), live: Default::default() };
     let mut out = Vec::new();
     for root in &roots.software {
         software_keys(&cx, root, &mut out);
@@ -83,7 +107,7 @@ pub fn registry_evidence(
     for root in &roots.classes {
         class_keys(&cx, root, &mut out);
     }
-    out
+    Collected { evidence: out, live_targets: cx.live.into_inner() }
 }
 
 /// (a) Direct children of a software root, and the children of container keys (a vendor in
@@ -158,7 +182,7 @@ fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
         return;
     }
     for (name, value) in cx.reg.values(root).unwrap_or_default() {
-        if let Some(target) = string_value(&value).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead(p)) {
+        if let Some(target) = string_value(&value).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
             out.push(dangling(RefKind::Run, root, target, Some(name)));
         }
     }
@@ -171,7 +195,7 @@ fn app_path_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
         if !cx.examines(&k) {
             continue;
         }
-        if let Some(target) = default_string(cx.reg, &k).as_deref().and_then(path_in_value).filter(|p| cx.is_dead(p)) {
+        if let Some(target) = default_string(cx.reg, &k).as_deref().and_then(path_in_value).filter(|p| cx.is_dead_ref(p)) {
             out.push(dangling(RefKind::AppPaths, &k, target, None));
         }
     }
@@ -188,17 +212,20 @@ fn class_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
                 if !cx.examines(&c) {
                     continue;
                 }
-                let target = SERVER_KEYS
-                    .iter()
-                    .filter_map(|s| default_string(cx.reg, &child(&c, s)).as_deref().and_then(path_in_value))
-                    .find(|p| cx.is_dead(p));
+                // Every server is checked, so each existing one is recorded as live.
+                let mut target = None;
+                for p in SERVER_KEYS.iter().filter_map(|s| default_string(cx.reg, &child(&c, s)).as_deref().and_then(path_in_value)) {
+                    if cx.is_dead_ref(&p) && target.is_none() {
+                        target = Some(p);
+                    }
+                }
                 if let Some(target) = target {
                     out.push(dangling(RefKind::ClassesServer, &c, target, None));
                 }
             }
         } else if cx.examines(&k) {
             let command = default_string(cx.reg, &child(&k, r"shell\open\command"));
-            if let Some(target) = command.as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead(p)) {
+            if let Some(target) = command.as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
                 out.push(dangling(RefKind::ShellCommand, &k, target, None));
             }
         }
@@ -418,6 +445,26 @@ mod tests {
             let server = r.ends_with(r"\InprocServer32") || r.ends_with(r"\LocalServer32");
             assert!(listings.contains(&r) || server, "unexpected read {r}");
         }
+    }
+
+    #[test]
+    fn existing_reference_targets_are_live() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(key(Hive::CurrentUser, RUN), "Tray", s(r#""C:\Apps\Live\tray.exe" --min"#));
+        reg.set(hklm(&format!(r"{APP_PATHS}\live.exe")), "", s(r"C:\Apps\Live\live.exe"));
+        reg.set(hklm(&format!(r"{CLSID}\{{A}}\InprocServer32")), "", s(r"C:\Apps\Live\ext.dll"));
+        reg.set(hklm(r"SOFTWARE\Classes\liveproto\shell\open\command"), "", s(r#""C:\Apps\Live\open.exe" "%1""#));
+        let fs = FakeFs::new()
+            .file(r"C:\Apps\Live\tray.exe", 1)
+            .file(r"C:\Apps\Live\live.exe", 1)
+            .file(r"C:\Apps\Live\ext.dll", 1)
+            .file(r"C:\Apps\Live\open.exe", 1);
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives);
+        assert_eq!(got.evidence, vec![]);
+        let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
+        live.sort();
+        assert_eq!(live, vec![r"C:\Apps\Live\ext.dll", r"C:\Apps\Live\live.exe", r"C:\Apps\Live\open.exe", r"C:\Apps\Live\tray.exe"]);
     }
 
     #[test]

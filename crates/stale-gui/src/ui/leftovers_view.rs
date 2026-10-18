@@ -281,6 +281,8 @@ pub(crate) fn note_text(note: &str) -> &str {
         g::REASON_WORD_OF_NAME => strings::NOTE_WORD_OF_INSTALLED,
         g::REASON_SIBLING_OWNED => strings::NOTE_SIBLING_OWNED,
         g::REASON_PUBLISHER_OF_INSTALLED => strings::NOTE_PUBLISHER_OF_INSTALLED,
+        g::REASON_IN_USE => strings::NOTE_IN_USE,
+        g::REASON_LAUNCHER_LIBRARY => strings::NOTE_LAUNCHER_LIBRARY,
         other => other,
     }
 }
@@ -305,6 +307,8 @@ mod tests {
             ("word-of-installed-name", strings::NOTE_WORD_OF_INSTALLED),
             ("sibling-owned", strings::NOTE_SIBLING_OWNED),
             ("publisher-of-installed", strings::NOTE_PUBLISHER_OF_INSTALLED),
+            ("in-use", strings::NOTE_IN_USE),
+            ("launcher-library", strings::NOTE_LAUNCHER_LIBRARY),
         ] {
             assert_eq!(note_text(key), text, "{key}");
         }

@@ -157,6 +157,8 @@ pub const NOTE_FIRST_WORD: &str = "namnet är första ordet i ett installerat pr
 pub const NOTE_WORD_OF_INSTALLED: &str = "namnet ingår i ett installerat programs namn";
 pub const NOTE_SIBLING_OWNED: &str = "utgivarmappen innehåller ett installerat program";
 pub const NOTE_PUBLISHER_OF_INSTALLED: &str = "namnet är utgivaren av ett installerat program";
+pub const NOTE_IN_USE: &str = "används av en tjänst, uppgift, autostart eller genväg";
+pub const NOTE_LAUNCHER_LIBRARY: &str = "tillhör ett spelbibliotek";
 pub const MARK_SAFE: &str = "Markera säkra";
 pub const REMOVE_CHECKED: &str = "Ta bort markerade";
 pub const SERVICE_REBOOT: &str = "Tjänster tas bort helt först efter omstart";
@@ -225,6 +227,16 @@ pub const REF_SHELL_COMMAND: &str = "Filtyp";
 pub const REF_SERVICE: &str = "Tjänst";
 pub const REF_TASK: &str = "Schemalagd uppgift";
 pub const REF_SHORTCUT: &str = "Genväg";
+
+/// The section of ghosts that were probably uninstalled (checked by default).
+pub fn probably_section(count: usize) -> String {
+    format!("Troligen avinstallerade ({count})")
+}
+
+/// The open section of leftovers without an installation (unchecked by default).
+pub fn leftovers_section(count: usize) -> String {
+    format!("Rester utan installation (bocka i själv) ({count})")
+}
 
 /// The collapsed section of uncertain ghosts: "Osäkra (3)".
 pub fn uncertain_section(count: usize) -> String {

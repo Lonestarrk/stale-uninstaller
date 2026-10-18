@@ -11,9 +11,10 @@ pub struct GhostSelection {
 }
 
 impl GhostSelection {
-    /// Every ghost checked unless it is [`Assessment::Uncertain`].
+    /// Only [`Assessment::ProbablyUninstalled`] ghosts start checked; leftovers without an
+    /// installation and uncertain ones are the user's call.
     pub fn new(ghosts: Vec<Ghost>) -> Self {
-        let checked = ghosts.iter().map(|g| g.assessment != Assessment::Uncertain).collect();
+        let checked = ghosts.iter().map(|g| g.assessment == Assessment::ProbablyUninstalled).collect();
         GhostSelection { ghosts, checked }
     }
 
@@ -84,16 +85,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn uncertain_ghosts_start_unchecked() {
+    fn only_probably_uninstalled_is_prechecked() {
         let sel = selection();
-        assert_eq!(sel.checked, vec![true, false, true]);
-        assert_eq!(sel.summary(), (2, 3, 107));
+        assert_eq!(sel.checked, vec![true, false, false]);
+        assert_eq!(sel.summary(), (1, 3, 100));
     }
 
     #[test]
     fn checked_reports_convert_only_checked() {
         let mut sel = selection();
-        sel.checked[2] = false;
+        sel.checked[1] = false;
         let reports = sel.checked_reports();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].0, "Alpha");
@@ -115,6 +116,7 @@ pub(crate) mod tests {
     fn remove_by_key() {
         let mut sel = selection();
         sel.checked[0] = false;
+        sel.checked[2] = true;
         sel.remove_by_key("beta");
         assert_eq!(sel.ghosts.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["Alpha", "Gamma"]);
         assert_eq!(sel.checked, vec![false, true], "check marks stay with their ghosts");

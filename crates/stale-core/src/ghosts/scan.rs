@@ -1,9 +1,9 @@
 //! The ghost scan: every collector over the live (or fake) sources, then grouping.
 
 use super::folders::orphan_folders;
-use super::refs::{service_evidence, shortcut_evidence, task_evidence, usage_evidence};
-use super::registry::registry_evidence;
-use super::{group, Evidence, Ghost, InstalledIndex, NameRoots};
+use super::refs::{service_collect, shortcut_collect, task_collect, usage_collect};
+use super::registry::registry_collect;
+use super::{group, Collected, Evidence, Ghost, InstalledIndex, LiveRefs, NameRoots};
 use crate::leftovers::LeftoverSources;
 use crate::model::Program;
 use crate::shortcuts::ShortcutTarget;
@@ -37,31 +37,41 @@ impl GhostSources {
 }
 
 /// Runs every collector (orphan folders, registry, services, scheduled tasks, Start Menu and
-/// desktop shortcuts, execution traces) against `src` and groups the evidence into ghosts.
+/// desktop shortcuts, execution traces) against `src` and groups the evidence into ghosts. The
+/// existing targets the reference collectors saw are the live references: a folder holding one
+/// is in use and never more than Uncertain.
 pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
     let l = &src.leftovers;
     let (fs, reg, keep) = (&*l.fs, &*l.reg, &l.keep);
     let drive_present: &dyn Fn(char) -> bool = &*src.drive_present;
     let installed = InstalledIndex::from_programs(&src.programs);
     let shortcuts: Vec<ShortcutTarget> = l.start_menu_targets.iter().chain(&l.desktop_targets).cloned().collect();
-    let evidence: Vec<Evidence> = orphan_folders(fs, &l.fs_roots, &installed, keep)
-        .into_iter()
-        .chain(registry_evidence(reg, fs, &l.reg_roots, &installed, keep, drive_present))
-        .chain(service_evidence(reg, fs, &installed, keep, drive_present))
-        .chain(task_evidence(fs, &l.tasks_root, &installed, keep, drive_present))
-        .chain(shortcut_evidence(fs, &shortcuts, &installed, keep, drive_present))
-        .chain(usage_evidence(fs, &src.unmatched_hits, &installed, keep, drive_present))
-        .collect();
+    let collected: Vec<Collected> = vec![
+        registry_collect(reg, fs, &l.reg_roots, &installed, keep, drive_present),
+        service_collect(reg, fs, &installed, keep, drive_present),
+        task_collect(fs, &l.tasks_root, &installed, keep, drive_present),
+        shortcut_collect(fs, &shortcuts, &installed, keep, drive_present),
+        usage_collect(fs, &src.unmatched_hits, &installed, keep, drive_present),
+    ];
+    let mut evidence: Vec<Evidence> = orphan_folders(fs, &l.fs_roots, &installed, keep);
+    let mut live_targets = Vec::new();
+    for c in collected {
+        evidence.extend(c.evidence);
+        live_targets.extend(c.live_targets);
+    }
+    let live = LiveRefs::from_targets(live_targets);
     let roots = NameRoots::new(&l.fs_roots, &fs.profile_dirs(), &src.programs);
     let current_profile = fs.env("USERPROFILE").map(PathBuf::from);
-    group(evidence, &installed, keep, &roots, current_profile.as_deref())
+    group(evidence, &installed, keep, &roots, current_profile.as_deref(), &live)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fsys::{FakeFs, FsReader};
-    use crate::ghosts::{Assessment, Evidence, RefKind};
+    use crate::ghosts::group::REASON_IN_USE;
+    use crate::ghosts::{to_leftovers, Assessment, Evidence, RefKind};
+    use crate::leftovers::Confidence;
     use crate::keep::KeepList;
     use crate::leftovers::fs_scan::FsScanRoots;
     use crate::leftovers::reg_scan::RegScanRoots;
@@ -73,6 +83,76 @@ mod tests {
     use std::sync::Arc;
 
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    /// Sources over `fs` and `reg` with the standard Program Files / ProgramData roots, no
+    /// programs and no execution traces.
+    fn sources(fs: FakeFs, reg: FakeRegistry) -> GhostSources {
+        let fs: Arc<dyn FsReader> = Arc::new(fs);
+        let reg: Arc<dyn RegistryReader> = Arc::new(reg);
+        GhostSources {
+            leftovers: LeftoverSources {
+                fs_roots: FsScanRoots::from_env(&*fs),
+                reg_roots: RegScanRoots { software: vec![], classes: vec![], run: vec![], app_paths: vec![] },
+                tasks_root: PathBuf::from(r"C:\Windows\System32\Tasks"),
+                start_menu_targets: Vec::new(),
+                desktop_targets: Vec::new(),
+                keep: KeepList::default(),
+                reg,
+                fs,
+            },
+            programs: Vec::new(),
+            unmatched_hits: Vec::new(),
+            drive_present: Box::new(|d| d == 'C'),
+        }
+    }
+
+    fn base_fs() -> FakeFs {
+        FakeFs::new()
+            .env("ProgramFiles", r"C:\Program Files")
+            .env("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            .env("ProgramData", r"C:\ProgramData")
+            .env("USERPROFILE", r"C:\Users\A")
+            .dir(r"C:\Program Files", 0)
+            .dir(r"C:\Program Files (x86)", 0)
+            .profile(r"C:\Users\A")
+    }
+
+    fn service(reg: &mut FakeRegistry, name: &str, image: &str, service_type: u32) {
+        let k = key(Hive::LocalMachine, &format!(r"SYSTEM\CurrentControlSet\Services\{name}"));
+        reg.set(k.clone(), "ImagePath", RegValue::ExpandStr(image.into()));
+        reg.set(k, "Type", RegValue::Dword(service_type));
+    }
+
+    fn by_name<'a>(ghosts: &'a [Ghost], name: &str) -> &'a Ghost {
+        ghosts.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("no {name} in {ghosts:?}"))
+    }
+
+    /// Regression: a running Win32 service's own folder was a pre-checked LeftoversOnly ghost.
+    #[test]
+    fn running_service_folder_is_in_use_like_lighting_service() {
+        let fs = base_fs().file(r"C:\Program Files (x86)\LightingService\LightingService.exe", 13);
+        let mut reg = FakeRegistry::new();
+        service(&mut reg, "LightingService", r#""C:\Program Files (x86)\LightingService\LightingService.exe""#, 16);
+        let ghosts = scan_ghosts(&sources(fs, reg));
+        let g = by_name(&ghosts, "LightingService");
+        assert_eq!((g.assessment, g.reasons.clone()), (Assessment::Uncertain, vec![REASON_IN_USE.to_string()]));
+        assert!(to_leftovers(g, Path::new(r"C:\T")).items.iter().all(|l| l.confidence == Confidence::Low));
+    }
+
+    /// Regression: a running kernel driver's folder (`\??\` ImagePath, `Type` 1) was a ghost.
+    #[test]
+    fn kernel_driver_folder_is_in_use_like_ldplayer9box() {
+        let fs = base_fs().file(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 144);
+        let mut reg = FakeRegistry::new();
+        service(&mut reg, "Ld9BoxSup", r"\??\C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
+        // A kernel driver whose file is gone is not evidence either.
+        service(&mut reg, "GoneDrv", r"\??\C:\Program Files\Gone Driver Co\gone.sys", 1);
+        let ghosts = scan_ghosts(&sources(fs, reg));
+        assert_eq!(ghosts.len(), 1, "{ghosts:?}");
+        let g = by_name(&ghosts, "ldplayer9box");
+        assert_eq!((g.assessment, g.reasons.first().map(String::as_str)), (Assessment::Uncertain, Some(REASON_IN_USE)));
+        assert!(!g.evidence.iter().any(|e| matches!(e, Evidence::DanglingRef { .. })), "{g:?}");
+    }
 
     #[test]
     fn scan_ghosts_end_to_end_with_fakes() {

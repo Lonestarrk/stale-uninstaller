@@ -1209,6 +1209,8 @@ mod tests {
             ghost("Beta", Assessment::Uncertain, 50),
             ghost("Gamma", Assessment::LeftoversOnly, 7),
         ]));
+        // Leftovers-only ghosts start unchecked; the user ticks Gamma.
+        app.ghosts.as_mut().unwrap().checked[2] = true;
         app.open_leftovers_from_ghosts();
         assert_eq!((app.view, app.leftovers_origin), (View::Leftovers, View::Ghosts));
         let sel = app.leftovers.as_ref().expect("selection built");
