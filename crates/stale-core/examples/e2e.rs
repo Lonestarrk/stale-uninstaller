@@ -35,16 +35,8 @@ impl Steps {
     }
 }
 
-fn hive(h: Hive) -> &'static str {
-    match h {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    }
-}
-
 fn key_text(k: &RegKeyPath) -> String {
-    format!(r"{}\{}", hive(k.hive), k.path)
+    format!(r"{}\{}", k.hive.short_name(), k.path)
 }
 
 fn mb(bytes: u64) -> String {
@@ -260,7 +252,7 @@ fn main() -> ExitCode {
             None => steps.record("3 vendor", false, "no uninstall command"),
             Some(cmd) => {
                 let result = JobObjectRunner::default().run_and_wait_tree(cmd);
-                let gone = !still_installed(&WinRegistry, &RealFs, &p);
+                let gone = !still_installed(&WinRegistry, &RealFs::default(), &p);
                 let verdict = if gone { "Uninstalled" } else { "NotUninstalled" };
                 println!("  exit: {result:?}; {verdict}");
                 steps.record("3 vendor", result.is_ok() && gone, format!("{verdict}, exit {result:?}"));

@@ -65,6 +65,12 @@ pub const REASON_APPDATA_ONLY: &str = "appdata-only";
 pub const REASON_DATA_ONLY: &str = "data-only";
 /// `Ghost::note` of a ghost with a folder in another user's profile.
 pub const NOTE_OTHER_PROFILE: &str = "other-profile";
+/// Leftover note of a reference whose holder also points at targets that still exist (a
+/// scheduled task with another, live command).
+pub const NOTE_PARTLY_LIVE: &str = "partly-live";
+/// Leftover note of a vendor key that also holds an installed program's subkey (the same key
+/// the leftover scanner uses for a shared publisher key).
+pub const NOTE_SHARED_VENDOR_KEY: &str = "shared-publisher-key";
 
 /// The program roots names are taken below, and the installed publishers whose folders hold one
 /// folder per product.
@@ -203,7 +209,7 @@ fn key_name(k: &RegKeyPath) -> Option<String> {
 pub fn ghost_name_of(e: &Evidence, roots: &NameRoots) -> Option<String> {
     match e {
         Evidence::Folder { path, .. } => file_name(path).filter(|n| usable(n) && !roots.is_profile_name(n)),
-        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => key_name(key),
+        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key, .. } => key_name(key),
         Evidence::DanglingRef { target, .. } => program_folder(target, roots).map(|(_, name)| name),
         Evidence::UsageTrace { exe, .. } => program_folder(exe, roots).map(|(_, name)| name),
     }
@@ -248,7 +254,7 @@ fn in_other_profile(e: &Evidence, current_profile: Option<&Path>) -> bool {
 /// may be that account's own per-user install, invisible to us.
 fn from_other_hive(e: &Evidence) -> bool {
     let key = match e {
-        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => Some(key.clone()),
+        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key, .. } => Some(key.clone()),
         Evidence::DanglingRef { location, .. } => parse_location(location),
         _ => None,
     };
@@ -428,16 +434,22 @@ fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
             note: Some(REASON_CONTAINS_USER_DATA.to_string()),
         },
         Evidence::Folder { path, size, .. } => owned(LeftoverKind::Dir { path: path.clone(), size: *size }),
+        // A vendor key holding an installed program's subkey: never pre-checked.
+        Evidence::RegKeyMissingPath { key, shared: true, .. } | Evidence::RegKeyOrphan { key, shared: true } => Leftover {
+            kind: LeftoverKind::RegKey { key: key.clone() },
+            confidence: Confidence::Low,
+            note: Some(NOTE_SHARED_VENDOR_KEY.to_string()),
+        },
         Evidence::RegKeyMissingPath { key, .. } => owned(LeftoverKind::RegKey { key: key.clone() }),
         // A vendor key with no path value says little on its own: Medium only for a ghost that
         // is probably uninstalled.
-        Evidence::RegKeyOrphan { key } if g.assessment != Assessment::ProbablyUninstalled => Leftover {
+        Evidence::RegKeyOrphan { key, .. } if g.assessment != Assessment::ProbablyUninstalled => Leftover {
             kind: LeftoverKind::RegKey { key: key.clone() },
             confidence: Confidence::Low,
             note: g.reasons.first().cloned(),
         },
-        Evidence::RegKeyOrphan { key } => item(LeftoverKind::RegKey { key: key.clone() }, Confidence::Medium),
-        Evidence::DanglingRef { kind, location, target, value_name } => {
+        Evidence::RegKeyOrphan { key, .. } => item(LeftoverKind::RegKey { key: key.clone() }, Confidence::Medium),
+        Evidence::DanglingRef { kind, location, target, value_name, partly_live } => {
             let kind = match kind {
                 RefKind::Run => LeftoverKind::RegValue { key: parse_location(location)?, name: value_name.clone()? },
                 RefKind::AppPaths | RefKind::ClassesServer => LeftoverKind::RegKey { key: parse_location(location)? },
@@ -450,7 +462,11 @@ fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
                 },
                 RefKind::Shortcut => LeftoverKind::Shortcut { lnk: PathBuf::from(location), target: target.clone() },
             };
-            item(kind, Confidence::High)
+            if *partly_live {
+                Leftover { kind, confidence: Confidence::Low, note: Some(NOTE_PARTLY_LIVE.to_string()) }
+            } else {
+                item(kind, Confidence::High)
+            }
         }
         Evidence::UsageTrace { .. } => return None,
     })
@@ -541,6 +557,7 @@ mod tests {
             location: format!(r"CurrentUser\{RUN}"),
             target: target.into(),
             value_name: Some(value.into()),
+            partly_live: false,
         }
     }
 
@@ -549,11 +566,11 @@ mod tests {
     }
 
     fn orphan_key(path: &str) -> Evidence {
-        Evidence::RegKeyOrphan { key: key(Hive::LocalMachine, path) }
+        Evidence::RegKeyOrphan { key: key(Hive::LocalMachine, path), shared: false }
     }
 
     fn missing_path(path: &str) -> Evidence {
-        Evidence::RegKeyMissingPath { key: key(Hive::LocalMachine, path), value_name: "InstallDir".into(), path: r"C:\Gone".into() }
+        Evidence::RegKeyMissingPath { key: key(Hive::LocalMachine, path), value_name: "InstallDir".into(), path: r"C:\Gone".into(), shared: false }
     }
 
     fn installed(programs: &[Program]) -> InstalledIndex {
@@ -742,12 +759,13 @@ mod tests {
         let r = roots(&[]);
         let theirs = key(Hive::Users, r"S-1-5-21-9\Software\Their Tool");
         let ev = vec![
-            Evidence::RegKeyMissingPath { key: theirs.clone(), value_name: "InstallDir".into(), path: r"D:\Their Tool".into() },
+            Evidence::RegKeyMissingPath { key: theirs.clone(), value_name: "InstallDir".into(), path: r"D:\Their Tool".into(), shared: false },
             Evidence::DanglingRef {
                 kind: RefKind::Run,
                 location: format!(r"Users\S-1-5-21-9\{RUN}"),
                 target: r"C:\Program Files\Their Runner\r.exe".into(),
                 value_name: Some("Runner".into()),
+                partly_live: false,
             },
             missing_path(r"SOFTWARE\Our Tool"),
         ];
@@ -767,7 +785,7 @@ mod tests {
     }
 
     fn path_value(key_path: &str, value_name: &str, path: &str) -> Evidence {
-        Evidence::RegKeyMissingPath { key: key(Hive::CurrentUser, key_path), value_name: value_name.into(), path: path.into() }
+        Evidence::RegKeyMissingPath { key: key(Hive::CurrentUser, key_path), value_name: value_name.into(), path: path.into(), shared: false }
     }
 
     #[test]
@@ -849,7 +867,7 @@ mod tests {
     }
 
     fn dangling(kind: RefKind, location: &str, target: &str) -> Evidence {
-        Evidence::DanglingRef { kind, location: location.into(), target: target.into(), value_name: None }
+        Evidence::DanglingRef { kind, location: location.into(), target: target.into(), value_name: None, partly_live: false }
     }
 
     #[test]
@@ -865,7 +883,7 @@ mod tests {
                 dangling(RefKind::Shortcut, r"C:\Menu\Old Tool.lnk", r"C:\Program Files\Old Tool\o.exe"),
                 pf(r"C:\Program Files\Old Tool", 7),
                 missing_path(r"SOFTWARE\Old Tool"),
-                Evidence::RegKeyMissingPath { key: hklm(r"SOFTWARE\Old Tool"), value_name: "Path".into(), path: r"C:\Gone".into() },
+                Evidence::RegKeyMissingPath { key: hklm(r"SOFTWARE\Old Tool"), value_name: "Path".into(), path: r"C:\Gone".into(), shared: false },
                 orphan_key(r"SOFTWARE\Old Tool\Sub"),
                 run(r"C:\Program Files\Old Tool\o.exe", "OldTool"),
                 dangling(RefKind::AppPaths, r"LocalMachine\SOFTWARE\App Paths\o.exe", r"C:\Program Files\Old Tool\o.exe"),
@@ -924,8 +942,8 @@ mod tests {
         let mut g = ghost_with(
             "Binary Fortress Software",
             vec![
-                Evidence::RegKeyOrphan { key: vendor.clone() },
-                Evidence::RegKeyMissingPath { key: vendor.clone(), value_name: "InstallDir".into(), path: r"C:\Gone".into() },
+                Evidence::RegKeyOrphan { key: vendor.clone(), shared: false },
+                Evidence::RegKeyMissingPath { key: vendor.clone(), value_name: "InstallDir".into(), path: r"C:\Gone".into(), shared: false },
                 run(r"C:\Program Files\Binary Fortress Software\gone.exe", "BFS"),
             ],
         );
@@ -981,7 +999,7 @@ mod tests {
             folder(r"C:\ProgramData\Vendor Cache", 10, RootKind::ProgramData),
             folder(r"C:\Users\A\AppData\Local\Vendor Cache", 10, RootKind::AppData),
             // A vendor key joining the folders changes nothing.
-            Evidence::RegKeyOrphan { key: key(Hive::CurrentUser, r"Software\Vendor Cache") },
+            Evidence::RegKeyOrphan { key: key(Hive::CurrentUser, r"Software\Vendor Cache"), shared: false },
         ];
         let ghosts = group_t(ev, &installed(&[]), &KeepList::default(), &r, None);
         assert_eq!(summary(&ghosts), vec![("Vendor Cache".to_string(), Assessment::Uncertain)]);

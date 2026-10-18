@@ -4,7 +4,6 @@ use crate::leftovers::names::normalize_name;
 use crate::model::RegKeyPath;
 use crate::pathutil::norm;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -27,34 +26,27 @@ fn same_key(a: &RegKeyPath, b: &RegKeyPath) -> bool {
     a.hive == b.hive && key_str(a) == key_str(b)
 }
 
+/// The largest keep list read (1 MiB); a larger file is ignored.
+pub const MAX_KEEP_LIST_BYTES: u64 = crate::trusted::MAX_TRUSTED_BYTES;
+
 impl KeepList {
-    /// Defaults when the file is missing or unparsable; unknown fields are ignored.
+    /// Defaults when the file is missing or unparsable; unknown fields are ignored. Defaults with
+    /// a warning when it is a link or reparse point, larger than [`MAX_KEEP_LIST_BYTES`], or not
+    /// owned by Administrators or SYSTEM (judged on the handle it is read from, see
+    /// [`crate::trusted::read_trusted`]).
     pub fn load_from(path: &Path) -> KeepList {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        Self::load_from_with(path, &crate::trusted::live_owner_trusted)
     }
 
-    /// Writes pretty JSON atomically (`<path>.tmp`, flushed to disk, then renamed over `path`).
+    /// [`Self::load_from`] with the owner check `owner_trusted`.
+    pub fn load_from_with(path: &Path, owner_trusted: &dyn Fn(&std::fs::File) -> Option<bool>) -> KeepList {
+        crate::trusted::load_json(path, MAX_KEEP_LIST_BYTES, owner_trusted)
+    }
+
+    /// Writes pretty JSON atomically (a new file, flushed to disk, renamed over `path`); refuses a
+    /// link or reparse point at `path`.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let result = (|| {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        crate::trusted::write_replacing(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     /// True when `p` equals a kept path or lies strictly under one (compared with [`norm`]).
@@ -118,6 +110,7 @@ impl KeepList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trusted::tests::{trust_all, trust_none};
     use crate::leftovers::scan::filter_kept;
     use crate::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
     use crate::model::Hive;
@@ -128,18 +121,51 @@ mod tests {
     fn keep_list_roundtrip_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("important.json");
-        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), KeepList::default());
         let mut k = KeepList::default();
         k.keep_path(PathBuf::from(r"C:\Apps\Foo"));
         k.keep_key(key(Hive::CurrentUser, r"Software\Foo"));
         k.keep_name("Foo".to_string());
         k.save_to(&path).unwrap();
-        assert_eq!(KeepList::load_from(&path), k);
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), k);
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), KeepList::default());
         std::fs::write(&path, r#"{"names":["x"],"future":1}"#).unwrap();
-        assert_eq!(KeepList::load_from(&path).names, vec!["x".to_string()]);
+        assert_eq!(KeepList::load_from_with(&path, &trust_all).names, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn untrusted_or_linked_keep_list_is_ignored_and_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        let mut k = KeepList::default();
+        k.keep_name("planted".to_string());
+        k.save_to(&path).unwrap();
+        assert_eq!(KeepList::load_from_with(&path, &trust_none), KeepList::default(), "untrusted owner");
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("linked.json");
+        assert!(crate::testutil::junction(&link, &target), "mklink /J failed");
+        assert_eq!(KeepList::load_from_with(&link, &trust_all), KeepList::default());
+        assert!(k.save_to(&link).is_err());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    #[test]
+    fn oversized_keep_list_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        // Valid JSON, padded with whitespace to just over 1 MiB.
+        let body = r#"{"names":["x"]}"#;
+        let padded = format!("{body}{}", " ".repeat(MAX_KEEP_LIST_BYTES as usize + 1 - body.len()));
+        std::fs::write(&path, &padded).unwrap();
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), KeepList::default());
+        // Exactly at the cap it is still read.
+        std::fs::write(&path, &padded[..MAX_KEEP_LIST_BYTES as usize]).unwrap();
+        assert_eq!(KeepList::load_from_with(&path, &trust_all).names, vec!["x".to_string()]);
+        assert_eq!(MAX_KEEP_LIST_BYTES, 1024 * 1024);
     }
 
     #[test]

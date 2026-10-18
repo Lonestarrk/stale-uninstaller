@@ -3,10 +3,11 @@
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::fsys::FsReader;
 use crate::model::Hive;
-use crate::pathutil::{exe_under, expand_env};
+use crate::pathutil::{exe_under, expand_env, norm};
 use crate::registry::{key, RegValue, RegistryReader};
 use crate::services::{normalize_image_path, SERVICES_ROOT};
 use crate::shortcuts::ShortcutTarget;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// The install folder to match against ([`ProgramHint::effective_install_dir`]); `None` when
@@ -69,6 +70,18 @@ pub(crate) fn task_files(fs: &dyn FsReader, dir: &Path, out: &mut Vec<PathBuf>) 
             out.push(entry.path);
         }
     }
+}
+
+/// `norm()`ed command of every scheduled-task action (usage matching must not count these).
+pub fn task_exes(fs: &dyn FsReader, tasks_root: &Path) -> HashSet<String> {
+    let mut files = Vec::new();
+    task_files(fs, tasks_root, &mut files);
+    files
+        .iter()
+        .filter_map(|f| fs.read_text(f))
+        .flat_map(|xml| task_commands(&xml))
+        .map(|c| norm(&c))
+        .collect()
 }
 
 /// Scheduled tasks (one leftover per task file) with a command inside the install folder.
@@ -136,6 +149,17 @@ mod tests {
         );
         assert!(scan_services(&reg, &hint(None)).is_empty());
         assert!(scan_services(&reg, &hint(Some(r"C:\Program Files"))).is_empty());
+    }
+
+    #[test]
+    fn task_exes_collects_every_command_normalized() {
+        let root = r"C:\Windows\System32\Tasks";
+        let fs = FakeFs::new()
+            .text(&format!(r"{root}\A\One"), r#"<Command>"C:\Apps\Foo\a.exe"</Command><Command>C:\X\b.EXE</Command>"#)
+            .text(&format!(r"{root}\Two"), r"<Command>C:\Apps\Foo\c.exe</Command>");
+        let got = task_exes(&fs, Path::new(root));
+        assert_eq!(got.len(), 3);
+        assert!(got.contains(&norm(Path::new(r"C:\x\B.exe"))));
     }
 
     #[test]

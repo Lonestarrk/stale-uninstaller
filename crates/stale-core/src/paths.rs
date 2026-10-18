@@ -99,9 +99,12 @@ pub fn logs_dir() -> PathBuf {
     dir
 }
 
-/// `%SystemDrive%\Users`.
+/// The Users folder from `SHGetKnownFolderPath(FOLDERID_UserProfiles)`; `%SystemDrive%\Users`
+/// only when that fails.
 pub fn user_profiles_root() -> PathBuf {
-    PathBuf::from(format!(r"{}\Users", env_or("SystemDrive", "C:")))
+    use windows::Win32::UI::Shell::FOLDERID_UserProfiles;
+    crate::knownfolders::resolve_id(&FOLDERID_UserProfiles)
+        .unwrap_or_else(|| PathBuf::from(format!(r"{}\Users", env_or("SystemDrive", "C:"))))
 }
 
 /// `data_dir()\quarantine`: one manifest per quarantine. Created on demand (creation errors are ignored).
@@ -124,6 +127,7 @@ mod tests {
     #[cfg(not(feature = "e2e-overrides"))]
     #[test]
     fn data_dir_override_env_is_ignored_without_the_feature() {
+        let _env = crate::env_lock();
         let expected = program_data_dir().join("Stale Uninstaller");
         std::env::set_var("STALE_E2E_DATA_DIR", r"C:\e2e-should-be-ignored");
         let got = data_dir_path();

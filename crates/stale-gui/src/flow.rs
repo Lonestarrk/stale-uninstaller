@@ -4,7 +4,13 @@ use stale_core::leftovers::LeftoverReport;
 use stale_core::uninstall::{RestorePointStatus, UninstallEvent, VendorResult};
 use stale_core::ProgramId;
 
-use crate::strings;
+use crate::warning::{Msg, Warning};
+
+/// True when every flagged item (`(is_dependency, acknowledged)`) has been acknowledged, which
+/// is what enables Starta in the summary dialog.
+pub fn dependencies_acknowledged(items: &[(bool, bool)]) -> bool {
+    items.iter().all(|&(dependency, acknowledged)| !dependency || acknowledged)
+}
 
 /// The queue's current phase, shown as the dialog's step indicator.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,7 +42,7 @@ pub struct FlowState {
     pub restore_point: Option<RestorePointStatus>,
     /// Leftover reports keyed by item index.
     pub reports: Vec<(usize, LeftoverReport)>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
     pub finished: bool,
 }
 
@@ -83,9 +89,10 @@ impl FlowState {
             }
             UninstallEvent::NoUninstaller { index } => {
                 let name = self.items.get(index).map_or("", |(_, name, _)| name.as_str());
-                self.warnings.push(strings::no_uninstaller(name));
+                self.warnings.push(Warning::NoUninstaller(name.to_string()));
             }
-            UninstallEvent::Warning(w) => self.warnings.push(w),
+            // Only the GUI worker sends it, with the reason the uninstall thread did not start.
+            UninstallEvent::Warning(detail) => self.warnings.push(Warning::Detail(Msg::UninstallThreadFailed, detail)),
             UninstallEvent::QueueDone => self.finish(),
         }
     }
@@ -119,6 +126,15 @@ impl FlowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starta_disabled_until_dependency_acknowledged() {
+        assert!(dependencies_acknowledged(&[]));
+        assert!(dependencies_acknowledged(&[(false, false)]));
+        assert!(!dependencies_acknowledged(&[(false, false), (true, false)]));
+        assert!(!dependencies_acknowledged(&[(true, true), (true, false)]));
+        assert!(dependencies_acknowledged(&[(true, true), (false, false)]));
+    }
 
     fn flow(n: usize) -> FlowState {
         let items: Vec<(ProgramId, String)> =
@@ -161,8 +177,11 @@ mod tests {
         f.apply(UninstallEvent::QueueDone);
         assert!(f.finished);
         assert_eq!(f.step, Step::Done);
-        assert_eq!(f.warnings, vec![strings::no_uninstaller("App 2"), "w".to_string()]);
-        assert_eq!(f.warnings[0], "App 2: ingen avinstallerare hittades, tvingad borttagning");
+        assert_eq!(
+            f.warnings,
+            vec![Warning::NoUninstaller("App 2".into()), Warning::Detail(Msg::UninstallThreadFailed, "w".into())]
+        );
+        assert_eq!(f.warnings[0].text(), "App 2: ingen avinstallerare hittades, tvingad borttagning");
         assert_eq!(f.reports.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(f.items[3].2, ItemState::Skipped, "never started");
     }

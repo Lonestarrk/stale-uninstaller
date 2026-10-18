@@ -46,7 +46,70 @@ pub fn decode_text(bytes: &[u8]) -> String {
 
 const SKIPPED_PROFILES: [&str; 4] = ["public", "default", "default user", "all users"];
 
-pub struct RealFs;
+/// The registry key with one subkey per user profile (`ProfileImagePath`).
+pub const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// Every `ProfileImagePath` under [`PROFILE_LIST`], environment variables expanded; profiles may
+/// live outside the Users folder.
+pub fn profile_list_dirs(reg: &dyn crate::registry::RegistryReader) -> Vec<PathBuf> {
+    use crate::registry::{key, RegValue};
+    let root = key(crate::model::Hive::LocalMachine, PROFILE_LIST);
+    reg.subkeys(&root)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|sid| {
+            let values = reg.values(&key(crate::model::Hive::LocalMachine, &format!(r"{PROFILE_LIST}\{sid}"))).ok()?;
+            values.into_iter().find_map(|(n, v)| match v {
+                RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ProfileImagePath") => {
+                    let s = crate::pathutil::expand_env(s.trim());
+                    (!s.is_empty()).then(|| PathBuf::from(s))
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// `listed` (the Users folder's children) then `registered` (the ProfileList), deduplicated by
+/// [`crate::pathutil::norm`]: existing folders only, never Public / Default / Default User / All
+/// Users, and never a service profile below the (normed) `windows` folder.
+pub(crate) fn merge_profiles(listed: Vec<PathBuf>, registered: Vec<PathBuf>, is_dir: &dyn Fn(&Path) -> bool, windows: &str) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    listed
+        .into_iter()
+        .chain(registered)
+        .filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let n = norm(p);
+            !SKIPPED_PROFILES.contains(&name.as_str())
+                && n != windows
+                && !crate::pathutil::normed_under(&n, windows)
+                && is_dir(p)
+                && seen.insert(n)
+        })
+        .collect()
+}
+
+/// The real file system. Its profile folders are the Users folder's children plus
+/// `registered_profiles`, which the caller passes in ([`RealFs::live`] reads them from the
+/// registry's ProfileList): the reader itself never reads the registry.
+#[derive(Clone, Debug, Default)]
+pub struct RealFs {
+    registered_profiles: Vec<PathBuf>,
+}
+
+impl RealFs {
+    /// The real file system with the profile folders of the registry's ProfileList
+    /// ([`profile_list_dirs`]), read once, here.
+    pub fn live() -> RealFs {
+        RealFs::with_registered_profiles(profile_list_dirs(&crate::registry::WinRegistry))
+    }
+
+    /// The real file system with `registered` as the ProfileList's profile folders.
+    pub fn with_registered_profiles(registered: Vec<PathBuf>) -> RealFs {
+        RealFs { registered_profiles: registered }
+    }
+}
 
 impl FsReader for RealFs {
     fn list_dir(&self, dir: &Path) -> Vec<DirEntryInfo> {
@@ -77,15 +140,9 @@ impl FsReader for RealFs {
     }
 
     fn profile_dirs(&self) -> Vec<PathBuf> {
-        self.list_dir(&crate::paths::user_profiles_root())
-            .into_iter()
-            .filter(|e| e.is_dir)
-            .filter(|e| {
-                let name = e.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-                !SKIPPED_PROFILES.contains(&name.as_str())
-            })
-            .map(|e| e.path)
-            .collect()
+        let listed: Vec<PathBuf> =
+            self.list_dir(&crate::paths::user_profiles_root()).into_iter().filter(|e| e.is_dir).map(|e| e.path).collect();
+        merge_profiles(listed, self.registered_profiles.clone(), &|p| p.is_dir(), &crate::pathutil::norm(&crate::paths::windows_dir()))
     }
 
     fn env(&self, var: &str) -> Option<String> {
@@ -236,6 +293,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_list_adds_profiles_outside_users() {
+        use crate::model::Hive;
+        use crate::registry::{key, FakeRegistry, RegValue};
+        let mut reg = FakeRegistry::new();
+        let profile = |sid: &str, path: &str, reg: &mut FakeRegistry| {
+            let k = key(Hive::LocalMachine, &format!(r"{PROFILE_LIST}\{sid}"));
+            reg.set(k, "ProfileImagePath", RegValue::ExpandStr(path.into()));
+        };
+        profile("S-1-5-21-1", r"D:\Profiles\Bob", &mut reg);
+        profile("S-1-5-21-2", r"c:\users\a", &mut reg);
+        profile("S-1-5-21-3", r"E:\Gone\Carl", &mut reg);
+        profile("S-1-5-18", r"C:\Windows\system32\config\systemprofile", &mut reg);
+        reg.add_key(key(Hive::LocalMachine, &format!(r"{PROFILE_LIST}\S-1-5-21-4")));
+        let mut listed = profile_list_dirs(&reg);
+        listed.sort_by_key(|p| p.display().to_string());
+        assert_eq!(
+            listed,
+            vec![
+                PathBuf::from(r"C:\Windows\system32\config\systemprofile"),
+                PathBuf::from(r"D:\Profiles\Bob"),
+                PathBuf::from(r"E:\Gone\Carl"),
+                PathBuf::from(r"c:\users\a"),
+            ]
+        );
+        let fs = FakeFs::new()
+            .dir(r"C:\Users\A", 0)
+            .dir(r"D:\Profiles\Bob", 0)
+            .dir(r"C:\Windows\system32\config\systemprofile", 0);
+        let got = merge_profiles(vec![PathBuf::from(r"C:\Users\A")], profile_list_dirs(&reg), &|p| fs.is_dir(p), r"C:\WINDOWS");
+        // Deduplicated, existing folders only, nothing below Windows.
+        assert_eq!(got, vec![PathBuf::from(r"C:\Users\A"), PathBuf::from(r"D:\Profiles\Bob")]);
+    }
+
+    #[test]
     fn fake_lists_children_with_sizes_and_creates_parents() {
         let fs = FakeFs::new().dir(r"C:\A\B", 100).file(r"C:\A\f.txt", 7).file(r"C:\A\C\g.txt", 5);
         assert!(fs.is_dir(Path::new(r"c:/a")));
@@ -272,16 +363,16 @@ mod tests {
     #[test]
     fn real_fs_modified_reads_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let got = RealFs.modified(dir.path()).expect("modified time");
+        let got = RealFs::default().modified(dir.path()).expect("modified time");
         assert!((Utc::now() - got).num_minutes().abs() < 5);
-        assert_eq!(RealFs.modified(&dir.path().join("missing")), None);
+        assert_eq!(RealFs::default().modified(&dir.path().join("missing")), None);
     }
 
     #[test]
     #[ignore]
     fn real_fs_lists_program_files() {
-        let pf = RealFs.env("ProgramFiles").unwrap();
-        assert!(!RealFs.list_dir(Path::new(&pf)).is_empty());
+        let pf = RealFs::default().env("ProgramFiles").unwrap();
+        assert!(!RealFs::default().list_dir(Path::new(&pf)).is_empty());
     }
 
     fn utf16le(s: &str) -> Vec<u8> {

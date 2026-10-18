@@ -77,6 +77,7 @@ mod tests {
 
     #[test]
     fn system32_tool_does_not_depend_on_env() {
+        let _env = crate::env_lock();
         let real = crate::paths::windows_dir();
         let saved = std::env::var_os("SystemRoot");
         // Edition 2021: set_var is safe; restored right after.

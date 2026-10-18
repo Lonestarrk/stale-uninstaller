@@ -226,8 +226,9 @@ mod tests {
                 scope: Scope::Machine,
             },
             usage: Some(ProgramUsage {
-                last_used: LastUsed { when: days_ago.map(|d| now() - Duration::days(d)), source: None, confident: true },
+                last_used: LastUsed { when: days_ago.map(|d| now() - Duration::days(d)), source: None, confident: true, via: None, autostart: false },
                 exes: Vec::new(),
+                main_exe: None,
             }),
             size: None,
         }

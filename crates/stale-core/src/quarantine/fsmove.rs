@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::QuarantineId;
+use super::{codes, QuarantineId};
 use crate::pathutil::{drive_letter, norm};
 
 /// Why [`FileMover::move_path`] did not complete.
@@ -26,11 +26,11 @@ pub enum MoveError {
 impl fmt::Display for MoveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MoveError::Exists => write!(f, "destination already exists"),
-            MoveError::Locked(p) => write!(f, "locked: {}", p.display()),
-            MoveError::LinkInTree(p) => write!(f, "link in tree: {}", p.display()),
+            MoveError::Exists => f.write_str(codes::DESTINATION_EXISTS),
+            MoveError::Locked(p) => write!(f, "{}: {}", codes::LOCKED, p.display()),
+            MoveError::LinkInTree(p) => write!(f, "{}: {}", codes::LINK_IN_TREE, p.display()),
             MoveError::PartialMove { stored, detail } => {
-                write!(f, "copied to {} but the source was not fully removed: {detail}", stored.display())
+                write!(f, "{}: copied to {}; {detail}", codes::PARTIAL_MOVE, stored.display())
             }
             MoveError::Other(s) => f.write_str(s),
         }
@@ -201,7 +201,7 @@ impl FileMover for RealFileMover {
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String> {
         for p in root.parent().into_iter().chain([root]) {
             if is_reparse_point(p) {
-                return Err(format!("{} is a link or reparse point", p.display()));
+                return Err(format!("{}: {}", codes::IS_REPARSE, p.display()));
             }
         }
         for warning in crate::acl::secure_dir(root, false)? {
@@ -254,7 +254,7 @@ impl FileMover for RealFileMover {
         if !Path::new(&root).exists() {
             return false;
         }
-        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide = crate::pathutil::wide(&root);
         let mut flags = 0u32;
         let mut fs_name = [0u16; 64];
         // SAFETY: `wide` is NUL-terminated and outlives the call; the out-pointers are valid locals.
@@ -513,18 +513,7 @@ mod tests {
         src
     }
 
-    /// Creates a directory junction (no privilege needed); `false` if this machine refuses.
-    fn junction(link: &Path, target: &Path) -> bool {
-        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-            return true;
-        }
-        std::process::Command::new(crate::proc::system32_tool("cmd.exe"))
-            .args(["/c", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
+    use crate::testutil::junction;
 
     #[test]
     fn real_mover_moves_tree_and_creates_parents() {

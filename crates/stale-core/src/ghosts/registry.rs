@@ -5,10 +5,10 @@ use super::{format_location, Collected, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
 use crate::leftovers::names::name_matches_exact;
-use crate::leftovers::reg_scan::{child, default_string, path_in_value, string_value, RegScanRoots};
+use crate::leftovers::reg_scan::{child, command_arguments, default_string, path_in_value, string_value, RegScanRoots};
 use crate::leftovers::system_root_norm;
 use crate::model::RegKeyPath;
-use crate::pathutil::{drive_letter, first_path_in_command, is_shared_root, norm, normed_under};
+use crate::pathutil::{drive_letter, expand_env, first_path_in_command, is_shared_root, norm, normed_under};
 use crate::registry::RegistryReader;
 use std::path::{Path, PathBuf};
 
@@ -54,13 +54,18 @@ impl Ctx<'_> {
             && !self.fs.exists(p)
     }
 
+    /// Records `p` as a live target when it is an existing absolute path; true then.
+    fn note_live(&self, p: &Path) -> bool {
+        let live = p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p);
+        if live {
+            self.live.borrow_mut().push(p.to_path_buf());
+        }
+        live
+    }
+
     /// [`Self::is_dead`] for a reference's target; an existing target is recorded as live instead.
     fn is_dead_ref(&self, p: &Path) -> bool {
-        if p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p) {
-            self.live.borrow_mut().push(p.to_path_buf());
-            return false;
-        }
-        self.is_dead(p)
+        !self.note_live(p) && self.is_dead(p)
     }
 
     fn examines(&self, k: &RegKeyPath) -> bool {
@@ -69,7 +74,7 @@ impl Ctx<'_> {
 }
 
 fn dangling(kind: RefKind, k: &RegKeyPath, target: PathBuf, value_name: Option<String>) -> Evidence {
-    Evidence::DanglingRef { kind, location: format_location(k), target, value_name }
+    Evidence::DanglingRef { kind, location: format_location(k), target, value_name, partly_live: false }
 }
 
 /// Vendor keys whose install path is gone, then Run values, App Paths entries and COM classes /
@@ -137,30 +142,33 @@ fn software_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
             continue;
         }
         let forced = CONTAINER_KEYS.iter().any(|c| c.eq_ignore_ascii_case(&sub));
-        if !forced && path_values(cx, &k, out) {
+        let children = cx.reg.subkeys(&k).unwrap_or_default();
+        // Removing the key would take an installed program's subkey with it.
+        let shared = children.iter().any(|c| cx.installed.matches_name(c) || cx.installed.matches_in_container(c, &sub));
+        if !forced && path_values(cx, &k, shared, out) {
             continue;
         }
         // No path value, but named exactly like an orphan folder: that program's vendor key.
         if !forced && cx.folder_names.iter().any(|f| name_matches_exact(&sub, f)) {
-            out.push(Evidence::RegKeyOrphan { key: k });
+            out.push(Evidence::RegKeyOrphan { key: k, shared });
             continue;
         }
-        let children = cx.reg.subkeys(&k).unwrap_or_default();
         if !forced && children.len() < 2 {
             continue;
         }
         for c in children {
             let ck = child(&k, &c);
             if !cx.installed.matches_name(&c) && !cx.installed.matches_in_container(&c, &sub) && cx.examines(&ck) {
-                path_values(cx, &ck, out);
+                let shared = cx.reg.subkeys(&ck).unwrap_or_default().iter().any(|g| cx.installed.matches_name(g));
+                path_values(cx, &ck, shared, out);
             }
         }
     }
 }
 
-/// Pushes a [`Evidence::RegKeyMissingPath`] per dead install-path value of `k`; true when `k`
-/// has any value named in [`PATH_VALUE_NAMES`].
-fn path_values(cx: &Ctx, k: &RegKeyPath, out: &mut Vec<Evidence>) -> bool {
+/// Pushes a [`Evidence::RegKeyMissingPath`] (with `shared`) per dead install-path value of `k`;
+/// true when `k` has any value named in [`PATH_VALUE_NAMES`].
+fn path_values(cx: &Ctx, k: &RegKeyPath, shared: bool, out: &mut Vec<Evidence>) -> bool {
     let mut has_path_value = false;
     for (name, value) in cx.reg.values(k).unwrap_or_default() {
         if !PATH_VALUE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
@@ -168,7 +176,7 @@ fn path_values(cx: &Ctx, k: &RegKeyPath, out: &mut Vec<Evidence>) -> bool {
         }
         has_path_value = true;
         if let Some(path) = string_value(&value, k).as_deref().and_then(install_dir).filter(|p| cx.is_dead(p)) {
-            out.push(Evidence::RegKeyMissingPath { key: k.clone(), value_name: name, path });
+            out.push(Evidence::RegKeyMissingPath { key: k.clone(), value_name: name, path, shared });
         }
     }
     has_path_value
@@ -196,14 +204,36 @@ fn looks_like_file(p: &Path) -> bool {
     })
 }
 
-/// (b) Autostart command lines whose exe is missing.
-fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
-    if !cx.examines(root) {
-        return;
+/// The DLL a `rundll32 <dll>,<entry>` command line loads; `None` for any other command.
+fn rundll32_dll(cmd: &str) -> Option<PathBuf> {
+    let exe = first_path_in_command(cmd)?;
+    if !exe.file_stem()?.to_string_lossy().eq_ignore_ascii_case("rundll32") {
+        return None;
     }
+    // What follows the exe path itself (a folder may be named `rundll32` too).
+    let rest = command_arguments(cmd);
+    let dll = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split(',').next()?,
+    };
+    let dll = expand_env(dll.trim());
+    let dll = dll.trim();
+    (!dll.is_empty()).then(|| PathBuf::from(dll))
+}
+
+/// (b) Autostart command lines whose exe is missing. The existing exe, and the DLL of a
+/// `rundll32` line, are live targets, under a kept key too.
+fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
+    let kept = !cx.examines(root);
     for (name, value) in cx.reg.values(root).unwrap_or_default() {
-        if let Some(target) = string_value(&value, root).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
-            out.push(dangling(RefKind::Run, root, target, Some(name)));
+        let Some(cmd) = string_value(&value, root) else { continue };
+        if let Some(dll) = rundll32_dll(&cmd) {
+            cx.note_live(&dll);
+        }
+        if let Some(target) = first_path_in_command(&cmd).filter(|p| cx.is_dead_ref(p)) {
+            if !kept {
+                out.push(dangling(RefKind::Run, root, target, Some(name)));
+            }
         }
     }
 }
@@ -212,41 +242,46 @@ fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
 fn app_path_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
     for sub in cx.reg.subkeys(root).unwrap_or_default() {
         let k = child(root, &sub);
-        if !cx.examines(&k) {
-            continue;
-        }
+        let kept = !cx.examines(&k);
         if let Some(target) = default_string(cx.reg, &k).as_deref().and_then(path_in_value).filter(|p| cx.is_dead_ref(p)) {
-            out.push(dangling(RefKind::AppPaths, &k, target, None));
+            if !kept {
+                out.push(dangling(RefKind::AppPaths, &k, target, None));
+            }
         }
     }
 }
 
 /// (d) One pass over a classes root: per `CLSID\{…}` only the [`SERVER_KEYS`] defaults, per
-/// other subkey only the `shell\open\command` default; nothing deeper.
+/// other subkey only the `shell\open\command` default; nothing deeper. A kept key is never
+/// evidence, but its existing targets are live.
 fn class_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
     for sub in cx.reg.subkeys(root).unwrap_or_default() {
         let k = child(root, &sub);
         if sub.eq_ignore_ascii_case("CLSID") {
             for clsid in cx.reg.subkeys(&k).unwrap_or_default() {
                 let c = child(&k, &clsid);
-                if !cx.examines(&c) {
-                    continue;
-                }
-                // Every server is checked, so each existing one is recorded as live.
-                let mut target = None;
+                let kept = !cx.examines(&c);
+                // Every server is checked, so each existing one is recorded as live. A class
+                // with any server that is not verifiably gone (live, a bare name such as
+                // `mscoree.dll`, on a missing drive, kept or installed) is never evidence.
+                let (mut target, mut other_alive) = (None, false);
                 for p in SERVER_KEYS.iter().filter_map(|s| default_string(cx.reg, &child(&c, s)).as_deref().and_then(path_in_value)) {
-                    if cx.is_dead_ref(&p) && target.is_none() {
+                    if !cx.is_dead_ref(&p) {
+                        other_alive = true;
+                    } else if target.is_none() {
                         target = Some(p);
                     }
                 }
-                if let Some(target) = target {
+                if let Some(target) = target.filter(|_| !kept && !other_alive) {
                     out.push(dangling(RefKind::ClassesServer, &c, target, None));
                 }
             }
-        } else if cx.examines(&k) {
+        } else {
             let command = default_string(cx.reg, &child(&k, r"shell\open\command"));
             if let Some(target) = command.as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
-                out.push(dangling(RefKind::ShellCommand, &k, target, None));
+                if cx.examines(&k) {
+                    out.push(dangling(RefKind::ShellCommand, &k, target, None));
+                }
             }
         }
     }
@@ -258,7 +293,6 @@ mod tests {
     use crate::fsys::FakeFs;
     use crate::ghosts::RefKind;
     use crate::model::{Hive, Program, ProgramId, RegKeyPath, Scope};
-    use crate::pathutil::expand_env;
     use crate::registry::{key, FakeRegistry, RegValue};
     use std::path::PathBuf;
 
@@ -309,7 +343,7 @@ mod tests {
     }
 
     fn missing(hive: Hive, path: &str, value_name: &str, target: &str) -> Evidence {
-        Evidence::RegKeyMissingPath { key: key(hive, path), value_name: value_name.into(), path: PathBuf::from(target) }
+        Evidence::RegKeyMissingPath { key: key(hive, path), value_name: value_name.into(), path: PathBuf::from(target), shared: false }
     }
 
     fn dangling(kind: RefKind, location: &str, target: &str, value_name: Option<&str>) -> Evidence {
@@ -318,6 +352,7 @@ mod tests {
             location: location.into(),
             target: PathBuf::from(target),
             value_name: value_name.map(str::to_string),
+            partly_live: false,
         }
     }
 
@@ -384,6 +419,7 @@ mod tests {
 
     #[test]
     fn dangling_run_value_is_evidence() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         let run = key(Hive::CurrentUser, RUN);
         reg.set(run.clone(), "Gone", s(r#""C:\Gone Tray\tray.exe" --minimized"#));
@@ -396,7 +432,7 @@ mod tests {
         let ev = scan(&reg, &fs, &[program("Some Suite", Some(r"D:\Suite"))], &KeepList::default());
         assert_eq!(
             ev,
-            vec![dangling(RefKind::Run, &format!(r"CurrentUser\{RUN}"), r"C:\Gone Tray\tray.exe", Some("Gone"))]
+            vec![dangling(RefKind::Run, &format!(r"HKCU\{RUN}"), r"C:\Gone Tray\tray.exe", Some("Gone"))]
         );
     }
 
@@ -413,10 +449,10 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                dangling(RefKind::AppPaths, &format!(r"LocalMachine\{APP_PATHS}\gone.exe"), r"C:\Gone\gone.exe", None),
+                dangling(RefKind::AppPaths, &format!(r"HKLM\{APP_PATHS}\gone.exe"), r"C:\Gone\gone.exe", None),
                 dangling(
                     RefKind::ShellCommand,
-                    r"LocalMachine\SOFTWARE\Classes\goneproto",
+                    r"HKLM\SOFTWARE\Classes\goneproto",
                     r"C:\Program Files\Gone\gone.exe",
                     None
                 ),
@@ -455,8 +491,8 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                dangling(RefKind::ClassesServer, &format!(r"LocalMachine\{CLSID}\{{A}}"), r"C:\Program Files\Gone Ext\ext.dll", None),
-                dangling(RefKind::ClassesServer, &format!(r"LocalMachine\{CLSID}\{{D}}"), r"D:\Gone\server.exe", None),
+                dangling(RefKind::ClassesServer, &format!(r"HKLM\{CLSID}\{{A}}"), r"C:\Program Files\Gone Ext\ext.dll", None),
+                dangling(RefKind::ClassesServer, &format!(r"HKLM\{CLSID}\{{D}}"), r"D:\Gone\server.exe", None),
             ]
         );
         // One pass: only the root listings and the server defaults are read.
@@ -488,6 +524,92 @@ mod tests {
     }
 
     #[test]
+    fn clsid_with_live_server_not_listed() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(hklm(&format!(r"{CLSID}\{{Mixed}}\InprocServer32")), "", s(r"C:\Apps\Live\ext.dll"));
+        reg.set(hklm(&format!(r"{CLSID}\{{Mixed}}\LocalServer32")), "", s(r"C:\Apps\Gone\server.exe"));
+        reg.set(hklm(&format!(r"{CLSID}\{{Dead}}\LocalServer32")), "", s(r"C:\Apps\Gone\other.exe"));
+        let fs = FakeFs::new().file(r"C:\Apps\Live\ext.dll", 1);
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
+        let location = format!(r"HKLM\{CLSID}\{{Dead}}");
+        assert_eq!(got.evidence, vec![dangling(RefKind::ClassesServer, &location, r"C:\Apps\Gone\other.exe", None)]);
+        assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Apps\Live\ext.dll")]);
+    }
+
+    #[test]
+    fn clsid_with_bare_server_not_listed() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(hklm(&format!(r"{CLSID}\{{Net}}\InprocServer32")), "", s("mscoree.dll"));
+        reg.set(hklm(&format!(r"{CLSID}\{{Net}}\LocalServer32")), "", s(r"C:\Apps\Gone\server.exe"));
+        let got = registry_collect(&reg, &FakeFs::new(), &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
+        assert_eq!(got.evidence, vec![], "a server that is not verifiably gone keeps the class");
+    }
+
+    #[test]
+    fn rundll32_dll_is_live() {
+        let _env = crate::env_lock();
+        let mut reg = FakeRegistry::new();
+        let run = key(Hive::CurrentUser, RUN);
+        let rundll32 = expand_env(r"%SystemRoot%\System32\rundll32.exe");
+        reg.set(run.clone(), "Plain", s(&format!(r"{rundll32} C:\Vendor Tools\helper.dll,Start /x")));
+        reg.set(run.clone(), "Quoted", s(&format!(r#""{rundll32}" "C:\Vendor Tools\quoted.dll",Run"#)));
+        reg.set(run, "Bare", s(r"rundll32 C:\Vendor Tools\bare.dll,Go"));
+        let fs = FakeFs::new()
+            .file(r"C:\Vendor Tools\helper.dll", 1)
+            .file(r"C:\Vendor Tools\quoted.dll", 1)
+            .file(r"C:\Vendor Tools\bare.dll", 1);
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
+        assert_eq!(got.evidence, vec![]);
+        let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
+        live.sort();
+        assert_eq!(live, vec![r"C:\Vendor Tools\bare.dll", r"C:\Vendor Tools\helper.dll", r"C:\Vendor Tools\quoted.dll"]);
+    }
+
+    #[test]
+    fn rundll32_dll_follows_the_exe_path() {
+        let _env = crate::env_lock();
+        // "rundll32" in a folder name is not where the arguments start.
+        assert_eq!(rundll32_dll(r"C:\Tools\rundll32\rundll32.exe x.dll,Go"), Some(PathBuf::from("x.dll")));
+        assert_eq!(rundll32_dll(r#""C:\Tools\rundll32\rundll32.exe" "C:\A B\y.dll",Go"#), Some(PathBuf::from(r"C:\A B\y.dll")));
+        assert_eq!(rundll32_dll(r"rundll32 C:\Vendor Tools\bare.dll,Go"), Some(PathBuf::from(r"C:\Vendor Tools\bare.dll")));
+        // Variables in the DLL path are expanded.
+        assert_eq!(rundll32_dll(r"rundll32.exe %SystemRoot%\x.dll,Go"), Some(PathBuf::from(expand_env(r"%SystemRoot%\x.dll"))));
+        assert_eq!(rundll32_dll(r"C:\Tools\other.exe x.dll,Go"), None);
+    }
+
+    #[test]
+    fn kept_key_target_is_live() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(key(Hive::CurrentUser, RUN), "Tray", s(r#""C:\Apps\Kept\tray.exe" --min"#));
+        reg.set(hklm(&format!(r"{APP_PATHS}\kept.exe")), "", s(r"C:\Apps\Kept\kept.exe"));
+        reg.set(hklm(&format!(r"{CLSID}\{{K}}\InprocServer32")), "", s(r"C:\Apps\Kept\ext.dll"));
+        reg.set(hklm(&format!(r"{CLSID}\{{K}}\LocalServer32")), "", s(r"C:\Apps\Gone\server.exe"));
+        reg.set(hklm(r"SOFTWARE\Classes\keptproto\shell\open\command"), "", s(r#""C:\Apps\Kept\open.exe" "%1""#));
+        let fs = FakeFs::new()
+            .file(r"C:\Apps\Kept\tray.exe", 1)
+            .file(r"C:\Apps\Kept\kept.exe", 1)
+            .file(r"C:\Apps\Kept\ext.dll", 1)
+            .file(r"C:\Apps\Kept\open.exe", 1);
+        let keep = KeepList {
+            keys: vec![
+                key(Hive::CurrentUser, RUN),
+                hklm(&format!(r"{APP_PATHS}\kept.exe")),
+                hklm(&format!(r"{CLSID}\{{K}}")),
+                hklm(r"SOFTWARE\Classes\keptproto"),
+            ],
+            ..KeepList::default()
+        };
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &keep, &all_drives, &[]);
+        assert_eq!(got.evidence, vec![], "kept keys are never evidence");
+        let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
+        live.sort();
+        assert_eq!(live, vec![r"C:\Apps\Kept\ext.dll", r"C:\Apps\Kept\kept.exe", r"C:\Apps\Kept\open.exe", r"C:\Apps\Kept\tray.exe"]);
+    }
+
+    #[test]
     fn wow64_run_value_expands_to_x86() {
         let mut reg = FakeRegistry::new();
         let run = key(Hive::LocalMachine, &format!(r"SOFTWARE\WOW6432Node\{}", &RUN["Software\\".len()..]));
@@ -496,7 +618,7 @@ mod tests {
         let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![run.clone()], app_paths: vec![] };
         let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
         let x86 = std::env::var("ProgramFiles(x86)").unwrap();
-        let location = format!(r"LocalMachine\{}", run.path);
+        let location = format!(r"HKLM\{}", run.path);
         assert_eq!(
             ev,
             vec![
@@ -514,7 +636,7 @@ mod tests {
         reg.set(theirs.clone(), "Fixed", RegValue::ExpandStr(r"C:\Gone Fixed\f.exe".into()));
         let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![theirs.clone()], app_paths: vec![] };
         let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
-        assert_eq!(ev, vec![dangling(RefKind::Run, &format!(r"Users\{}", theirs.path), r"C:\Gone Fixed\f.exe", Some("Fixed"))]);
+        assert_eq!(ev, vec![dangling(RefKind::Run, &format!(r"HKU\{}", theirs.path), r"C:\Gone Fixed\f.exe", Some("Fixed"))]);
     }
 
     #[test]

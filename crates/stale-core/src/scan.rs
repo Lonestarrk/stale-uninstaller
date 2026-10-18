@@ -11,10 +11,12 @@ use crate::pathutil::{exe_under, is_shared_root};
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
 use crate::services::service_exes;
-use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, ShortcutTarget};
+use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, startup_dirs, ShortcutTarget};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
-use crate::usage::matching::{arg_exe_names, is_name_excluded, main_exes, match_usage, MatchInput, ProgramUsage};
+use crate::usage::matching::{
+    arg_exe_names, is_name_excluded, match_usage, program_main_exes, usage_install_dir, MatchInput, ProgramUsage,
+};
 use crate::usage::prefetch::PrefetchProvider;
 use crate::usage::userassist::UserAssistProvider;
 use crate::usage::{UsageHit, UsageProvider};
@@ -32,8 +34,32 @@ pub enum ScanEvent {
     UnmatchedHits(Vec<UsageHit>),
     /// Measured install-folder sizes in bytes, only for programs without a registry estimate.
     Sizes(HashMap<ProgramId, u64>),
-    Warning(String),
+    Warning(ScanWarning),
     Done,
+}
+
+/// Something the user should know about a scan; the GUI words it in the user's language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanWarning {
+    /// `skipped` of the `total` Prefetch files could not be parsed; the rest were used.
+    PrefetchUnreadable { skipped: usize, total: usize },
+    /// The usage source `source` (e.g. `"BAM"`) produced nothing; `error` is the technical detail.
+    SourceFailed { source: String, error: String },
+    /// The scan thread could not be started; `error` is the technical detail.
+    ThreadFailed { error: String },
+}
+
+impl std::fmt::Display for ScanWarning {
+    /// English, for the log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanWarning::PrefetchUnreadable { skipped, total } => {
+                write!(f, "Prefetch: {skipped} of {total} files could not be read")
+            }
+            ScanWarning::SourceFailed { source, error } => write!(f, "{source}: {error}"),
+            ScanWarning::ThreadFailed { error } => write!(f, "could not start the scan thread: {error}"),
+        }
+    }
 }
 
 /// Lists `*.exe` files directly in a folder, with sizes.
@@ -62,6 +88,10 @@ pub struct ScanSources {
     pub file_times: FileTimesFn,
     /// `norm()`ed exe paths of installed services.
     pub service_exes: Box<dyn Fn() -> HashSet<String> + Send>,
+    /// `norm()`ed exe paths of scheduled-task actions.
+    pub task_exes: Box<dyn Fn() -> HashSet<String> + Send>,
+    /// `norm()`ed targets of `Run`/`RunOnce` values and Startup-folder shortcuts.
+    pub autostart_exes: Box<dyn Fn() -> HashSet<String> + Send>,
     /// Resolves `.lnk` hits (UserAssist records Start Menu launches by shortcut path).
     pub resolve_lnk: ResolveLnkFn,
 }
@@ -70,8 +100,11 @@ impl ScanSources {
     /// The real machine: registry, BAM, UserAssist, Prefetch, Start Menu shortcuts, file system.
     pub fn live() -> ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
+        // Usage matching rejects other profiles' Temp folders as install folders.
+        crate::leftovers::init_profile_roots(&crate::fsys::RealFs::live());
         let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
         let services_reg = reg.clone();
+        let autostart_reg = reg.clone();
         ScanSources {
             providers: vec![
                 Box::new(BamProvider { reg: reg.clone(), map: Arc::new(WinDeviceMap::new()) }),
@@ -87,6 +120,16 @@ impl ScanSources {
                 FileTimeProvider { exes: exes.to_vec() }.collect().unwrap_or_default()
             }),
             service_exes: Box::new(move || service_exes(&*services_reg)),
+            task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs::default(), &crate::paths::tasks_root())),
+            autostart_exes: Box::new(move || {
+                let mut exes = crate::leftovers::reg_scan::run_value_exes(&*autostart_reg);
+                exes.extend(
+                    shortcut_targets(&startup_dirs())
+                        .iter()
+                        .flat_map(|t| crate::usage::matching::autostart_targets(&t.path, &t.arguments)),
+                );
+                exes
+            }),
             resolve_lnk: Box::new(resolve_lnk),
         }
     }
@@ -123,6 +166,73 @@ fn find_arg_exes(install: &Path, targets: &[ShortcutTarget], find: &dyn Fn(&Path
     names.iter().flat_map(|n| find(install, n)).collect()
 }
 
+/// Everything usage matching needs besides the programs and shortcut targets.
+pub struct UsageInputs {
+    pub root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>>,
+    pub arg_exes: HashMap<ProgramId, Vec<PathBuf>>,
+    /// Provider hits (`.lnk` hits resolved) plus file-time hits for the main exes.
+    pub hits: Vec<UsageHit>,
+    pub service_exes: HashSet<String>,
+    pub task_exes: HashSet<String>,
+    pub autostart_exes: HashSet<String>,
+    /// Provider failures and partial-result warnings, for the user.
+    pub warnings: Vec<ScanWarning>,
+}
+
+impl UsageInputs {
+    pub fn match_input<'a>(&'a self, programs: &'a [Program], shortcut_targets: &'a [ShortcutTarget]) -> MatchInput<'a> {
+        MatchInput {
+            programs,
+            hits: &self.hits,
+            shortcut_targets,
+            root_exes: &self.root_exes,
+            arg_exes: &self.arg_exes,
+            service_exes: &self.service_exes,
+            task_exes: &self.task_exes,
+            autostart_exes: &self.autostart_exes,
+        }
+    }
+}
+
+/// Reads root exes and Squirrel argument exes (in each program's [`usage_install_dir`]), every
+/// provider's hits and the service exes.
+pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
+    let dirs: Vec<(&ProgramId, PathBuf)> =
+        programs.iter().filter_map(|p| Some((&p.id, usage_install_dir(p, &src.shortcut_targets)?))).collect();
+    let root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>> =
+        dirs.iter().map(|(id, dir)| ((*id).clone(), (src.list_root_exes)(dir))).collect();
+    let arg_exes: HashMap<ProgramId, Vec<PathBuf>> = dirs
+        .iter()
+        .filter_map(|(id, dir)| {
+            let found = find_arg_exes(dir, &src.shortcut_targets, &*src.find_exes);
+            (!found.is_empty()).then(|| ((*id).clone(), found))
+        })
+        .collect();
+    let (service_exes, task_exes) = ((src.service_exes)(), (src.task_exes)());
+    // The same main exes matching uses, so a service never gets a file-time fallback.
+    let mains: Vec<PathBuf> = programs
+        .iter()
+        .flat_map(|p| {
+            let roots = root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
+            let args = arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
+            program_main_exes(p, &src.shortcut_targets, roots, args, &service_exes).0
+        })
+        .collect();
+
+    let (mut hits, mut warnings) = (Vec::new(), Vec::new());
+    for provider in &src.providers {
+        let (result, provider_warnings) = provider.collect_with_warnings();
+        warnings.extend(provider_warnings);
+        match result {
+            Ok(h) => hits.extend(h),
+            Err(error) => warnings.push(ScanWarning::SourceFailed { source: provider.name().to_string(), error }),
+        }
+    }
+    let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
+    hits.extend((src.file_times)(&mains));
+    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, autostart_exes: (src.autostart_exes)(), warnings }
+}
+
 /// Blocking. Stops early when the receiver hangs up.
 pub fn run_scan(src: ScanSources, tx: Sender<ScanEvent>) {
     let _ = scan(src, &tx);
@@ -133,54 +243,12 @@ fn scan(src: ScanSources, tx: &Sender<ScanEvent>) -> Result<(), std::sync::mpsc:
     let programs = enumerate_programs(&*src.reg);
     tx.send(ScanEvent::Programs(programs.clone()))?;
 
-    let root_exes: HashMap<ProgramId, Vec<(PathBuf, u64)>> = programs
-        .iter()
-        .filter_map(|p| Some((p.id.clone(), (src.list_root_exes)(own_folder(p)?))))
-        .collect();
-    let arg_exes: HashMap<ProgramId, Vec<PathBuf>> = programs
-        .iter()
-        .filter_map(|p| {
-            let found = find_arg_exes(own_folder(p)?, &src.shortcut_targets, &*src.find_exes);
-            (!found.is_empty()).then(|| (p.id.clone(), found))
-        })
-        .collect();
-    let mains: Vec<PathBuf> = programs
-        .iter()
-        .flat_map(|p| {
-            let roots = root_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
-            let args = arg_exes.get(&p.id).map(Vec::as_slice).unwrap_or_default();
-            main_exes(p, &src.shortcut_targets, roots, args)
-        })
-        .collect();
-
-    let mut hits = Vec::new();
-    for provider in &src.providers {
-        let (result, warnings) = provider.collect_with_warnings();
-        for w in warnings {
-            log::warn!("{w}");
-            tx.send(ScanEvent::Warning(w))?;
-        }
-        match result {
-            Ok(h) => hits.extend(h),
-            Err(e) => {
-                let msg = format!("{}: {}", provider.name(), e);
-                log::warn!("{msg}");
-                tx.send(ScanEvent::Warning(msg))?;
-            }
-        }
+    let inputs = gather_usage(&src, &programs);
+    for w in &inputs.warnings {
+        log::warn!("{w}");
+        tx.send(ScanEvent::Warning(w.clone()))?;
     }
-    let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
-    hits.extend((src.file_times)(&mains));
-
-    let services = (src.service_exes)();
-    let result = match_usage(&MatchInput {
-        programs: &programs,
-        hits: &hits,
-        shortcut_targets: &src.shortcut_targets,
-        root_exes: &root_exes,
-        arg_exes: &arg_exes,
-        service_exes: &services,
-    });
+    let result = match_usage(&inputs.match_input(&programs, &src.shortcut_targets));
     tx.send(ScanEvent::Usage(result.by_program))?;
     tx.send(ScanEvent::UnmatchedHits(result.unmatched))?;
 
@@ -233,8 +301,8 @@ mod tests {
         fn collect(&self) -> Result<Vec<UsageHit>, String> {
             Ok(vec![])
         }
-        fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
-            (Ok(vec![]), vec!["Prefetch: 2 av 9 filer kunde inte läsas".to_string()])
+        fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<ScanWarning>) {
+            (Ok(vec![]), vec![ScanWarning::PrefetchUnreadable { skipped: 2, total: 9 }])
         }
     }
 
@@ -270,6 +338,8 @@ mod tests {
             dir_size: Box::new(|_: &Path| Some(1234)),
             file_times: Box::new(|_: &[PathBuf]| vec![]),
             service_exes: Box::new(HashSet::new),
+            task_exes: Box::new(HashSet::new),
+            autostart_exes: Box::new(HashSet::new),
             resolve_lnk: Box::new(|_: &Path| None),
         }
     }
@@ -322,6 +392,25 @@ mod tests {
         let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
         let beta = usage.keys().find(|id| id.0.ends_with("Beta")).unwrap();
         assert_eq!(usage[beta].last_used.source, Some(UsageSource::FileTime));
+    }
+
+    #[test]
+    fn file_times_skip_service_main_exes_only() {
+        let mut src = sources(FixedProvider(Ok(vec![])));
+        src.list_root_exes = Box::new(|dir: &Path| vec![(dir.join("agent.exe"), 200), (dir.join("main.exe"), 100)]);
+        // An autostart task's own main exe stays the main exe; a service never is.
+        src.task_exes = Box::new(|| HashSet::from([crate::pathutil::norm(Path::new(r"D:\Apps\Alpha\agent.exe"))]));
+        src.service_exes = Box::new(|| HashSet::from([crate::pathutil::norm(Path::new(r"D:\Apps\Beta\agent.exe"))]));
+        let (tx_exes, rx_exes) = channel();
+        src.file_times = Box::new(move |exes: &[PathBuf]| {
+            tx_exes.send(exes.to_vec()).unwrap();
+            vec![]
+        });
+        run(src);
+        let exes = rx_exes.recv().unwrap();
+        assert!(exes.contains(&PathBuf::from(r"D:\Apps\Alpha\agent.exe")), "{exes:?}");
+        assert!(exes.contains(&PathBuf::from(r"D:\Apps\Beta\main.exe")), "{exes:?}");
+        assert!(!exes.contains(&PathBuf::from(r"D:\Apps\Beta\agent.exe")), "{exes:?}");
     }
 
     #[test]
@@ -378,10 +467,28 @@ mod tests {
         assert!(usage[discord].exes[0].is_main);
     }
 
+    /// Observed live (Steam): no InstallLocation, only an uninstaller in the install folder; the
+    /// root exes must still be listed there so `steam.exe` becomes the main exe.
+    #[test]
+    fn root_exes_are_listed_in_the_uninstallers_folder_without_install_location() {
+        let mut reg = FakeRegistry::new();
+        let k = key(Hive::LocalMachine, &format!(r"{UNINSTALL}\Steam"));
+        reg.set(k.clone(), "DisplayName", RegValue::Str("Steam".into()));
+        reg.set(k, "UninstallString", RegValue::Str(r"D:\Apps\Steam\uninstall.exe".into()));
+        let mut src = sources(FixedProvider(Ok(vec![hit(r"D:\Apps\Steam\main.exe")])));
+        src.reg = Arc::new(reg);
+        let events = run(src);
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let steam = usage.keys().find(|id| id.0.ends_with("Steam")).unwrap();
+        assert_eq!(usage[steam].last_used.source, Some(UsageSource::Bam));
+        assert!(usage[steam].exes[0].is_main, "{:?}", usage[steam].exes);
+    }
+
     #[test]
     fn scan_continues_when_provider_fails() {
         let events = run(sources(FixedProvider(Err("boom".into()))));
-        assert!(events.iter().any(|e| matches!(e, ScanEvent::Warning(w) if w.contains("boom") && w.contains("Fixed"))));
+        let failed = ScanWarning::SourceFailed { source: "Fixed".into(), error: "boom".into() };
+        assert!(events.iter().any(|e| matches!(e, ScanEvent::Warning(w) if *w == failed)));
         assert!(matches!(events.last(), Some(ScanEvent::Done)));
     }
 
@@ -392,7 +499,7 @@ mod tests {
         let events = run(src);
         let kinds: Vec<_> = events.iter().map(kind).collect();
         assert_eq!(kinds, ["Programs", "Warning", "Usage", "UnmatchedHits", "Sizes", "Done"]);
-        assert!(matches!(&events[1], ScanEvent::Warning(w) if w == "Prefetch: 2 av 9 filer kunde inte läsas"));
+        assert!(matches!(&events[1], ScanEvent::Warning(ScanWarning::PrefetchUnreadable { skipped: 2, total: 9 })));
     }
 
     #[test]

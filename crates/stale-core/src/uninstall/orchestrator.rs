@@ -65,7 +65,7 @@ impl UninstallSources {
             runner: Arc::new(JobObjectRunner::new(stop_waiting.clone())),
             programs: enumerate_programs(&*reg),
             reg,
-            fs: Arc::new(RealFs),
+            fs: Arc::new(RealFs::live()),
             // Built once: it resolves every Start Menu shortcut.
             leftovers: Arc::new(LeftoverSources::live()),
             stop_waiting,

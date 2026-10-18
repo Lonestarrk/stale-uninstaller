@@ -12,6 +12,7 @@ use eframe::egui;
 use stale_core::ghosts::{Evidence, Ghost};
 use stale_core::keep::KeepList;
 use stale_core::leftovers::ProgramHint;
+use stale_core::provenance::{InstallSource, Provenance, Signature};
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
 use stale_core::session;
@@ -27,8 +28,12 @@ use crate::flow::FlowState;
 use crate::ghost_sel::GhostSelection;
 use crate::leftover_sel::LeftoverSelection;
 use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
+use crate::warning::{Msg, Warning};
 use crate::worker::{GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
 use crate::{strings, worker};
+
+/// Provenance probes allowed in flight at once; clicking through the list never starts more.
+pub const MAX_PROVENANCE_PROBES: usize = 4;
 
 pub struct Row {
     pub program: Program,
@@ -40,6 +45,16 @@ impl Row {
     /// When the program was last seen in use, if ever.
     pub fn last_used(&self) -> Option<DateTime<Utc>> {
         self.usage.as_ref().and_then(|u| u.last_used.when)
+    }
+
+    /// File name of the subcomponent exe the date came from, when it was not the main exe.
+    pub fn last_used_via(&self) -> Option<&str> {
+        self.usage.as_ref().and_then(|u| u.last_used.via.as_deref())
+    }
+
+    /// Whether the last-used date comes from an automatic start.
+    pub fn last_used_autostart(&self) -> bool {
+        self.usage.as_ref().is_some_and(|u| u.last_used.autostart)
     }
 
     /// The registry estimate, else the measured folder size (spec §5).
@@ -66,6 +81,10 @@ pub struct QueueEntry {
     pub account: Option<String>,
     /// The program's uninstaller executable, from its uninstall command.
     pub uninstall_path: Option<String>,
+    /// Set when other programs probably rely on this one (reason key from the core).
+    pub dependency: Option<&'static str>,
+    /// The user ticked "Jag förstår" for a dependency; reset whenever the dialog opens.
+    pub acknowledged: bool,
 }
 
 /// The summary dialog's state before a queue starts.
@@ -110,7 +129,7 @@ pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
     pub scanning: bool,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
     pub filters: Filters,
     pub sort: Sort,
     pub selected: Option<ProgramId>,
@@ -170,6 +189,10 @@ pub struct StaleApp {
     /// Usage and sizes received so far, kept for hidden programs too.
     usage: HashMap<ProgramId, ProgramUsage>,
     sizes: HashMap<ProgramId, u64>,
+    /// Provenance read so far, per program (cleared with the scan data).
+    provenance: HashMap<ProgramId, Provenance>,
+    /// Provenance probes still running, at most one per program.
+    provenance_rx: HashMap<ProgramId, Receiver<Provenance>>,
 }
 
 impl StaleApp {
@@ -179,7 +202,8 @@ impl StaleApp {
         app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
         let id = session::identity();
         if session::runs_as_other_account(&id) {
-            app.warnings.push(strings::other_account_warning(id.session_user.as_deref().unwrap_or_default(), &id.token_user));
+            let session = id.session_user.clone().unwrap_or_default();
+            app.warnings.push(Warning::OtherAccount { session, token: id.token_user.clone() });
         }
         app.rx = Some(worker::spawn_scan());
         app.scanning = true;
@@ -232,6 +256,8 @@ impl StaleApp {
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
+            provenance: HashMap::new(),
+            provenance_rx: HashMap::new(),
         }
     }
 
@@ -250,6 +276,64 @@ impl StaleApp {
         self.sizes.clear();
         self.unmatched_hits.clear();
         self.warnings.clear();
+        self.provenance.clear();
+        // Dropping the receivers discards results of probes still running.
+        self.provenance_rx.clear();
+    }
+
+    /// The selected program's provenance once read; `None` while it is pending.
+    pub fn provenance_for(&self, id: &ProgramId) -> Option<&Provenance> {
+        self.provenance.get(id)
+    }
+
+    /// Starts reading the selected program's provenance on a worker thread, once its main exe
+    /// is known (usage has arrived), unless it is cached or already being read, and only while
+    /// fewer than [`MAX_PROVENANCE_PROBES`] probes run.
+    fn request_provenance(&mut self) {
+        self.request_provenance_with(worker::spawn_provenance);
+    }
+
+    fn request_provenance_with(&mut self, spawn: impl FnOnce(Program, Option<PathBuf>) -> Receiver<Provenance>) {
+        let Some(id) = self.selected.as_ref() else { return };
+        if self.provenance.contains_key(id) || self.provenance_rx.contains_key(id) {
+            return;
+        }
+        // Runs every frame: the current selection is probed as soon as a slot frees.
+        if self.provenance_rx.len() >= MAX_PROVENANCE_PROBES {
+            return;
+        }
+        let Some(row) = self.rows.iter().find(|r| &r.program.id == id) else { return };
+        let Some(usage) = row.usage.as_ref() else { return };
+        let rx = spawn(row.program.clone(), usage.main_exe.clone());
+        self.provenance_rx.insert(id.clone(), rx);
+    }
+
+    /// Caches finished provenance probes. A probe that ended without a result caches what is
+    /// known without the exe, so it is not started again.
+    fn drain_provenance(&mut self) {
+        let mut done = Vec::new();
+        for (id, rx) in &self.provenance_rx {
+            match rx.try_recv() {
+                Ok(p) => done.push((id.clone(), p)),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    log::error!("provenance worker for {} ended without a result", id.0);
+                    let install_date = self.programs.iter().find(|p| &p.id == id).and_then(|p| p.install_date);
+                    let fallback = Provenance {
+                        signature: Signature::Unknown,
+                        description: None,
+                        company: None,
+                        install_date,
+                        source: InstallSource::Unknown,
+                    };
+                    done.push((id.clone(), fallback));
+                }
+            }
+        }
+        for (id, p) in done {
+            self.provenance_rx.remove(&id);
+            self.provenance.insert(id, p);
+        }
     }
 
     /// Folds one scan event into the state (no UI work).
@@ -279,7 +363,7 @@ impl StaleApp {
             }
             ScanEvent::Warning(w) => {
                 log::warn!("{w}");
-                self.warnings.push(w);
+                self.warnings.push(Warning::Scan(w));
             }
             ScanEvent::Done => self.scanning = false,
         }
@@ -329,6 +413,19 @@ impl StaleApp {
         }
     }
 
+    /// Switches the user interface language (from the next frame on) and saves it.
+    pub fn set_language(&mut self, lang: strings::Lang) {
+        self.set_language_at(lang, &Settings::path());
+    }
+
+    fn set_language_at(&mut self, lang: strings::Lang, path: &Path) {
+        strings::set_lang(lang);
+        self.settings.language = Some(lang.code().to_string());
+        if let Err(e) = self.settings.save_to(path) {
+            log::warn!("could not save settings to {}: {e}", path.display());
+        }
+    }
+
     /// Opens the summary dialog for the checked rows that are visible under the current filters.
     pub fn open_queue_dialog(&mut self, mode: UninstallMode) {
         let visible = visible_rows(&self.rows, &self.filters, self.sort, Utc::now());
@@ -359,8 +456,17 @@ impl StaleApp {
                         .as_deref()
                         .and_then(first_path_in_command)
                         .map(|p| p.display().to_string()),
+                    dependency: stale_core::dependencies::is_shared_dependency(&r.program),
+                    acknowledged: false,
                 },
-                None => QueueEntry { name: id.0.clone(), scope: Scope::Machine, account: None, uninstall_path: None },
+                None => QueueEntry {
+                    name: id.0.clone(),
+                    scope: Scope::Machine,
+                    account: None,
+                    uninstall_path: None,
+                    dependency: None,
+                    acknowledged: false,
+                },
             })
             .collect();
         self.pending =
@@ -374,6 +480,12 @@ impl StaleApp {
 
     /// Starts the pending queue on a worker thread and closes the summary dialog.
     pub fn start_queue(&mut self) {
+        // Checked before taking it: a refused start leaves the dialog open.
+        let Some(pending) = self.pending.as_ref() else { return };
+        let flagged: Vec<(bool, bool)> = pending.entries.iter().map(|e| (e.dependency.is_some(), e.acknowledged)).collect();
+        if !crate::flow::dependencies_acknowledged(&flagged) {
+            return;
+        }
         let Some(pending) = self.pending.take() else { return };
         let programs: Vec<Program> = pending
             .ids
@@ -425,7 +537,7 @@ impl StaleApp {
                 Err(TryRecvError::Disconnected) => {
                     // Gone without `QueueDone`: the worker panicked (logged by the panic hook).
                     log::error!("uninstall worker disconnected before QueueDone");
-                    flow.warnings.push(strings::QUEUE_ABORTED.to_string());
+                    flow.warnings.push(Warning::Fixed(Msg::QueueAborted));
                     flow.finish();
                     break;
                 }
@@ -554,7 +666,7 @@ impl StaleApp {
                     return;
                 }
                 Ok(QuarantineEvent::Failed(msg)) => {
-                    log::error!("{msg}");
+                    log::error!("{msg:?}");
                     self.removal_progress = None;
                     self.warnings.push(msg);
                     return;
@@ -566,7 +678,7 @@ impl StaleApp {
                 Err(TryRecvError::Disconnected) => {
                     log::error!("quarantine worker disconnected before Finished");
                     self.removal_progress = None;
-                    self.warnings.push(strings::QUARANTINE_ABORTED.to_string());
+                    self.warnings.push(Warning::Fixed(Msg::QuarantineAborted));
                     return;
                 }
             }
@@ -624,7 +736,7 @@ impl StaleApp {
             QuarantineAdminEvent::Purged(id) => self.quarantine.retain(|m| m.id != id),
             QuarantineAdminEvent::PurgedAll => {}
             QuarantineAdminEvent::Failed(msg) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
         }
@@ -657,13 +769,13 @@ impl StaleApp {
                 self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]))
             }
             Ok(LeftoverScanEvent::Failed(msg)) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
             Err(TryRecvError::Empty) => self.leftover_scan_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
                 log::error!("leftover scan worker disconnected before Done");
-                self.warnings.push(strings::LEFTOVER_SCAN_ABORTED.to_string());
+                self.warnings.push(Warning::Fixed(Msg::LeftoverScanAborted));
             }
         }
     }
@@ -683,14 +795,14 @@ impl StaleApp {
         for e in &ghost.evidence {
             match e {
                 Evidence::Folder { path, .. } => self.keep.keep_path(path.clone()),
-                Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => self.keep.keep_key(key.clone()),
+                Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key, .. } => self.keep.keep_key(key.clone()),
                 Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } => {}
             }
         }
         sel.remove_by_key(key);
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
-            self.warnings.push(format!("{}: {e}", strings::KEEP_SAVE_FAILED));
+            self.warnings.push(Warning::Detail(Msg::KeepSaveFailed, e.to_string()));
         }
     }
 
@@ -731,7 +843,7 @@ impl StaleApp {
     fn save_keep(&mut self, path: &Path) {
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
-            self.warnings.push(format!("{}: {e}", strings::KEEP_SAVE_FAILED));
+            self.warnings.push(Warning::Detail(Msg::KeepSaveFailed, e.to_string()));
         }
     }
 
@@ -786,7 +898,7 @@ impl StaleApp {
         self.ghost_scan_waiting = false;
         if self.programs.is_empty() {
             log::warn!("ghost scan refused: no installed programs known");
-            self.warnings.push(strings::GHOSTS_NEED_PROGRAMS.to_string());
+            self.warnings.push(Warning::Fixed(Msg::GhostsNeedPrograms));
             return;
         }
         self.ghost_rx = Some(worker::spawn_ghost_scan(self.programs.clone(), self.unmatched_hits.clone()));
@@ -816,13 +928,13 @@ impl StaleApp {
                 self.last_kept = None;
             }
             Ok(GhostEvent::Failed(msg)) => {
-                log::error!("{msg}");
+                log::error!("{msg:?}");
                 self.warnings.push(msg);
             }
             Err(TryRecvError::Empty) => self.ghost_rx = Some(rx),
             Err(TryRecvError::Disconnected) => {
                 log::error!("ghost scan worker disconnected before Done");
-                self.warnings.push(strings::GHOST_SCAN_ABORTED.to_string());
+                self.warnings.push(Warning::Fixed(Msg::GhostScanAborted));
             }
         }
     }
@@ -842,7 +954,7 @@ impl StaleApp {
                     // logged by the panic hook): say so instead of showing partial results silently.
                     if self.scanning {
                         log::error!("scan worker disconnected before Done");
-                        self.warnings.push(strings::SCAN_ABORTED.to_string());
+                        self.warnings.push(Warning::Fixed(Msg::ScanAborted));
                         self.scanning = false;
                     }
                     return;
@@ -861,7 +973,10 @@ impl eframe::App for StaleApp {
         self.drain_quarantine_admin();
         self.drain_ghost_scan();
         self.start_waiting_ghost_scan();
+        self.drain_provenance();
+        self.request_provenance();
         if self.scanning
+            || !self.provenance_rx.is_empty()
             || self.ghost_scan_running()
             || self.queue_running()
             || self.removal_running()
@@ -877,9 +992,9 @@ impl eframe::App for StaleApp {
         egui::Panel::top("top").show(ui, |ui| {
             toolbar::show(ui, self);
             if !self.warnings.is_empty() {
-                ui.collapsing(strings::WARNINGS, |ui| {
+                egui::CollapsingHeader::new(strings::t().warnings).id_salt("warnings").show(ui, |ui| {
                     for w in &self.warnings {
-                        ui.label(w);
+                        ui.label(w.text());
                     }
                 });
             }
@@ -891,9 +1006,9 @@ impl eframe::App for StaleApp {
         egui::Panel::bottom("details").resizable(true).default_size(160.0).show(ui, |ui| {
             let row = self.selected.as_ref().and_then(|id| self.rows.iter().find(|r| &r.program.id == id));
             match row {
-                Some(row) => details::details_panel(ui, row),
+                Some(row) => details::details_panel(ui, row, self.provenance.get(&row.program.id)),
                 None => {
-                    ui.label(strings::NO_SELECTION);
+                    ui.label(strings::t().no_selection);
                 }
             }
         });
@@ -909,7 +1024,7 @@ impl eframe::App for StaleApp {
             }
             if self.rows.is_empty() {
                 if !self.scanning {
-                    ui.label(strings::NO_PROGRAMS);
+                    ui.label(strings::t().no_programs);
                 }
                 return;
             }
@@ -923,6 +1038,7 @@ impl eframe::App for StaleApp {
 
 #[cfg(test)]
 mod tests {
+    use stale_core::scan::ScanWarning;
     use stale_core::quarantine::{Failure, QuarantineId, RestoreOutcome};
     use stale_core::usage::matching::LastUsed;
     use stale_core::{Hive, RegKeyPath, Scope};
@@ -930,6 +1046,11 @@ mod tests {
     use crate::worker::QuarantineAdminEvent;
 
     use super::*;
+
+    /// Test files in a temp folder belong to whoever runs the tests: trust them.
+    fn trust_all(_: &std::fs::File) -> Option<bool> {
+        Some(true)
+    }
 
     fn program(id: &str, hidden: bool) -> Program {
         Program {
@@ -953,7 +1074,103 @@ mod tests {
     }
 
     fn usage() -> ProgramUsage {
-        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true }, exes: Vec::new() }
+        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: Vec::new(), main_exe: None }
+    }
+
+    fn unknown_provenance() -> Provenance {
+        Provenance {
+            signature: Signature::Unknown,
+            description: None,
+            company: None,
+            install_date: None,
+            source: InstallSource::Unknown,
+        }
+    }
+
+    #[test]
+    fn provenance_is_probed_once_per_program_and_cleared_on_refresh() {
+        use std::sync::mpsc::channel;
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
+        app.selected = Some(ProgramId("a".into()));
+        let mut calls: Vec<(ProgramId, Option<PathBuf>)> = Vec::new();
+        let (tx, rx) = channel();
+        let mut rx = Some(rx);
+        let mut spawn = |p: Program, exe: Option<PathBuf>| {
+            calls.push((p.id, exe));
+            rx.take().unwrap_or_else(|| channel().1)
+        };
+        // The main exe is not known before usage arrives: nothing is probed yet.
+        app.request_provenance_with(&mut spawn);
+        let exe = PathBuf::from(r"C:\Apps\A\a.exe");
+        let mut u = usage();
+        u.main_exe = Some(exe.clone());
+        app.apply_event(ScanEvent::Usage(HashMap::from([(ProgramId("a".into()), u)])));
+        app.request_provenance_with(&mut spawn);
+        app.request_provenance_with(&mut spawn);
+        assert!(app.provenance_for(&ProgramId("a".into())).is_none(), "pending");
+        tx.send(unknown_provenance()).unwrap();
+        app.drain_provenance();
+        assert_eq!(app.provenance_for(&ProgramId("a".into())), Some(&unknown_provenance()));
+        app.request_provenance_with(&mut spawn);
+        assert_eq!(calls, vec![(ProgramId("a".into()), Some(exe))], "one probe per program");
+        app.clear_scan_data();
+        assert!(app.provenance_for(&ProgramId("a".into())).is_none());
+        assert!(app.provenance_rx.is_empty());
+    }
+
+    #[test]
+    fn at_most_four_provenance_probes_run_at_once() {
+        use std::sync::mpsc::{channel, Sender};
+        let mut app = StaleApp::empty(Settings::default());
+        let ids: Vec<String> = (0..6).map(|i| format!("p{i}")).collect();
+        app.apply_event(ScanEvent::Programs(ids.iter().map(|id| program(id, false)).collect()));
+        app.apply_event(ScanEvent::Usage(ids.iter().map(|id| (ProgramId(id.clone()), usage())).collect()));
+        let mut senders: Vec<Sender<Provenance>> = Vec::new();
+        let mut spawned: Vec<ProgramId> = Vec::new();
+        // The user clicks through six programs while no probe finishes.
+        for id in &ids {
+            app.selected = Some(ProgramId(id.clone()));
+            app.request_provenance_with(|p, _| {
+                spawned.push(p.id);
+                let (tx, rx) = channel();
+                senders.push(tx);
+                rx
+            });
+        }
+        assert_eq!(spawned.len(), MAX_PROVENANCE_PROBES);
+        assert_eq!(app.provenance_rx.len(), MAX_PROVENANCE_PROBES);
+        // One finishes: the next frame probes the current selection.
+        senders[0].send(unknown_provenance()).unwrap();
+        app.drain_provenance();
+        app.request_provenance_with(|p, _| {
+            spawned.push(p.id);
+            channel().1
+        });
+        assert_eq!(spawned.last(), Some(&ProgramId("p5".into())));
+        assert_eq!(spawned.len(), MAX_PROVENANCE_PROBES + 1);
+    }
+
+    #[test]
+    fn a_lost_provenance_worker_is_not_respawned() {
+        let mut app = StaleApp::empty(Settings::default());
+        let mut p = program("a", false);
+        p.install_date = chrono::NaiveDate::from_ymd_opt(2024, 1, 2);
+        app.apply_event(ScanEvent::Programs(vec![p]));
+        app.apply_event(ScanEvent::Usage(HashMap::from([(ProgramId("a".into()), usage())])));
+        app.selected = Some(ProgramId("a".into()));
+        let mut calls = 0;
+        let mut spawn = |_: Program, _: Option<PathBuf>| {
+            calls += 1;
+            std::sync::mpsc::channel().1
+        };
+        app.request_provenance_with(&mut spawn);
+        app.drain_provenance();
+        app.request_provenance_with(&mut spawn);
+        assert_eq!(calls, 1);
+        let shown = app.provenance_for(&ProgramId("a".into())).expect("a fallback is cached");
+        assert_eq!(shown.signature, Signature::Unknown);
+        assert_eq!(shown.install_date, chrono::NaiveDate::from_ymd_opt(2024, 1, 2));
     }
 
     #[test]
@@ -966,14 +1183,14 @@ mod tests {
 
         app.apply_event(ScanEvent::Usage(HashMap::from([(ProgramId("a".into()), usage())])));
         app.apply_event(ScanEvent::Sizes(HashMap::from([(ProgramId("b".into()), 1234)])));
-        app.apply_event(ScanEvent::Warning("w".into()));
+        app.apply_event(ScanEvent::Warning(ScanWarning::ThreadFailed { error: "w".into() }));
         let a = app.rows.iter().find(|r| r.program.id.0 == "a").unwrap();
         let b = app.rows.iter().find(|r| r.program.id.0 == "b").unwrap();
         assert_eq!(a.usage, Some(usage()));
         assert_eq!(a.size, None);
         assert_eq!(b.usage, None);
         assert_eq!(b.size, Some(1234));
-        assert_eq!(app.warnings, vec!["w".to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Scan(ScanWarning::ThreadFailed { error: "w".into() })]);
         assert!(app.scanning);
 
         app.apply_event(ScanEvent::Done);
@@ -999,7 +1216,7 @@ mod tests {
         app.drain_events();
         assert!(!app.scanning);
         assert_eq!(app.rows.len(), 1, "events before the disconnect are applied");
-        assert_eq!(app.warnings, vec![strings::SCAN_ABORTED.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::ScanAborted)]);
         assert!(app.rx.is_none());
     }
 
@@ -1018,10 +1235,10 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.rx = Some(rx);
         app.scanning = true;
-        tx.send(ScanEvent::Warning("w".into())).unwrap();
+        tx.send(ScanEvent::Warning(ScanWarning::ThreadFailed { error: "w".into() })).unwrap();
         app.drain_events();
         assert!(app.scanning && app.rx.is_some());
-        assert_eq!(app.warnings, vec!["w".to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Scan(ScanWarning::ThreadFailed { error: "w".into() })]);
     }
 
     #[test]
@@ -1029,7 +1246,7 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
         app.apply_event(ScanEvent::Sizes(HashMap::from([(ProgramId("a".into()), 7)])));
-        app.apply_event(ScanEvent::Warning("w".into()));
+        app.apply_event(ScanEvent::Warning(ScanWarning::ThreadFailed { error: "w".into() }));
         app.clear_scan_data();
         assert!(app.rows.is_empty() && app.warnings.is_empty());
         app.rebuild_rows();
@@ -1075,6 +1292,26 @@ mod tests {
     }
 
     #[test]
+    fn dependency_needs_acknowledgement_also_when_forced_and_resets_on_reopen() {
+        let mut app = StaleApp::empty(Settings::default());
+        let mut git = program("g", false);
+        git.name = "Git".into();
+        app.apply_event(ScanEvent::Programs(vec![program("m", false), git]));
+        app.open_queue_dialog_for(vec![ProgramId("m".into()), ProgramId("g".into())], UninstallMode::Forced);
+        let mut pending = app.pending.take().expect("dialog opened");
+        assert_eq!(pending.entries[0].dependency, None);
+        assert_eq!(pending.entries[1].dependency, Some("toolchain"));
+        pending.entries[1].acknowledged = true;
+        app.pending = Some(pending);
+        app.open_queue_dialog_for(vec![ProgramId("g".into())], UninstallMode::Forced);
+        assert!(!app.pending.as_ref().unwrap().entries[0].acknowledged);
+        // Starting without the acknowledgement does nothing, and the dialog stays open.
+        app.start_queue();
+        assert!(app.flow.is_none());
+        assert!(app.pending.is_some(), "a rejected start keeps the dialog");
+    }
+
+    #[test]
     fn pending_queue_carries_scope_and_account() {
         let mut app = StaleApp::empty(Settings::default());
         let mut other = program("o", false);
@@ -1102,7 +1339,7 @@ mod tests {
         app.toggle_show_hidden_at(&path);
         assert_eq!(app.rows.len(), 2);
         assert!(app.settings.show_hidden);
-        assert!(Settings::load_from(&path).show_hidden, "setting is saved");
+        assert!(Settings::load_from_with(&path, &trust_all).show_hidden, "setting is saved");
         app.checked.insert(ProgramId("h".into()));
         app.selected = Some(ProgramId("h".into()));
 
@@ -1201,9 +1438,9 @@ mod tests {
         assert_eq!(app.quarantine, vec![manifest("a"), manifest("b")]);
         app.apply_quarantine_admin(QuarantineAdminEvent::Listed(vec![manifest("c")]));
         assert_eq!(app.quarantine, vec![manifest("c")]);
-        app.apply_quarantine_admin(QuarantineAdminEvent::Failed("nope".into()));
+        app.apply_quarantine_admin(QuarantineAdminEvent::Failed(Warning::Fixed(Msg::QuarantineAdminAborted)));
         assert_eq!(app.quarantine, vec![manifest("c")], "a failure keeps the rows");
-        assert_eq!(app.warnings, vec!["nope".to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::QuarantineAdminAborted)]);
     }
 
     #[test]
@@ -1238,7 +1475,20 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.set_quarantine_days_at(7, &path);
         assert_eq!(app.settings.quarantine_days, 7);
-        assert_eq!(Settings::load_from(&path).quarantine_days, 7);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).quarantine_days, 7);
+    }
+
+    /// Swedish only: the language is process-wide and other tests running in parallel expect
+    /// Swedish text.
+    #[test]
+    fn chosen_language_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings::default());
+        app.set_language_at(strings::Lang::Sv, &path);
+        assert_eq!(app.settings.language.as_deref(), Some("sv"));
+        assert_eq!(Settings::load_from_with(&path, &trust_all).language.as_deref(), Some("sv"));
+        assert_eq!(strings::lang(), strings::Lang::Sv);
     }
 
     #[test]
@@ -1303,7 +1553,7 @@ mod tests {
         assert_eq!(sel.checked, vec![false, true, false], "back in its row, checked as before");
         assert_eq!(app.keep.names, vec!["Earlier".to_string()], "the keep entries are reverted");
         assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
-        assert_eq!(KeepList::load_from(&path), app.keep, "and saved");
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), app.keep, "and saved");
         assert!(app.last_kept.is_none());
         app.undo_keep_at(&path);
         assert_eq!(app.ghosts.as_ref().unwrap().ghosts.len(), 3, "a second undo does nothing");
@@ -1323,9 +1573,9 @@ mod tests {
         app.remove_keep_entry_at(&KeepEntry::Key(key), &path);
         assert_eq!(app.keep.names, vec!["Alpha".to_string()]);
         assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
-        assert_eq!(KeepList::load_from(&path), app.keep);
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), app.keep);
         app.remove_keep_entry_at(&KeepEntry::Name("alpha".into()), &path);
-        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), KeepList::default());
         assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy(), "nothing is rescanned");
     }
 
@@ -1337,18 +1587,19 @@ mod tests {
         let path = dir.path().join("important.json");
         let mut alpha = ghost("Alpha", Assessment::ProbablyUninstalled, 100);
         let missing = RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Alpha".into() };
-        alpha.evidence.push(Evidence::RegKeyMissingPath { key: missing.clone(), value_name: "Path".into(), path: r"D:\Alpha".into() });
+        alpha.evidence.push(Evidence::RegKeyMissingPath { key: missing.clone(), value_name: "Path".into(), path: r"D:\Alpha".into(), shared: false });
         alpha.evidence.push(Evidence::DanglingRef {
             kind: RefKind::Run,
             location: r"LocalMachine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
             target: r"C:\Program Files\Alpha.exe".into(),
             value_name: Some("Alpha".into()),
+            partly_live: false,
         });
         let mut app = StaleApp::empty(Settings::default());
         app.ghosts = Some(GhostSelection::new(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));
 
         app.keep_ghost_at("alpha", &path);
-        let saved = KeepList::load_from(&path);
+        let saved = KeepList::load_from_with(&path, &trust_all);
         assert_eq!(saved, app.keep);
         assert_eq!(saved.names, vec!["Alpha".to_string()]);
         assert_eq!(saved.paths, vec![PathBuf::from(r"C:\Program Files\Alpha")]);
@@ -1357,7 +1608,7 @@ mod tests {
         assert_eq!(names, vec!["Beta"]);
 
         app.keep_ghost_at("missing", &path);
-        assert_eq!(KeepList::load_from(&path), saved, "an unknown key changes nothing");
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), saved, "an unknown key changes nothing");
     }
 
     #[test]
@@ -1393,7 +1644,7 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.refresh_ghosts();
         assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy());
-        assert_eq!(app.warnings, vec![strings::GHOSTS_NEED_PROGRAMS.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::GhostsNeedPrograms)]);
     }
 
     #[test]
@@ -1409,7 +1660,7 @@ mod tests {
         app.apply_event(ScanEvent::Done);
         app.start_waiting_ghost_scan();
         assert!(!app.ghost_scan_busy() && app.ghost_rx.is_none());
-        assert_eq!(app.warnings, vec![strings::GHOSTS_NEED_PROGRAMS.to_string()]);
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::GhostsNeedPrograms)]);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::keep::KeepList;
 use crate::leftovers::other_scan::{task_commands, task_files};
 use crate::leftovers::system_root_norm;
 use crate::model::Hive;
-use crate::pathutil::{drive_letter, norm, normed_under};
+use crate::pathutil::{drive_letter, expand_env, norm, normed_under};
 use crate::registry::{key, RegValue, RegistryReader};
 use crate::services::{normalize_image_path_with, SERVICES_ROOT};
 use crate::shortcuts::ShortcutTarget;
@@ -58,7 +58,7 @@ fn gate<'a>(
 }
 
 fn dangling(kind: RefKind, location: String, target: PathBuf) -> Evidence {
-    Evidence::DanglingRef { kind, location, target, value_name: None }
+    Evidence::DanglingRef { kind, location, target, value_name: None, partly_live: false }
 }
 
 /// [`service_collect`]'s evidence.
@@ -73,8 +73,8 @@ pub fn service_evidence(
 }
 
 /// Win32 services (`Type` 16/32) whose `ImagePath` executable is missing. The existing
-/// `ImagePath` of every service and driver (kernel and file system drivers included) is a live
-/// target.
+/// `ImagePath` of every service and driver (kernel and file system drivers included), and an
+/// existing `Parameters\ServiceDll`, is a live target.
 pub fn service_collect(
     reg: &dyn RegistryReader,
     fs: &dyn FsReader,
@@ -96,8 +96,12 @@ pub fn service_collect(
                 _ => {}
             }
         }
+        // A shared-process service's DLL (`Parameters\ServiceDll`) is loaded as long as it runs.
+        if let Some(dll) = service_dll(reg, &name).filter(|p| g.is_live(p)) {
+            out.live_targets.push(dll);
+        }
         // Unquoted paths with spaces are resolved against the disk, never cut at the first space.
-        let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p))) else {
+        let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p) && !fs.is_dir(p))) else {
             continue;
         };
         if g.is_live(&target) {
@@ -107,6 +111,27 @@ pub fn service_collect(
         }
     }
     out
+}
+
+/// The actions of a task definition: `<Exec>`, `<ComHandler>`, `<SendEmail>`, `<ShowMessage>`
+/// elements (`<ExecutionTimeLimit>` is not one).
+fn action_count(xml: &str) -> usize {
+    ["Exec", "ComHandler", "SendEmail", "ShowMessage"]
+        .iter()
+        .map(|tag| xml.matches(&format!("<{tag}>")).count() + xml.matches(&format!("<{tag} ")).count())
+        .sum()
+}
+
+/// `Services\<name>\Parameters\ServiceDll`, expanded and unquoted.
+fn service_dll(reg: &dyn RegistryReader, name: &str) -> Option<PathBuf> {
+    let values = reg.values(&key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}\Parameters"))).ok()?;
+    let raw = values.into_iter().find_map(|(n, v)| match v {
+        RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ServiceDll") => Some(s),
+        _ => None,
+    })?;
+    let dll = expand_env(raw.trim());
+    let dll = dll.trim().trim_matches('"').trim();
+    (!dll.is_empty()).then(|| PathBuf::from(dll))
 }
 
 /// [`task_collect`]'s evidence.
@@ -135,17 +160,32 @@ pub fn task_collect(
     let mut out = Collected::default();
     for file in files {
         let Some(xml) = fs.read_text(&file) else { continue };
+        let commands = task_commands(&xml);
+        let actions = action_count(&xml).max(commands.len());
+        // Any action not verifiably dead (a live or bare command, one on a missing drive, a kept
+        // or installed path, a COM handler): removing the task takes it too.
+        let mut other_alive = actions > commands.len();
         let mut dead = None;
-        for command in task_commands(&xml) {
+        for command in commands {
             if g.is_live(&command) {
                 out.live_targets.push(command);
-            } else if dead.is_none() && g.is_dead(&command) {
+                other_alive = true;
+            } else if !g.is_dead(&command) {
+                other_alive = true;
+            } else if dead.is_none() {
                 dead = Some(command);
             }
         }
+        let partly_live = actions > 1 && other_alive;
         let (Some(target), Ok(rel)) = (dead, file.strip_prefix(tasks_root)) else { continue };
         let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
-        out.evidence.push(dangling(RefKind::ScheduledTask, name, target));
+        out.evidence.push(Evidence::DanglingRef {
+            kind: RefKind::ScheduledTask,
+            location: name,
+            target,
+            value_name: None,
+            partly_live,
+        });
     }
     out
 }
@@ -292,6 +332,49 @@ mod tests {
     }
 
     #[test]
+    fn task_with_bare_or_non_exec_action_is_partly_live() {
+        let root = r"C:\Windows\System32\Tasks";
+        let fs = FakeFs::new()
+            .text(&format!(r"{root}\Bare"), r"<Exec><Command>powershell.exe</Command></Exec><Exec><Command>C:\Gone\b.exe</Command></Exec>")
+            .text(
+                &format!(r"{root}\Com"),
+                r"<Settings><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings><Actions><ComHandler><ClassId>{1}</ClassId></ComHandler><Exec><Command>C:\Gone\c.exe</Command></Exec></Actions>",
+            )
+            .text(&format!(r"{root}\Usb"), r"<Exec><Command>E:\Usb\u.exe</Command></Exec><Exec><Command>C:\Gone\d.exe</Command></Exec>")
+            .text(
+                &format!(r"{root}\Alone"),
+                r"<Settings><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings><Exec><Command>C:\Gone\e.exe</Command></Exec>",
+            );
+        let (i, k) = none();
+        let no_e = |c: char| c != 'E';
+        let mut got: Vec<(String, bool)> = task_collect(&fs, Path::new(root), &i, &k, &no_e)
+            .evidence
+            .into_iter()
+            .map(|e| match e {
+                Evidence::DanglingRef { location, partly_live, .. } => (location, partly_live),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        got.sort();
+        let want = [("Alone", false), ("Bare", true), ("Com", true), ("Usb", true)].map(|(l, p)| (l.to_string(), p));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn service_dll_is_live() {
+        let _env = crate::env_lock();
+        let mut reg = FakeRegistry::new();
+        svc_typed(&mut reg, "VendorHost", r"%SystemRoot%\System32\svchost.exe -k vendor", 32);
+        let params = key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\VendorHost\Parameters"));
+        reg.set(params, "ServiceDll", RegValue::ExpandStr(r"C:\Program Files\Vendor\vsvc.dll".into()));
+        let fs = FakeFs::new().file(r"C:\Program Files\Vendor\vsvc.dll", 1);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        assert_eq!(got.evidence, vec![]);
+        assert!(got.live_targets.contains(&PathBuf::from(r"C:\Program Files\Vendor\vsvc.dll")), "{:?}", got.live_targets);
+    }
+
+    #[test]
     fn truncated_prefix_is_not_reported_dead() {
         let mut reg = FakeRegistry::new();
         svc(&mut reg, "VendorAgent", r"C:\ProgramData\Vendor\Some Dir\agent.bin --run");
@@ -309,6 +392,18 @@ mod tests {
     }
 
     #[test]
+    fn directory_prefix_is_not_accepted() {
+        // `C:\ProgramData\Vendor` is a folder: never the image of `Vendor Suite\gone.exe`.
+        let mut reg = FakeRegistry::new();
+        svc(&mut reg, "VendorSuite", r"C:\ProgramData\Vendor Suite\gone.exe -k run");
+        let fs = FakeFs::new().dir(r"C:\ProgramData\Vendor", 0);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        assert_eq!(got.live_targets, Vec::<PathBuf>::new());
+        assert_eq!(got.evidence, vec![dang(RefKind::Service, "VendorSuite", r"C:\ProgramData\Vendor Suite\gone.exe")]);
+    }
+
+    #[test]
     fn collectors_report_existing_targets_as_live() {
         let root = r"C:\Windows\System32\Tasks";
         let fs = FakeFs::new()
@@ -320,7 +415,15 @@ mod tests {
         let (i, k) = none();
         let tasks = task_collect(&fs, Path::new(root), &i, &k, &all);
         assert_eq!(tasks.live_targets, vec![PathBuf::from(r"C:\Live\up.exe")]);
-        assert_eq!(tasks.evidence, vec![dang(RefKind::ScheduledTask, r"Vendor\Updater", r"C:\Gone\b.exe")]);
+        // The task also runs a live command: partly live.
+        let partly = Evidence::DanglingRef {
+            kind: RefKind::ScheduledTask,
+            location: r"Vendor\Updater".into(),
+            target: PathBuf::from(r"C:\Gone\b.exe"),
+            value_name: None,
+            partly_live: true,
+        };
+        assert_eq!(tasks.evidence, vec![partly]);
         let links = shortcut_collect(&fs, &[lnk(r"C:\Menu\Live.lnk", r"C:\Live\app.exe")], &i, &k, &all);
         assert_eq!((links.evidence, links.live_targets), (vec![], vec![PathBuf::from(r"C:\Live\app.exe")]));
         let hits = [hit(r"\RAN\RAN.EXE", 1, UsageSource::Prefetch), hit(r"C:\Live\app.exe", 1, UsageSource::Bam)];
@@ -330,7 +433,7 @@ mod tests {
     }
 
     fn dang(kind: RefKind, location: &str, target: &str) -> Evidence {
-        Evidence::DanglingRef { kind, location: location.into(), target: PathBuf::from(target), value_name: None }
+        Evidence::DanglingRef { kind, location: location.into(), target: PathBuf::from(target), value_name: None, partly_live: false }
     }
 
     #[test]
@@ -348,6 +451,7 @@ mod tests {
 
     #[test]
     fn system32_service_is_skipped() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         svc(&mut reg, "Drv", r"System32\drivers\gone.sys");
         svc(&mut reg, "Host", r"%SystemRoot%\System32\svchost.exe -k netsvcs");

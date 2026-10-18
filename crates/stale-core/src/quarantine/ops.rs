@@ -32,13 +32,11 @@ use crate::regwrite::{RegistryWriter, WinRegistryWriter};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 
-/// `Failure::error` for a payload `<id>` folder that still holds files no manifest entry accounts
-/// for after a restore or purge; the folder and the manifest are kept.
-pub const UNKNOWN_CONTENT_LEFT: &str = "unknown-content-left";
-
-/// Prefix of the purge error `"drive-missing: X:"`: a drive holding stored items is not connected,
-/// so nothing is purged and the manifest is kept.
-pub const DRIVE_MISSING: &str = "drive-missing";
+pub use super::codes::{DRIVE_MISSING, UNKNOWN_CONTENT_LEFT};
+use super::codes::{
+    ACL_NOT_REINHERITED, BACKUP_IS_LINK, BACKUP_OUTSIDE, INVALID_ID, MANIFEST_SAVE_FAILED, NOT_STORABLE,
+    NOT_TRUSTED, OCCUPIED, PARTIAL_MOVE, REPARSE_IN_DESTINATION, REPARSE_IN_QUARANTINE_PATH, STORED_OUTSIDE,
+};
 
 /// A system command run on a service or task name.
 pub type NameCommand = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -167,7 +165,7 @@ pub const E2E_TRUST_ALL_ENV: &str = "STALE_E2E_TRUST_ALL";
 
 /// Whether the [`E2E_TRUST_ALL_ENV`] value asks for trust-all: exactly `"1"`.
 #[cfg(feature = "e2e-overrides")]
-fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
+pub(crate) fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
@@ -201,7 +199,7 @@ impl FileMover for UnlockedFileMover {
     }
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String> {
         if root.parent().into_iter().chain([root]).any(|p| RealFileMover.is_reparse(p)) {
-            return Err(format!("{} is a link or reparse point", root.display()));
+            return Err(format!("{}: {}", super::codes::IS_REPARSE, root.display()));
         }
         std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))
     }
@@ -241,7 +239,7 @@ impl QuarantineOps {
             mover,
             regw: Arc::new(WinRegistryWriter),
             reg: Arc::new(WinRegistry),
-            fs: Arc::new(RealFs),
+            fs: Arc::new(RealFs::live()),
             manifest_dir: crate::paths::quarantine_manifest_dir(),
             payload_root_for: Box::new(crate::paths::quarantine_payload_root),
             tasks_root: system32_tool("Tasks"),
@@ -269,12 +267,7 @@ pub enum RestoreOutcome {
 
 /// `HKLM\<path>`.
 fn key_text(k: &RegKeyPath) -> String {
-    let hive = match k.hive {
-        Hive::LocalMachine => "HKLM",
-        Hive::CurrentUser => "HKCU",
-        Hive::Users => "HKU",
-    };
-    format!(r"{hive}\{}", k.path.trim_matches('\\'))
+    format!(r"{}\{}", k.hive.short_name(), k.path.trim_matches('\\'))
 }
 
 fn describe(kind: &LeftoverKind) -> String {
@@ -349,7 +342,7 @@ impl Run<'_> {
             Ok(()) => true,
             Err(e) => {
                 self.broken = true;
-                self.fail("manifest", format!("manifest-save-failed: {e}"));
+                self.fail("manifest", format!("{MANIFEST_SAVE_FAILED}: {e}"));
                 false
             }
         }
@@ -544,11 +537,11 @@ impl Run<'_> {
             Err(e) => return self.fail(what, e),
         };
         let Some(stored) = stored_path_for(&root, &self.m.id, original) else {
-            self.fail(what, "path cannot be stored in quarantine");
+            self.fail(what, NOT_STORABLE);
             return;
         };
         if let Some(p) = reparse_in_chain(self.ops.mover.as_ref(), &root, &stored) {
-            self.fail(what, format!("reparse point in quarantine path: {}", p.display()));
+            self.fail(what, format!("{REPARSE_IN_QUARANTINE_PATH}: {}", p.display()));
             return;
         }
         let size = self.ops.mover.size_of(original);
@@ -561,7 +554,7 @@ impl Run<'_> {
             Ok(()) => m.moved.push(MovedItem { original, stored, is_dir, size }),
             Err(MoveError::PartialMove { stored, detail }) => {
                 m.moved.push(MovedItem { original, stored, is_dir, size });
-                m.failures.push(Failure { what, error: format!("partial move: {detail}") });
+                m.failures.push(Failure { what, error: format!("{PARTIAL_MOVE}: {detail}") });
             }
             Err(e) => m.failures.push(Failure { what, error: e.to_string() }),
         });
@@ -647,7 +640,7 @@ pub fn live_free_bytes(drive: char) -> Option<u64> {
     if !drive.is_ascii_alphabetic() {
         return None;
     }
-    let root: Vec<u16> = format!(r"{}:\", drive.to_ascii_uppercase()).encode_utf16().chain(std::iter::once(0)).collect();
+    let root = crate::pathutil::wide(format!(r"{}:\", drive.to_ascii_uppercase()));
     let mut free = 0u64;
     // SAFETY: `root` is NUL-terminated and outlives the call; `free` is a valid out-pointer.
     unsafe { GetDiskFreeSpaceExW(PCWSTR(root.as_ptr()), Some(&mut free), None, None) }.ok()?;
@@ -672,7 +665,7 @@ fn check_trusted(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), String> {
     if !ops.mover.is_reparse(&folder) && (ops.trusted_dir)(&folder) == Some(true) {
         Ok(())
     } else {
-        Err(format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display()))
+        Err(format!("{NOT_TRUSTED}: {}", folder.display()))
     }
 }
 
@@ -719,7 +712,7 @@ pub fn quarantine(
     if let Err(e) = created.and_then(|()| save_manifest(&ops.manifest_dir, &run.m)) {
         // Without a manifest nothing could be restored, so nothing is touched.
         for it in items {
-            run.fail(describe(&it.kind), format!("manifest could not be saved: {e}"));
+            run.fail(describe(&it.kind), format!("{MANIFEST_SAVE_FAILED}: {e}"));
         }
         progress(QuarantineProgress::Finished(Box::new(run.m.clone())));
         return run.m;
@@ -758,7 +751,7 @@ fn payload_dirs(ops: &QuarantineOps, id: &QuarantineId) -> Vec<PathBuf> {
 /// A backup a restore may use: a non-link file named after `pattern` (`N` = digits, `*` = any
 /// non-empty text) directly in `<manifest dir>\<id>`.
 fn check_backup(ops: &QuarantineOps, id: &QuarantineId, file: &Path, pattern: &str) -> Result<(), String> {
-    let outside = || format!("backup file outside the quarantine folder: {}", file.display());
+    let outside = || format!("{BACKUP_OUTSIDE}: {}", file.display());
     let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(outside)?;
     let (prefix, suffix) = pattern.split_once(['N', '*']).ok_or_else(outside)?;
     let middle = name.strip_prefix(prefix).and_then(|r| r.strip_suffix(suffix)).ok_or_else(outside)?;
@@ -771,7 +764,7 @@ fn check_backup(ops: &QuarantineOps, id: &QuarantineId, file: &Path, pattern: &s
         return Err(outside());
     }
     if ops.mover.is_reparse(file) {
-        return Err(format!("backup file is a link: {}", file.display()));
+        return Err(format!("{BACKUP_IS_LINK}: {}", file.display()));
     }
     Ok(())
 }
@@ -791,17 +784,17 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
         }
         let root = drive_letter(&item.stored).map(|d| (ops.payload_root_for)(d));
         let Some(root) = root.filter(|r| is_under(&item.stored, &r.join(&id.0))) else {
-            fail("stored outside the quarantine folder".to_string());
+            fail(STORED_OUTSIDE.to_string());
             kept.push(item.clone());
             continue;
         };
         if let Some(p) = reparse_in_chain(ops.mover.as_ref(), &root, &item.stored) {
-            fail(format!("reparse point in quarantine path: {}", p.display()));
+            fail(format!("{REPARSE_IN_QUARANTINE_PATH}: {}", p.display()));
             kept.push(item.clone());
             continue;
         }
         if let Some(p) = item.original.ancestors().skip(1).find(|a| ops.mover.is_reparse(a)) {
-            fail(format!("reparse-in-destination: {}", p.display()));
+            fail(format!("{REPARSE_IN_DESTINATION}: {}", p.display()));
             kept.push(item.clone());
             continue;
         }
@@ -809,7 +802,7 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
             Ok(()) => true,
             // The original is complete again; the leftover copy goes with the payload folder.
             Err(MoveError::PartialMove { detail, .. }) => {
-                fail(format!("partial move: {detail}"));
+                fail(format!("{PARTIAL_MOVE}: {detail}"));
                 true
             }
             Err(e) => {
@@ -822,19 +815,15 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
         // Never through a link swapped in meanwhile (`acl::reinherit` checks again on its handle).
         if back {
             if ops.mover.is_reparse(&item.original) {
-                fail("acl-not-reinherited: reparse".to_string());
+                fail(format!("{ACL_NOT_REINHERITED}: reparse"));
             } else if let Err(e) = (ops.reinherit)(&item.original) {
-                fail(format!("acl-not-reinherited: {e}"));
+                fail(format!("{ACL_NOT_REINHERITED}: {e}"));
             }
         }
     }
     kept.reverse();
     kept
 }
-
-/// `Failure::error` for something a restore would overwrite: the original path, key, value or
-/// service exists again (e.g. the program was reinstalled). The item stays in quarantine.
-const OCCUPIED: &str = "occupied";
 
 /// `Err("occupied")` when `occupied`, so a reinstalled program's registry data is never
 /// overwritten by an old backup.
@@ -937,7 +926,7 @@ fn restore_services(
 /// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
 pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
     if !valid_id(&m.id) {
-        return RestoreOutcome::Partial(vec![Failure { what: m.id.0.clone(), error: "invalid quarantine id".to_string() }]);
+        return RestoreOutcome::Partial(vec![Failure { what: m.id.0.clone(), error: INVALID_ID.to_string() }]);
     }
     if let Err(error) = secure_manifest_dir(ops).and_then(|()| check_trusted(ops, &m.id)) {
         return RestoreOutcome::Partial(vec![Failure { what: "manifest".to_string(), error }]);
@@ -997,7 +986,7 @@ pub fn purge(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> 
 
 fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
     if !valid_id(&m.id) {
-        return Err(format!("invalid quarantine id {:?}", m.id.0));
+        return Err(format!("{INVALID_ID}: {:?}", m.id.0));
     }
     check_trusted(ops, &m.id)?;
     let mut kept = adopt_pending(ops, m);
@@ -1146,6 +1135,7 @@ mod tests {
     #[cfg(not(feature = "e2e-overrides"))]
     #[test]
     fn trust_all_env_is_ignored_without_the_feature() {
+        let _env = crate::env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("STALE_E2E_TRUST_ALL", "1");
         let (_, trusted) = live_mover_and_trust();
@@ -1619,7 +1609,7 @@ mod tests {
         let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
         let s = stored('C', &m, r"C\Apps\Foo");
         assert_eq!(m.moved, vec![MovedItem { original: PathBuf::from(r"C:\Apps\Foo"), stored: s.clone(), is_dir: true, size: 4 }]);
-        assert_eq!(m.failures, vec![fail(r"C:\Apps\Foo", "partial move: forced partial move")]);
+        assert_eq!(m.failures, vec![fail(r"C:\Apps\Foo", "partial-move: forced partial move")]);
         assert!(e.mover.exists(&s.join("a.dll")));
         assert_eq!(list_manifests(e.dir.path()), vec![m]);
     }
@@ -1631,7 +1621,7 @@ mod tests {
         e.mover.set_reparse(r"C:\Stale Uninstaller\quarantine");
         let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
         assert!(m.moved.is_empty());
-        assert_eq!(m.failures, vec![fail(r"C:\Apps\Foo", r"reparse point in quarantine path: C:\Stale Uninstaller\quarantine")]);
+        assert_eq!(m.failures, vec![fail(r"C:\Apps\Foo", r"reparse-in-quarantine-path: C:\Stale Uninstaller\quarantine")]);
         assert!(exists(&e, r"C:\Apps\Foo\a.dll"));
         assert!(!e.mover.log.lock().unwrap().iter().any(|l| l.starts_with("move")));
 
@@ -1641,7 +1631,7 @@ mod tests {
         let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
         let parent = m.moved[0].stored.parent().unwrap().to_path_buf();
         e.mover.set_reparse(parent.to_str().unwrap());
-        let err = format!("reparse point in quarantine path: {}", parent.display());
+        let err = format!("reparse-in-quarantine-path: {}", parent.display());
         assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail(r"C:\Apps\Foo", &err)]));
         assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")));
         assert!(!exists(&e, r"C:\Apps\Foo"));
@@ -1697,7 +1687,7 @@ mod tests {
         tampered.keys[1].reg_file = e.dir.path().join(&m.id.0).join("evil.reg");
         e.regw.log.lock().unwrap().clear();
 
-        let outside = |p: &Path| format!("backup file outside the quarantine folder: {}", p.display());
+        let outside = |p: &Path| format!("backup-outside-quarantine: {}", p.display());
         assert_eq!(
             restore(&e.ops, &tampered),
             RestoreOutcome::Partial(vec![
@@ -1719,7 +1709,7 @@ mod tests {
         std::fs::create_dir_all(other.path().join(&m.id.0)).unwrap();
         e.calls.lock().unwrap().clear();
 
-        let err = format!("backup file outside the quarantine folder: {}", tampered.tasks[0].xml_backup.display());
+        let err = format!("backup-outside-quarantine: {}", tampered.tasks[0].xml_backup.display());
         assert_eq!(restore(&e.ops, &tampered), RestoreOutcome::Partial(vec![fail(r"Foo\Updater", &err)]));
         assert!(e.calls.lock().unwrap().is_empty(), "no task created");
     }
@@ -1769,7 +1759,7 @@ mod tests {
         e.mover.log.lock().unwrap().clear();
         e.regw.log.lock().unwrap().clear();
 
-        let untrusted = format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display());
+        let untrusted = format!("quarantine-not-trusted: {}", folder.display());
         assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail("manifest", &untrusted)]));
         assert!(!e.mover.log.lock().unwrap().iter().any(|l| l.starts_with("move")), "nothing moved back");
         assert!(e.regw.log.lock().unwrap().is_empty(), "nothing imported");

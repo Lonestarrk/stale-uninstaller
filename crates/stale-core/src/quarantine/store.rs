@@ -4,7 +4,6 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::Write;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -26,7 +25,7 @@ pub(crate) fn valid_id(id: &QuarantineId) -> bool {
 /// Writes `dir\<id>\manifest.json` (via a temporary file, so a crash never leaves half a manifest).
 pub fn save_manifest(dir: &Path, m: &QuarantineManifest) -> Result<(), String> {
     if !valid_id(&m.id) {
-        return Err(format!("invalid quarantine id {:?}", m.id.0));
+        return Err(format!("{}: {:?}", super::codes::INVALID_ID, m.id.0));
     }
     let folder = dir.join(&m.id.0);
     std::fs::create_dir_all(&folder).map_err(|e| format!("create {}: {e}", folder.display()))?;
@@ -85,7 +84,7 @@ pub fn owned_by_admins(path: &Path) -> Option<bool> {
     if super::fsmove::is_reparse_point(path) {
         return Some(false);
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide = crate::pathutil::wide(path);
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `wide` is NUL-terminated and outlives the call; `owner` points into `sd`, which the
@@ -178,20 +177,13 @@ mod tests {
         assert!(!checked.borrow().contains(&link), "a reparse entry is refused before its owner is read");
     }
 
-    /// `mklink /J link target`; false when it could not be created.
-    fn junction(link: &Path, target: &Path) -> bool {
-        std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
+    use crate::testutil::junction;
 
     /// Run with `cargo test -p stale-core -- --ignored junction`.
     #[test]
     #[ignore]
     fn junction_to_trusted_folder_is_not_trusted_live() {
+        let _env = crate::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let m = manifest("j-1", Utc::now());
@@ -212,6 +204,7 @@ mod tests {
     #[test]
     #[ignore]
     fn owned_by_admins_live() {
+        let _env = crate::env_lock();
         let programdata = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
         assert_eq!(owned_by_admins(Path::new(&programdata)), Some(true), "ProgramData is owned by SYSTEM");
         let dir = tempfile::tempdir().unwrap();

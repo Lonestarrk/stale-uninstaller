@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use super::filetime::filetime_to_utc;
 use super::{UsageHit, UsageProvider, UsageSource};
+use crate::scan::ScanWarning;
 
 pub mod decompress;
 
@@ -153,11 +154,11 @@ impl UsageProvider for PrefetchProvider {
         self.hits_in_dir().map(|(hits, _, _)| hits)
     }
 
-    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<String>) {
+    fn collect_with_warnings(&self) -> (Result<Vec<UsageHit>, String>, Vec<ScanWarning>) {
         match self.hits_in_dir() {
             Ok((hits, skipped, total)) => {
                 let warnings = if skipped > 0 {
-                    vec![format!("Prefetch: {skipped} av {total} filer kunde inte läsas")]
+                    vec![ScanWarning::PrefetchUnreadable { skipped, total }]
                 } else {
                     vec![]
                 };
@@ -234,7 +235,7 @@ mod tests {
         assert_eq!(p.collect().unwrap(), hits);
         let (with_warnings, warnings) = p.collect_with_warnings();
         assert_eq!(with_warnings.unwrap(), hits);
-        assert_eq!(warnings, vec!["Prefetch: 1 av 2 filer kunde inte läsas".to_string()]);
+        assert_eq!(warnings, vec![ScanWarning::PrefetchUnreadable { skipped: 1, total: 2 }]);
     }
 
     #[test]

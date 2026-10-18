@@ -120,13 +120,7 @@ impl ProgramHint {
     fn exe_dir(&self, exe: &Path) -> Option<PathBuf> {
         let stem = exe.file_stem()?.to_string_lossy().to_lowercase();
         let dir = exe.parent()?;
-        if drive_letter(exe).is_none()
-            || stem == "msiexec"
-            || normed_under(&norm(exe), &system_root_norm())
-            || is_shared_root(dir)
-            || in_temp_or_installer_cache(dir)
-            || in_user_folder(dir)
-        {
+        if drive_letter(exe).is_none() || stem == "msiexec" || is_rejected_dir(dir) {
             return None;
         }
         let named_like_uninstaller = UNINSTALLER_STEMS.iter().any(|u| stem.starts_with(u));
@@ -148,6 +142,20 @@ impl ProgramHint {
     }
 }
 
+/// True when `dir` can never be a program's own folder: no drive letter, a shared root, at or
+/// under `%SystemRoot%`, a temp or installer-cache folder ([`in_temp_or_installer_cache`]), or
+/// at/under a profile's user folder (Desktop, Documents, ...).
+pub(crate) fn is_rejected_dir(dir: &Path) -> bool {
+    let n = norm(dir);
+    let system_root = system_root_norm();
+    drive_letter(dir).is_none()
+        || is_shared_root(dir)
+        || n == system_root
+        || normed_under(&n, &system_root)
+        || in_temp_or_installer_cache(dir)
+        || in_user_folder(dir)
+}
+
 /// Lowercase file-name prefixes of uninstallers (`unins000`, `Uninstall Obsidian`, `uninst`,
 /// `setup`, `install`): such an exe sits in the program's own folder.
 const UNINSTALLER_STEMS: [&str; 5] = ["unins", "uninstall", "uninst", "setup", "install"];
@@ -155,12 +163,15 @@ const UNINSTALLER_STEMS: [&str; 5] = ["unins", "uninstall", "uninst", "setup", "
 /// Folder names that hold installer caches, never a program's install folder.
 const INSTALLER_CACHE_NAMES: [&str; 3] = ["package cache", "downloaded installations", "installshield installation information"];
 
-/// `dir` is at or under `%TEMP%`, `%LOCALAPPDATA%\Temp`, `%ProgramData%\Package Cache`,
-/// `%LOCALAPPDATA%\Package Cache`, or has a `Package Cache`, `Downloaded Installations` or
-/// `InstallShield Installation Information` folder in its path: an uninstaller there is a cached
-/// setup, and its folder is not the install folder.
+/// `dir` is at or under `%TEMP%`, `%LOCALAPPDATA%\Temp`, any profile's `AppData\Local\Temp`,
+/// `%ProgramData%\Package Cache`, `%LOCALAPPDATA%\Package Cache`, or has a `Package Cache`,
+/// `Downloaded Installations` or `InstallShield Installation Information` folder in its path: an
+/// uninstaller there is a cached setup, and its folder is not the install folder.
 fn in_temp_or_installer_cache(dir: &Path) -> bool {
     let n = norm(dir);
+    if in_any_profile_temp(&n, &norm(&crate::paths::user_profiles_root()), profile_roots()) {
+        return true;
+    }
     let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%LOCALAPPDATA%\Package Cache"];
     // ProgramData from the system, never from the environment.
     let package_cache = norm(&crate::paths::program_data_dir().join("Package Cache"));
@@ -172,6 +183,44 @@ fn in_temp_or_installer_cache(dir: &Path) -> bool {
         .chain(std::iter::once(package_cache))
         .any(|r| n == r || normed_under(&n, &r))
         || dir.components().any(|c| INSTALLER_CACHE_NAMES.contains(&c.as_os_str().to_string_lossy().to_lowercase().as_str()))
+}
+
+/// Every profile folder, [`norm`]ed, as recorded by [`init_profile_roots`].
+static PROFILE_ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Records every profile folder (`fs`'s [`profile_dirs`](crate::fsys::FsReader::profile_dirs) and
+/// `%USERPROFILE%`) for the Temp-folder check of [`ProgramHint::effective_install_dir`]. The live
+/// sources constructors call it; the first call wins. Until then (and in tests) only profiles in
+/// the Users folder are known.
+pub fn init_profile_roots(fs: &dyn crate::fsys::FsReader) {
+    PROFILE_ROOTS.get_or_init(|| {
+        let mut out: Vec<String> = fs.profile_dirs().iter().map(|p| norm(p)).collect();
+        out.extend(std::env::var_os("USERPROFILE").map(|p| norm(Path::new(&p))));
+        out
+    });
+}
+
+/// The profile folders [`init_profile_roots`] recorded; empty before it ran.
+fn profile_roots() -> &'static [String] {
+    PROFILE_ROOTS.get().map_or(&[], Vec::as_slice)
+}
+
+/// The [`norm`]ed `n` is at or under `<users>\<name>\AppData\Local\Temp` (whoever's profile it is;
+/// `users` is the normed Users folder) or `<profile>\AppData\Local\Temp` of one of `profiles`.
+fn in_any_profile_temp(n: &str, users: &str, profiles: &[String]) -> bool {
+    let under_users = n
+        .strip_prefix(users)
+        .and_then(|r| r.strip_prefix('\\'))
+        .is_some_and(|r| r.split('\\').skip(1).take(3).eq(["APPDATA", "LOCAL", "TEMP"]));
+    under_users || in_profile_temp(n, profiles)
+}
+
+/// The [`norm`]ed `n` is at or under `<profile>\AppData\Local\Temp` of one of `profiles`.
+fn in_profile_temp(n: &str, profiles: &[String]) -> bool {
+    profiles.iter().any(|p| {
+        let temp = format!(r"{p}\APPDATA\LOCAL\TEMP");
+        n == temp || normed_under(n, &temp)
+    })
 }
 
 /// `dir` is, holds or lies inside a user folder ([`USER_FOLDERS`]) of `%USERPROFILE%` or of the
@@ -371,6 +420,7 @@ mod tests {
 
     #[test]
     fn effective_install_dir_rejects_msiexec_and_system32() {
+        let _env = crate::env_lock();
         let sys = std::env::var("SystemRoot").unwrap();
         assert_eq!(hint_with(None, Some("MsiExec.exe /X{ABC}"), None).effective_install_dir(), None);
         assert_eq!(hint_with(None, Some(&format!(r"{sys}\System32\MsiExec.exe /X{{ABC}}")), None).effective_install_dir(), None);
@@ -380,6 +430,7 @@ mod tests {
 
     #[test]
     fn effective_install_dir_rejects_temp_caches_and_user_folders() {
+        let _env = crate::env_lock();
         let drive = std::env::var("SystemDrive").unwrap();
         let down = format!(r#""{drive}\Users\A\Downloads\Obsidian\Uninstall Obsidian.exe" /S"#);
         assert_eq!(hint_with(None, Some(&down), None).effective_install_dir(), None);
@@ -407,6 +458,29 @@ mod tests {
         let mut h = hint_with(None, None, Some(r"D:\Apps\Obsidian\Obsidian.exe"));
         h.name = "Obsidian Publisher".into();
         assert_eq!(h.effective_install_dir(), None);
+    }
+
+    #[test]
+    fn other_profile_temp_is_rejected() {
+        let users = norm(Path::new(r"X:\Users"));
+        let profiles = [norm(Path::new(r"D:\Profiles\Bob"))];
+        let temp = |p: &str| in_any_profile_temp(&norm(Path::new(p)), &users, &profiles);
+        // Anyone's Temp in the Users folder, whether or not the profile is known.
+        assert!(temp(r"X:\Users\SomeoneElse\AppData\Local\Temp"));
+        assert!(temp(r"X:\Users\SomeoneElse\AppData\Local\Temp\{GUID}\Obsidian"));
+        // The same profile's own programs are fine.
+        assert!(!temp(r"X:\Users\SomeoneElse\AppData\Local\Programs\Obsidian"));
+        assert!(!temp(r"X:\Users\SomeoneElse\Temp"));
+        assert!(!temp(r"D:\Apps\AppData\Local\Temp"));
+        // A profile outside the Users folder counts too.
+        assert!(temp(r"D:\Profiles\Bob\AppData\Local\Temp\{X}"));
+        assert!(temp(r"D:\Profiles\Bob\AppData\Local\Temp"));
+        assert!(!temp(r"D:\Profiles\Bob\AppData\Local\Programs"));
+        assert!(!in_any_profile_temp(&norm(Path::new(r"D:\Profiles\Bob\AppData\Local\Temp")), &users, &[]), "unknown profile");
+        // Wired into the install-folder rule: a setup in another profile's Temp is no install folder.
+        let temp_dir = crate::paths::user_profiles_root().join(r"SomeoneElse\AppData\Local\Temp");
+        let setup = format!(r#""{}\{{GUID}}\Uninstall Obsidian.exe" /S"#, temp_dir.display());
+        assert_eq!(hint_with(None, Some(&setup), None).effective_install_dir(), None);
     }
 
     #[test]

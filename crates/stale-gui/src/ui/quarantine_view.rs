@@ -27,12 +27,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let busy = app.quarantine_busy;
     let mut action = None;
     ui.horizontal(|ui| {
-        ui.heading(strings::QUARANTINE_TITLE);
-        if ui.button(strings::BACK_TO_PROGRAMS).clicked() {
+        ui.heading(strings::t().quarantine_title);
+        if ui.button(strings::t().back_to_programs).clicked() {
             action = Some(Action::Back);
         }
         let can_purge = !app.quarantine.is_empty() && !busy && !app.confirm_purge_all;
-        if ui.add_enabled(can_purge, egui::Button::new(strings::PURGE_ALL)).clicked() {
+        if ui.add_enabled(can_purge, egui::Button::new(strings::t().purge_all)).clicked() {
             action = Some(Action::AskPurgeAll);
         }
         if busy {
@@ -48,7 +48,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     }
     if app.quarantine.is_empty() {
         if !busy {
-            ui.label(strings::QUARANTINE_EMPTY);
+            ui.label(strings::t().quarantine_empty);
         }
     } else {
         let failures = app
@@ -97,7 +97,7 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
         .column(Column::auto())
         .column(Column::auto())
         .header(ROW_HEIGHT, |mut header| {
-            for title in [strings::COL_PROGRAM, strings::COL_DATE, strings::COL_SIZE, strings::COL_STATUS, ""] {
+            for title in [strings::t().col_program, strings::t().col_date, strings::t().col_size, strings::t().col_status, ""] {
                 header.col(|ui| {
                     ui.strong(title);
                 });
@@ -109,7 +109,7 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
                 row.col(|ui| {
                     let name = ui.label(&m.program_name);
                     if !m.services.is_empty() {
-                        name.on_hover_text(strings::SERVICE_REBOOT);
+                        name.on_hover_text(strings::t().service_reboot);
                     }
                 });
                 row.col(|ui| {
@@ -120,10 +120,10 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
                 });
                 row.col(|ui| status(ui, m));
                 row.col(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new(strings::RESTORE)).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new(strings::t().restore)).clicked() {
                         *action = Some(Action::Restore(m.id.clone()));
                     }
-                    if ui.add_enabled(!busy, egui::Button::new(strings::PURGE_ONE)).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new(strings::t().purge_one)).clicked() {
                         *action = Some(Action::AskPurge(m.id.clone()));
                     }
                 });
@@ -134,7 +134,7 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
 /// "ok", or "{n} fel" / "{n} ofullständiga" in the warning colour with the failures on hover.
 fn status(ui: &mut egui::Ui, m: &QuarantineManifest) {
     if m.failures.is_empty() && m.pending.is_empty() {
-        ui.label(strings::STATUS_OK);
+        ui.label(strings::t().status_ok);
         return;
     }
     if !m.failures.is_empty() {
@@ -146,14 +146,15 @@ fn status(ui: &mut egui::Ui, m: &QuarantineManifest) {
     }
 }
 
-fn failure_text(f: &Failure) -> String {
+/// "C:\Apps\Foo: <the error in the user's language>".
+pub(crate) fn failure_text(f: &Failure) -> String {
     format!("{}: {}", f.what, strings::core_error(&f.error))
 }
 
 /// What the last partial restore could not put back.
 fn restore_failures(ui: &mut egui::Ui, failures: &[Failure]) {
     ui.add_space(4.0);
-    ui.label(strings::RESTORE_PARTIAL);
+    ui.label(strings::t().restore_partial);
     egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
         for f in failures {
             ui.colored_label(STALE_COLOR, failure_text(f));
@@ -164,7 +165,8 @@ fn restore_failures(ui: &mut egui::Ui, failures: &[Failure]) {
 /// "Detta tar bort {name} permanent ({size}) och kan inte ångras." with Avbryt / Ta bort.
 fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action: &mut Option<Action>) {
     let size = format::human_size(Some(m.total_size()));
-    egui::Window::new(strings::PURGE_ONE)
+    egui::Window::new(strings::t().purge_one)
+        .id(egui::Id::unique("purge_one_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -172,10 +174,10 @@ fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action:
             ui.label(strings::purge_one_confirm(&m.program_name, &size));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(strings::CANCEL).clicked() {
+                if ui.button(strings::t().cancel).clicked() {
                     *action = Some(Action::CancelPurge);
                 }
-                if ui.add_enabled(!busy, egui::Button::new(strings::PURGE_ONE_CONFIRM_BUTTON)).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new(strings::t().purge_one_confirm_button)).clicked() {
                     *action = Some(Action::Purge(m.id.clone()));
                 }
             });
@@ -185,7 +187,8 @@ fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action:
 /// "Detta frigör {size} och kan inte ångras." with Avbryt / Töm.
 fn confirm_window(ui: &egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mut Option<Action>) {
     let size = format::human_size(Some(rows.iter().map(|m| m.total_size()).sum()));
-    egui::Window::new(strings::PURGE_ALL)
+    egui::Window::new(strings::t().purge_all)
+        .id(egui::Id::unique("purge_all_window"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -193,10 +196,10 @@ fn confirm_window(ui: &egui::Ui, rows: &[QuarantineManifest], busy: bool, action
             ui.label(strings::purge_all_confirm(&size));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(strings::CANCEL).clicked() {
+                if ui.button(strings::t().cancel).clicked() {
                     *action = Some(Action::CancelPurgeAll);
                 }
-                if ui.add_enabled(!busy, egui::Button::new(strings::PURGE)).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new(strings::t().purge)).clicked() {
                     *action = Some(Action::PurgeAll);
                 }
             });

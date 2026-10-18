@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, PCWSTR};
@@ -19,6 +18,11 @@ pub fn start_menu_dirs() -> Vec<PathBuf> {
         .filter_map(std::env::var_os)
         .map(|base| PathBuf::from(base).join(START_MENU_PROGRAMS))
         .collect()
+}
+
+/// The all-users and current-user Startup folders (shortcuts there run at logon).
+pub fn startup_dirs() -> Vec<PathBuf> {
+    start_menu_dirs().into_iter().map(|d| d.join("Startup")).collect()
 }
 
 /// Keeps COM initialized on the calling thread for its lifetime. If the thread already uses
@@ -69,7 +73,7 @@ fn from_wide(buf: &[u16]) -> String {
 /// The shortcut's target exactly as stored (may contain `%VAR%`; empty if it has none) and
 /// its arguments.
 fn raw_target(lnk: &Path) -> windows::core::Result<(String, String)> {
-    let wide: Vec<u16> = lnk.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide = crate::pathutil::wide(lnk);
     let mut path = [0u16; 1024];
     let mut args = [0u16; 2048];
     // SAFETY: COM is initialized by the caller; `wide` is NUL-terminated and outlives `Load`;
@@ -131,6 +135,7 @@ mod tests {
 
     #[test]
     fn start_menu_dirs_are_the_two_programs_folders() {
+        let _env = crate::env_lock();
         let dirs = start_menu_dirs();
         let suffix = Path::new("Microsoft").join("Windows").join("Start Menu").join("Programs");
         assert_eq!(dirs.len(), 2);

@@ -49,6 +49,14 @@ Upphöjd `dump` på utvecklarens dator: Prefetch har 490 filer och BAM 151 värd
 
 Beslutat i samtalet: ett program räknas som använt när **någon** av dess exe-filer har körts, inte bara huvudprogrammet. Uppdaterare, tjänster, kraschrapportörer, tray-hjälpare och avinstallerare räknas fortfarande inte (samma namnregler som i plan 1, plus registrerade tjänster). Kolumnen visar källan i parentes när det inte var huvudprogrammet: "Idag (via link.exe)". Verifierat underlag: på utvecklarens dator har Prefetch `LINK.EXE` (idag), `VCTIP.EXE`, `MSBUILD.EXE` under Visual Studios installationsmapp.
 
+Förtydligat under genomförandet (2026-10-18):
+- Bara exe-filer i programmets egen installationsmapp räknas som delkomponenter. En träff som hör till programmet bara via filnamnet räknas bara om den är huvudprogrammet.
+- Ett program som autostartar räknas som använt, eftersom det körs. En schemalagd uppgift som startar programmets eget huvudprogram räknas. Datumet märks då "(autostart)" när senaste körningen kom från BAM eller Prefetch och exe-filen startas av en schemalagd uppgift, en Run-nyckel eller Autostart-mappen, till exempel "Idag (autostart)".
+- Schemalagda underhållsjobb som inte är huvudprogrammet räknas inte, till exempel Office ActionsServer och Firefox default-browser-agent.
+- Tjänster räknas aldrig, inte ens när tjänsten är programmets ikonfil (Office ClickToRun).
+- En installationsfil räknas bara när den är programmets eget huvudprogram och körningen syns i Prefetch eller BAM. Ett program vars enda spår är dess egen cachade installationsfil räknas som aldrig använt.
+- En undantagen hjälpfil som användaren själv har startat från Start eller skrivbordet räknas, men dateras bara efter de egna starterna.
+
 ### 3.3 Beroenden
 
 Program som andra program behöver – SDK:er, runtimes, Visual C++-redistributables, .NET, Windows SDK, Python/Node/Java när andra program pekar dit – märks "används av andra program" i listan och kräver en extra bekräftelse innan de läggs i avinstallationskön. Byggarens val hur beroenden upptäcks (namnmönster + referenser från andra programs mappar är en rimlig början).
@@ -159,6 +167,17 @@ Mappförklararen och ögonblicksbilderna mäter många mappar. Mätningen körs 
 ## 13. Gränssnitt
 
 Nya vyer i verktygsraden: **Mappar** (§4–5), **Skräp** (§6, §9) och **Utrymme** (§7). Samma filtrerings-, tabell- och karantänmönster som de befintliga vyerna. All text på svenska i `strings.rs`.
+
+### 13.1 Språk
+
+Beslutat i samtalet (2026-10-18): programmet går att köra på svenska och engelska.
+- Första start: språket följer Windows visningsspråk. Svenska ger svenska, alla andra språk ger engelska.
+- Valet görs i inställningsmenyn, "Språk / Language", och sparas i `settings.json`. Bytet slår igenom direkt utan omstart.
+- Alla texter som visas för användaren finns på båda språken, även relativa datum ("3 dagar sedan" / "3 days ago"), felmeddelanden, varningar från kärnan och dialogen vid `--uninstall-cleanup`. Kompilatorn ska vägra en text som saknas på något av språken.
+- Kärnan skickar inga färdiga svenska meningar. Varningar och felorsaker är nycklar eller typade värden som gränssnittet översätter.
+- Installern visar svenska eller engelska efter Windows språk. Avinstallationsdialogen följer det språk som är sparat i programmet.
+- Datum visas som i dag (ÅÅÅÅ-MM-DD) på båda språken. Storlekar använder MB/GB på båda.
+- Senare uppgifter i plan 4 och plan 5 lägger in nya texter på båda språken.
 
 ## 14. Överlämnat till byggaren
 

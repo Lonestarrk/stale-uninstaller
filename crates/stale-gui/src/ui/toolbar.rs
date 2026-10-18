@@ -10,13 +10,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     ui.horizontal(|ui| {
         // One queue at a time: the buttons wait for the dialog and any running queue.
         let can_queue = !app.checked.is_empty() && app.pending.is_none() && !app.queue_running();
-        for (label, mode) in [(strings::UNINSTALL, UninstallMode::Normal), (strings::FORCE_REMOVE, UninstallMode::Forced)] {
+        for (label, mode) in [(strings::t().uninstall, UninstallMode::Normal), (strings::t().force_remove, UninstallMode::Forced)] {
             if ui.add_enabled(can_queue, egui::Button::new(label)).clicked() {
                 app.open_queue_dialog(mode);
             }
         }
         let can_search = app.search.is_none() && !app.leftover_search_running() && !app.removal_running();
-        if ui.add_enabled(can_search, egui::Button::new(strings::FIND_LEFTOVERS)).clicked() {
+        if ui.add_enabled(can_search, egui::Button::new(strings::t().find_leftovers)).clicked() {
             app.search = Some(SearchDialog::default());
         }
         // Leaving the leftovers view waits for a running removal, like its own back button.
@@ -25,11 +25,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             app.show_quarantine();
         }
         // Like the quarantine button; the view itself waits for the program scan before scanning.
-        if ui.add_enabled(!app.removal_running(), egui::Button::new(strings::GHOSTS)).clicked() {
+        if ui.add_enabled(!app.removal_running(), egui::Button::new(strings::t().ghosts)).clicked() {
             app.show_ghosts();
         }
         // One scan at a time: refreshing waits for the running scan to finish.
-        if ui.add_enabled(!app.scanning, egui::Button::new(strings::REFRESH)).clicked() {
+        if ui.add_enabled(!app.scanning, egui::Button::new(strings::t().refresh)).clicked() {
             app.refresh();
         }
         let mut show_hidden = app.settings.show_hidden;
@@ -37,22 +37,35 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         let mut days = app.settings.quarantine_days;
         let mut save_days = false;
         let mut open_kept = false;
-        ui.menu_button(strings::SETTINGS_MENU, |ui| {
-            toggled = ui.checkbox(&mut show_hidden, strings::SHOW_HIDDEN).changed();
+        let mut chosen_lang = None;
+        ui.menu_button(strings::t().settings_menu, |ui| {
+            toggled = ui.checkbox(&mut show_hidden, strings::t().show_hidden).changed();
             ui.horizontal(|ui| {
-                ui.label(strings::AUTO_PURGE_DAYS);
+                ui.label(strings::t().auto_purge_days);
                 let r = ui.add(egui::DragValue::new(&mut days).range(0..=365));
                 // Saved once a drag ends, not for every value passed on the way.
                 save_days = r.drag_stopped() || (r.changed() && !r.dragged());
                 if days == 0 {
-                    ui.label(strings::AUTO_PURGE_OFF);
+                    ui.label(strings::t().auto_purge_off);
                 }
             });
-            if ui.button(strings::KEPT_MENU).clicked() {
+            if ui.button(strings::t().kept_menu).clicked() {
                 open_kept = true;
                 ui.close();
             }
+            ui.menu_button(strings::t().language_menu, |ui| {
+                let current = strings::lang();
+                for (lang, label) in [(strings::Lang::Sv, strings::t().lang_sv), (strings::Lang::En, strings::t().lang_en)] {
+                    if ui.radio(current == lang, label).clicked() {
+                        chosen_lang = Some(lang);
+                        ui.close();
+                    }
+                }
+            });
         });
+        if let Some(lang) = chosen_lang {
+            app.set_language(lang);
+        }
         if toggled {
             app.toggle_show_hidden();
         }
@@ -67,16 +80,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         }
         if app.scanning {
             ui.spinner();
-            ui.label(strings::LOADING);
+            ui.label(strings::t().loading);
         }
         if app.leftover_search_running() {
             ui.spinner();
-            ui.label(strings::SEARCHING);
+            ui.label(strings::t().searching);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.filters.search)
-                    .hint_text(strings::SEARCH_HINT)
+                    .hint_text(strings::t().search_hint)
                     .desired_width(220.0),
             );
         });
