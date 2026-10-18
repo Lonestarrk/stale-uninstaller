@@ -19,6 +19,15 @@ pub fn exclude_label(reason: ExcludeReason) -> &'static str {
     }
 }
 
+/// "✓" for a counted main exe, "räknas" for a counted subcomponent, else the reason it is left out.
+fn counted_label(exe: &ExeUsage) -> &'static str {
+    match exe.excluded {
+        Some(reason) => exclude_label(reason),
+        None if exe.is_main => strings::COUNTED_YES,
+        None => strings::COUNTED_SUBCOMPONENT,
+    }
+}
+
 fn hive_label(hive: Hive) -> &'static str {
     match hive {
         Hive::LocalMachine => "HKLM",
@@ -33,6 +42,9 @@ fn last_used_text(row: &Row) -> String {
         return strings::NEVER_SEEN.to_string();
     };
     let mut text = format!("{} ({})", format::ymd(Some(format::local_date(when))), format::source_label(source));
+    if let Some(via) = &usage.last_used.via {
+        text.push_str(&format!(" {} {via}", strings::VIA));
+    }
     if !usage.last_used.confident {
         text.push_str(strings::UNCERTAIN_FILETIME);
     }
@@ -102,7 +114,7 @@ pub fn details_panel(ui: &mut egui::Ui, row: &Row) {
                     ui.label(format::source_label(exe.source));
                 });
                 r.col(|ui| {
-                    ui.label(exe.excluded.map_or(strings::COUNTED_YES, exclude_label));
+                    ui.label(counted_label(exe));
                 });
             });
         });
@@ -114,6 +126,21 @@ mod tests {
 
     use super::*;
     use crate::strings;
+
+    #[test]
+    fn counted_label_marks_subcomponents() {
+        let exe = |is_main, excluded| ExeUsage {
+            exe_path: r"C:\a\b.exe".into(),
+            last_run: chrono::Utc::now(),
+            source: stale_core::usage::UsageSource::Bam,
+            run_count: None,
+            is_main,
+            excluded,
+        };
+        assert_eq!(counted_label(&exe(true, None)), strings::COUNTED_YES);
+        assert_eq!(counted_label(&exe(false, None)), "räknas");
+        assert_eq!(counted_label(&exe(false, Some(ExcludeReason::Service))), strings::EXCLUDED_SERVICE);
+    }
 
     #[test]
     fn exclude_reason_labels_are_swedish() {

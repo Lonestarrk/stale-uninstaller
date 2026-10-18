@@ -94,7 +94,7 @@ pub fn show(ui: &mut egui::Ui, rows: &[Row], visible: &[usize], state: TableStat
                         return;
                     }
                     let last_used = row.last_used();
-                    let mut text = egui::RichText::new(format::relative_date(last_used, now));
+                    let mut text = egui::RichText::new(format::last_used_label(last_used, row.last_used_via(), now));
                     if is_stale(last_used, now) {
                         text = text.color(STALE_COLOR);
                     }

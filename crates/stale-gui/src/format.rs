@@ -32,6 +32,15 @@ pub fn relative_date(when: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String 
     }
 }
 
+/// [`relative_date`], plus " (via link.exe)" when the date came from a subcomponent exe.
+pub fn last_used_label(when: Option<DateTime<Utc>>, via: Option<&str>, now: DateTime<Utc>) -> String {
+    let date = relative_date(when, now);
+    match (when, via) {
+        (Some(_), Some(exe)) => format!("{date} ({} {exe})", strings::VIA),
+        _ => date,
+    }
+}
+
 /// "–" when unknown, whole MB below 1 GiB (at least 1 for non-empty), otherwise GB with
 /// one decimal and a Swedish comma.
 pub fn human_size(bytes: Option<u64>) -> String {
@@ -114,6 +123,14 @@ mod tests {
         assert_eq!(relative_date(ago(1079), now), "35 mån sedan");
         assert_eq!(relative_date(ago(1080), now), "2 år sedan");
         assert_eq!(relative_date(ago(1500), now), "4 år sedan");
+    }
+
+    #[test]
+    fn last_used_label_shows_via() {
+        let now = now();
+        assert_eq!(last_used_label(Some(now), Some("link.exe"), now), "Idag (via link.exe)");
+        assert_eq!(last_used_label(Some(now), None, now), "Idag");
+        assert_eq!(last_used_label(None, Some("link.exe"), now), "Aldrig sedd");
     }
 
     #[test]

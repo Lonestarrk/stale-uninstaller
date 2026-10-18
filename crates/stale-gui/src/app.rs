@@ -42,6 +42,11 @@ impl Row {
         self.usage.as_ref().and_then(|u| u.last_used.when)
     }
 
+    /// File name of the subcomponent exe the date came from, when it was not the main exe.
+    pub fn last_used_via(&self) -> Option<&str> {
+        self.usage.as_ref().and_then(|u| u.last_used.via.as_deref())
+    }
+
     /// The registry estimate, else the measured folder size (spec §5).
     pub fn size_bytes(&self) -> Option<u64> {
         self.program.estimated_size_bytes.or(self.size)
@@ -953,7 +958,7 @@ mod tests {
     }
 
     fn usage() -> ProgramUsage {
-        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true }, exes: Vec::new() }
+        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None }, exes: Vec::new() }
     }
 
     #[test]

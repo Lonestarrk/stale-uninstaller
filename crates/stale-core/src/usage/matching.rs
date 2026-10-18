@@ -30,6 +30,10 @@ pub struct ExeUsage {
 pub enum ExcludeReason {
     NamePattern,
     Service,
+    /// Kept for deserialisation. Only produced for a hit that belongs to a program through a
+    /// file-name claim alone (no install folder) and is not its main exe: that is the
+    /// uninstaller's or icon's name, not proof of a subcomponent. Inside the install folder a
+    /// non-main exe counts.
     NotMain,
 }
 
@@ -39,6 +43,10 @@ pub struct LastUsed {
     pub when: Option<DateTime<Utc>>,
     pub source: Option<UsageSource>,
     pub confident: bool,
+    /// Lowercased exe file name when the date came from a non-main exe of the program (a
+    /// subcomponent such as `link.exe`), else `None`.
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,13 +264,11 @@ fn is_uninstaller(exe: &Path) -> bool {
     exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().contains("unins"))
 }
 
-pub fn exclude_reason(exe: &Path, is_main: bool, service_exes: &HashSet<String>) -> Option<ExcludeReason> {
+pub fn exclude_reason(exe: &Path, service_exes: &HashSet<String>) -> Option<ExcludeReason> {
     if is_name_excluded(exe) {
         Some(ExcludeReason::NamePattern)
     } else if service_exes.contains(&norm(exe)) {
         Some(ExcludeReason::Service)
-    } else if !is_main {
-        Some(ExcludeReason::NotMain)
     } else {
         None
     }
@@ -320,6 +326,11 @@ impl<'a> Candidate<'a> {
         self.main.contains(&neutral) || (self.icon_name.is_some() && file_name_upper(exe) == self.icon_name)
     }
 
+    /// True for an exe inside the program's install folder (a subcomponent may count).
+    fn owns_by_folder(&self, exe: &Path) -> bool {
+        self.install.as_deref().is_some_and(|inst| normed_under(&norm(exe), inst))
+    }
+
     fn claims_by_name(&self, name: &Option<String>) -> bool {
         name.is_some() && (*name == self.icon_name || *name == self.uninstaller_name)
     }
@@ -358,7 +369,11 @@ fn with_install_drive(exe: &Path, install: Option<&str>) -> PathBuf {
 
 /// One `ExeUsage` per distinct exe (by `norm()`), newest first. Callers never mix FileTime
 /// hits with other sources in one call (see `summarize`).
-fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes: &HashSet<String>) -> Vec<ExeUsage> {
+fn group_hits(
+    hits: Vec<UsageHit>,
+    is_main: impl Fn(&Path) -> bool,
+    in_folder: impl Fn(&Path) -> bool,
+    service_exes: &HashSet<String>) -> Vec<ExeUsage> {
     let mut groups: BTreeMap<String, Vec<UsageHit>> = BTreeMap::new();
     for hit in hits {
         groups.entry(norm(&hit.exe_path)).or_default().push(hit);
@@ -378,7 +393,12 @@ fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes
                 source: latest.source,
                 run_count: group.iter().filter_map(|h| h.run_count).max(),
                 is_main: main,
-                excluded: if user_launched { None } else { exclude_reason(&latest.exe_path, main, service_exes) },
+                excluded: if user_launched {
+                    None
+                } else {
+                    exclude_reason(&latest.exe_path, service_exes)
+                        .or((!main && !in_folder(&latest.exe_path)).then_some(ExcludeReason::NotMain))
+                },
             })
         })
         .collect();
@@ -389,19 +409,31 @@ fn group_hits(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes
 fn last_used<'a>(exes: impl IntoIterator<Item = &'a ExeUsage>) -> LastUsed {
     exes.into_iter()
         .filter(|e| e.excluded.is_none())
-        .max_by_key(|e| e.last_run)
-        .map(|e| LastUsed { when: Some(e.last_run), source: Some(e.source), confident: e.source != UsageSource::FileTime })
-        .unwrap_or(LastUsed { when: None, source: None, confident: true })
+        // On a tie the main exe wins, so `via` stays empty.
+        .max_by_key(|e| (e.last_run, e.is_main))
+        .map(|e| LastUsed {
+            when: Some(e.last_run),
+            source: Some(e.source),
+            confident: e.source != UsageSource::FileTime,
+            via: (!e.is_main && e.source != UsageSource::FileTime)
+                .then(|| e.exe_path.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+                .flatten(),
+        })
+        .unwrap_or(LastUsed { when: None, source: None, confident: true, via: None })
 }
 
 /// Summarizes one program's hits (spec §5). File timestamps are a pure fallback: they never
 /// merge into an exe that has a real source, and they date the program only when it has no
 /// other hits at all (excluded ones included).
-fn summarize(hits: Vec<UsageHit>, is_main: impl Fn(&Path) -> bool, service_exes: &HashSet<String>) -> ProgramUsage {
+fn summarize(
+    hits: Vec<UsageHit>,
+    is_main: impl Fn(&Path) -> bool,
+    in_folder: impl Fn(&Path) -> bool,
+    service_exes: &HashSet<String>) -> ProgramUsage {
     let (file_times, real): (Vec<UsageHit>, Vec<UsageHit>) = hits.into_iter().partition(|h| h.source == UsageSource::FileTime);
-    let real = group_hits(real, &is_main, service_exes);
+    let real = group_hits(real, &is_main, &in_folder, service_exes);
     let real_exes: HashSet<String> = real.iter().map(|e| norm(&e.exe_path)).collect();
-    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, service_exes)
+    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes)
         .into_iter()
         .filter(|e| !real_exes.contains(&norm(&e.exe_path)))
         .collect();
@@ -430,7 +462,7 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
     let by_program = candidates
         .iter()
         .zip(assigned)
-        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), input.service_exes)))
+        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes)))
         .collect();
     MatchResult { by_program, unmatched }
 }
@@ -595,13 +627,13 @@ mod tests {
     fn exclude_reason_checks_name_then_service_then_main() {
         let exe = Path::new(r"C:\Apps\Foo\FooUpdater.exe");
         let services = HashSet::from([norm(exe), norm(Path::new(r"C:\Apps\Foo\agent.exe"))]);
-        assert_eq!(exclude_reason(exe, true, &services), Some(ExcludeReason::NamePattern));
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\CrashReporter.exe"), true, &HashSet::new()), Some(ExcludeReason::NamePattern));
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\AGENT.EXE"), true, &services), Some(ExcludeReason::Service));
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\other.exe"), false, &services), Some(ExcludeReason::NotMain));
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\foo.exe"), true, &services), None);
+        assert_eq!(exclude_reason(exe, &services), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\CrashReporter.exe"), &HashSet::new()), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\AGENT.EXE"), &services), Some(ExcludeReason::Service));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\other.exe"), &services), None);
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\foo.exe"), &services), None);
         // Only the stem is checked: a folder name containing "update" does not exclude.
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Updates\foo.exe"), true, &services), None);
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Updates\foo.exe"), &services), None);
     }
 
     #[test]
@@ -610,7 +642,7 @@ mod tests {
         let hits = [hit(r"C:\Apps\Foo\FooUpdater.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 200, UsageSource::Bam)];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(200)), source: Some(UsageSource::Bam), confident: true });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(200)), source: Some(UsageSource::Bam), confident: true, via: None });
         assert_eq!(u.exes.len(), 2);
         assert_eq!(u.exes[0].exe_path, PathBuf::from(r"C:\Apps\Foo\FooUpdater.exe"));
         assert_eq!(u.exes[0].excluded, Some(ExcludeReason::NamePattern));
@@ -627,7 +659,7 @@ mod tests {
         let services = HashSet::from([norm(Path::new(r"C:\Apps\Foo\foo.exe"))]);
         let u = &run(&programs, &hits, &services).by_program[&ProgramId("Foo".into())];
         assert_eq!(u.exes[0].excluded, Some(ExcludeReason::Service));
-        assert_eq!(u.last_used, LastUsed { when: None, source: None, confident: true });
+        assert_eq!(u.last_used, LastUsed { when: None, source: None, confident: true, via: None });
     }
 
     #[test]
@@ -640,7 +672,7 @@ mod tests {
         ];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(5)), source: Some(UsageSource::UserAssist), confident: true });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(5)), source: Some(UsageSource::UserAssist), confident: true, via: Some("other.exe".into()) });
         assert_eq!(u.exes.len(), 2);
         assert!(!u.exes[0].is_main);
         assert_eq!(u.exes[0].excluded, None);
@@ -669,7 +701,7 @@ mod tests {
         let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
         let hits = [hit(r"C:\Apps\Foo\foo.exe", 30, UsageSource::FileTime)];
         let r = run(&programs, &hits, &HashSet::new());
-        assert_eq!(usage(&r, "Foo").last_used, LastUsed { when: Some(days_ago(30)), source: Some(UsageSource::FileTime), confident: false });
+        assert_eq!(usage(&r, "Foo").last_used, LastUsed { when: Some(days_ago(30)), source: Some(UsageSource::FileTime), confident: false, via: None });
     }
 
     #[test]
@@ -782,8 +814,8 @@ mod tests {
         let roots = vec![(PathBuf::from(r"C:\Apps\Foo\unins000.exe"), 900), (PathBuf::from(r"C:\Apps\Foo\foo.exe"), 100)];
         assert_eq!(main_exes(&p, &shortcuts, &roots, &[]), paths(&[r"C:\Apps\Foo\foo.exe"]));
         let services = HashSet::new();
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\unins000.exe"), true, &services), Some(ExcludeReason::NamePattern));
-        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\Uninstall.exe"), true, &services), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\unins000.exe"), &services), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(Path::new(r"C:\Apps\Foo\Uninstall.exe"), &services), Some(ExcludeReason::NamePattern));
         let hits = [hit(r"C:\Apps\Foo\unins000.exe", 1, UsageSource::Bam)];
         let r = match_usage(&MatchInput {
             programs: &[p],
@@ -802,7 +834,7 @@ mod tests {
         let hits = [hit(r"C:\Nowhere\x.exe", 1, UsageSource::Bam)];
         let r = run(&programs, &hits, &HashSet::new());
         assert_eq!(r.unmatched, hits.to_vec());
-        assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true }, exes: vec![] });
+        assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None }, exes: vec![] });
     }
 
     #[test]
@@ -813,7 +845,7 @@ mod tests {
         let main = PathBuf::from(r"C:\Users\X\AppData\Local\Discord\app-1.0\Discord.exe");
         let roots = vec![(update.clone(), 2_000_000)];
         assert_eq!(main_exes(&p, &shortcuts, &roots, std::slice::from_ref(&main)), vec![main.clone()]);
-        assert_eq!(exclude_reason(&update, false, &HashSet::new()), Some(ExcludeReason::NamePattern));
+        assert_eq!(exclude_reason(&update, &HashSet::new()), Some(ExcludeReason::NamePattern));
 
         let hits = [hit(main.to_str().unwrap(), 3, UsageSource::Bam), hit(update.to_str().unwrap(), 1, UsageSource::Bam)];
         let r = match_usage(&MatchInput {
@@ -825,7 +857,7 @@ mod tests {
             service_exes: &HashSet::new(),
         });
         let u = usage(&r, "Discord");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(3)), source: Some(UsageSource::Bam), confident: true });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(3)), source: Some(UsageSource::Bam), confident: true, via: None });
         let discord = u.exes.iter().find(|e| e.exe_path == main).unwrap();
         assert!(discord.is_main && discord.excluded.is_none());
     }
@@ -844,7 +876,7 @@ mod tests {
         let hits = [hit(r"C:\Apps\Foo\foo.exe", 300, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 1, UsageSource::FileTime)];
         let r = run(&programs, &hits, &HashSet::new());
         let u = usage(&r, "Foo");
-        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(300)), source: Some(UsageSource::Bam), confident: true });
+        assert_eq!(u.last_used, LastUsed { when: Some(days_ago(300)), source: Some(UsageSource::Bam), confident: true, via: None });
         assert_eq!(u.exes.len(), 1);
         assert_eq!((u.exes[0].source, u.exes[0].last_run), (UsageSource::Bam, days_ago(300)));
     }
@@ -900,7 +932,7 @@ mod tests {
         let programs = [prog("Outer", Some(r"C:\Apps\Suite")), prog("Inner", Some(r"C:\Apps\Suite\Plugin"))];
         let hits = [hit(r"C:\Apps\Suite\Plugin\plug.exe", 1, UsageSource::Bam)];
         assert_eq!(explain(&programs, &hits, "Outer"), ["assigned-to:Inner"]);
-        assert_eq!(explain(&programs, &hits, "Inner"), ["excluded:NotMain"]);
+        assert_eq!(explain(&programs, &hits, "Inner"), ["counted"]);
     }
 
     fn input<'a>(
@@ -1118,6 +1150,80 @@ mod tests {
             (PathBuf::from(format!(r"{install}\bf6.exe")), 2_000_000),
         ];
         assert_eq!(main_exes_with_rule(&p, &[], &roots, &[]), (vec![PathBuf::from(format!(r"{install}\bf6.exe"))], MainRule::LargestRootExe));
+    }
+
+    fn via_of(u: &ProgramUsage) -> (Option<DateTime<Utc>>, Option<&str>) {
+        (u.last_used.when, u.last_used.via.as_deref())
+    }
+
+    #[test]
+    fn non_main_exe_counts_and_sets_via() {
+        let vs = r"C:\Program Files\Microsoft Visual Studio\18\Professional";
+        let programs = [prog("VS", Some(vs))];
+        let hits = [hit(&format!(r"{vs}\VC\Tools\MSVC\14.50\bin\Hostx64\x64\LINK.EXE"), 0, UsageSource::Bam)];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "VS");
+        assert_eq!(via_of(u), (Some(days_ago(0)), Some("link.exe")));
+        assert_eq!(u.exes[0].excluded, None);
+        assert!(!u.exes[0].is_main);
+    }
+
+    #[test]
+    fn main_exe_hit_wins_without_via() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let newer_other = [hit(r"C:\Apps\Foo\foo.exe", 1, UsageSource::Bam), hit(r"C:\Apps\Foo\tool.exe", 0, UsageSource::Bam)];
+        let r = run(&programs, &newer_other, &HashSet::new());
+        assert_eq!(via_of(usage(&r, "Foo")), (Some(days_ago(0)), Some("tool.exe")));
+        let newer_main = [hit(r"C:\Apps\Foo\foo.exe", 0, UsageSource::Bam), hit(r"C:\Apps\Foo\tool.exe", 1, UsageSource::Bam)];
+        let r = run(&programs, &newer_main, &HashSet::new());
+        assert_eq!(via_of(usage(&r, "Foo")), (Some(days_ago(0)), None));
+        let tie = [hit(r"C:\Apps\Foo\tool.exe", 0, UsageSource::Bam), hit(r"C:\Apps\Foo\foo.exe", 0, UsageSource::Bam)];
+        let r = run(&programs, &tie, &HashSet::new());
+        assert_eq!(via_of(usage(&r, "Foo")), (Some(days_ago(0)), None));
+    }
+
+    #[test]
+    fn updater_still_excluded() {
+        let chrome = r"C:\Program Files\Google\Chrome";
+        let programs = [prog("Chrome", Some(chrome))];
+        let hits = [
+            hit(&format!(r"{chrome}\GoogleUpdate.exe"), 0, UsageSource::Bam),
+            hit(&format!(r"{chrome}\updater.exe"), 0, UsageSource::Prefetch),
+            hit(&format!(r"{chrome}\Application\crashpad_handler.exe"), 0, UsageSource::Bam),
+            hit(&format!(r"{chrome}\unins000.exe"), 0, UsageSource::Bam),
+        ];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Chrome");
+        assert_eq!(u.last_used.when, None);
+        assert!(u.exes.iter().all(|e| e.excluded == Some(ExcludeReason::NamePattern)));
+    }
+
+    #[test]
+    fn service_exe_still_excluded() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let hits = [hit(r"C:\Apps\Foo\bin\agent.exe", 0, UsageSource::Bam)];
+        let services = HashSet::from([norm(Path::new(r"C:\Apps\Foo\bin\agent.exe"))]);
+        let r = run(&programs, &hits, &services);
+        assert_eq!(usage(&r, "Foo").exes[0].excluded, Some(ExcludeReason::Service));
+        assert_eq!(usage(&r, "Foo").last_used.when, None);
+    }
+
+    #[test]
+    fn name_claimed_non_main_hit_does_not_count() {
+        // No install folder, so the uninstaller's file name claims `remove.exe` hits: not a subcomponent.
+        let mut p = prog("Baz", None);
+        p.uninstall_string = Some(r#""C:\x\remove.exe" /SILENT"#.to_string());
+        let r = run(&[p], &[hit(r"D:\elsewhere\REMOVE.EXE", 0, UsageSource::Bam)], &HashSet::new());
+        let u = usage(&r, "Baz");
+        assert_eq!(u.exes[0].excluded, Some(ExcludeReason::NotMain));
+        assert_eq!(u.last_used.when, None);
+    }
+
+    #[test]
+    fn filetime_fallback_never_sets_via() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let r = run(&programs, &[hit(r"C:\Apps\Foo\tool.exe", 3, UsageSource::FileTime)], &HashSet::new());
+        assert_eq!(via_of(usage(&r, "Foo")), (Some(days_ago(3)), None));
     }
 
     #[test]

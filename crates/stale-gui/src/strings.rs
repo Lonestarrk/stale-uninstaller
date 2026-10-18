@@ -97,6 +97,10 @@ pub const COL_LAST_RUN: &str = "Senast körd";
 pub const COL_SOURCE: &str = "Källa";
 pub const COL_COUNTED: &str = "Räknas";
 pub const COUNTED_YES: &str = "✓";
+/// Counted non-main exe (a subcomponent of the program).
+pub const COUNTED_SUBCOMPONENT: &str = "räknas";
+/// Between the date and the exe name in "Idag (via link.exe)".
+pub const VIA: &str = "via";
 pub const RUNS: &str = "körningar";
 pub const EXCLUDED_NAME_PATTERN: &str = "uppdaterare/tjänst-namn";
 pub const EXCLUDED_SERVICE: &str = "tjänst";
