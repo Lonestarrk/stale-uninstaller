@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::quarantine::{list_trusted_manifests, purge, QuarantineOps};
+use crate::quarantine::{list_trusted_manifests, purge, QuarantineManifest, QuarantineOps};
 
 /// The user's answer to the "the quarantine holds N GB" question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,11 +89,69 @@ fn retry_writable(path: &Path, md: &std::fs::Metadata, remove: &dyn Fn(&Path) ->
     }
 }
 
-/// How `--uninstall-cleanup` ended.
+/// `--ask` exit code: no quarantine, remove the data folder (`--apply remove`).
+pub const EXIT_REMOVE: i32 = 10;
+/// `--ask` exit code: the user chose Yes, purge then remove (`--apply purge`).
+pub const EXIT_PURGE: i32 = 11;
+/// `--ask` exit code: keep the quarantine and the data folder (nothing to apply).
+pub const EXIT_KEEP: i32 = 12;
+
+/// The `--ask` exit code that tells the installer's uninstaller what was decided.
+pub fn exit_code_for(action: CleanupAction) -> i32 {
+    match action {
+        CleanupAction::RemoveDataDir => EXIT_REMOVE,
+        CleanupAction::PurgeThenRemove => EXIT_PURGE,
+        CleanupAction::KeepAll => EXIT_KEEP,
+        CleanupAction::AbortUninstall => EXIT_ABORT,
+    }
+}
+
+/// The action an `--ask` exit code stands for; `None` for any other code (a crash, a refused
+/// build), which the uninstaller treats as "keep everything".
+pub fn action_for_exit_code(code: i32) -> Option<CleanupAction> {
+    match code {
+        EXIT_REMOVE => Some(CleanupAction::RemoveDataDir),
+        EXIT_PURGE => Some(CleanupAction::PurgeThenRemove),
+        EXIT_KEEP => Some(CleanupAction::KeepAll),
+        EXIT_ABORT => Some(CleanupAction::AbortUninstall),
+        _ => None,
+    }
+}
+
+/// What `--apply` was told to do, decided earlier by `--ask`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// `--apply remove`: there was no quarantine.
+    Remove,
+    /// `--apply purge`: the user agreed to empty the quarantine.
+    Purge,
+}
+
+impl ApplyMode {
+    /// `"remove"` or `"purge"`; `None` for anything else.
+    pub fn parse(arg: &str) -> Option<ApplyMode> {
+        match arg {
+            "remove" => Some(ApplyMode::Remove),
+            "purge" => Some(ApplyMode::Purge),
+            _ => None,
+        }
+    }
+}
+
+/// The action `--apply mode` carries out when `manifests` trusted quarantines exist now. A
+/// quarantine that appeared after `--ask` found none is never purged without consent: `remove`
+/// then keeps everything.
+pub fn apply_action(mode: ApplyMode, manifests: usize) -> CleanupAction {
+    match (mode, manifests) {
+        (_, 0) => CleanupAction::RemoveDataDir,
+        (ApplyMode::Remove, _) => CleanupAction::KeepAll,
+        (ApplyMode::Purge, _) => CleanupAction::PurgeThenRemove,
+    }
+}
+
+/// How `--apply` ended.
 #[derive(Debug, Default, PartialEq)]
 pub struct CleanupOutcome {
-    /// 0, or [`EXIT_ABORT`] when the uninstall must stop.
-    pub exit_code: i32,
     /// The data folder was removed.
     pub removed: bool,
     /// Some quarantine could not be purged, so the data folder was kept.
@@ -103,48 +161,50 @@ pub struct CleanupOutcome {
     pub errors: Vec<String>,
 }
 
-/// Lists the trusted quarantines below `ops.manifest_dir` (folders that are not reparse points
-/// and that `ops.trusted_dir` vouches for), asks `ask(total bytes)` only when there are any, and
-/// carries out [`cleanup_action`]: purges them ([`purge`], which never deletes unknown payload)
-/// and/or removes `data_dir` with [`remove_tree_no_follow`], then prunes the empty folders of
-/// `payload_parents` (`<drive>:\Stale Uninstaller`), which never removes a file or follows a link.
-/// The data folder is kept when any purge fails.
-pub fn run(
-    ops: &QuarantineOps,
-    data_dir: &Path,
-    payload_parents: &[PathBuf],
-    ask: &mut dyn FnMut(u64) -> Option<Choice>,
-) -> CleanupOutcome {
-    let manifests = list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir, &|p| ops.mover.is_reparse(p));
-    let choice = if manifests.is_empty() {
-        None
-    } else {
-        ask(manifests.iter().map(|m| m.total_size()).sum())
-    };
+/// The trusted quarantines below `ops.manifest_dir`: folders that are not reparse points and that
+/// `ops.trusted_dir` vouches for.
+fn trusted_manifests(ops: &QuarantineOps) -> Vec<QuarantineManifest> {
+    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir, &|p| ops.mover.is_reparse(p))
+}
+
+/// `--ask`: lists the trusted quarantines and asks `ask(total bytes)` only when there are any.
+/// Only decides: nothing is purged, moved or deleted, because the installer's uninstaller asks for
+/// its own confirmation after this, and `--apply` acts only once that is given.
+pub fn decide(ops: &QuarantineOps, ask: &mut dyn FnMut(u64) -> Option<Choice>) -> CleanupAction {
+    let manifests = trusted_manifests(ops);
+    let choice = if manifests.is_empty() { None } else { ask(manifests.iter().map(|m| m.total_size()).sum()) };
+    cleanup_action(manifests.len(), choice)
+}
+
+/// `--apply mode`: re-lists the trusted quarantines and carries out [`apply_action`]: purges them
+/// ([`purge`], which never deletes unknown payload) and/or removes `data_dir` with
+/// [`remove_tree_no_follow`], then prunes the empty folders of `payload_parents`
+/// (`<drive>:\Stale Uninstaller`), which never removes a file or follows a link. The data folder
+/// is kept when any purge fails.
+pub fn apply(ops: &QuarantineOps, data_dir: &Path, payload_parents: &[PathBuf], mode: ApplyMode) -> CleanupOutcome {
+    let manifests = trusted_manifests(ops);
+    let action = apply_action(mode, manifests.len());
     let mut out = CleanupOutcome::default();
-    match cleanup_action(manifests.len(), choice) {
-        CleanupAction::AbortUninstall => out.exit_code = EXIT_ABORT,
-        CleanupAction::KeepAll => {}
-        action => {
-            if action == CleanupAction::PurgeThenRemove {
-                for m in &manifests {
-                    if let Err(e) = purge(ops, m) {
-                        out.errors.push(format!("quarantine {}: {e}", m.id.0));
-                    }
-                }
-            }
-            out.purge_failed = !out.errors.is_empty();
-            if !out.purge_failed {
-                match remove_tree_no_follow(data_dir) {
-                    Ok(()) => out.removed = true,
-                    Err(e) => out.errors.push(format!("remove {}: {e}", data_dir.display())),
-                }
-            }
-            for p in payload_parents {
-                // Only empty folders go; anything left (unknown payload, a link) keeps its folders.
-                let _ = ops.mover.remove_empty_dirs(p);
+    if !matches!(action, CleanupAction::RemoveDataDir | CleanupAction::PurgeThenRemove) {
+        return out;
+    }
+    if action == CleanupAction::PurgeThenRemove {
+        for m in &manifests {
+            if let Err(e) = purge(ops, m) {
+                out.errors.push(format!("quarantine {}: {e}", m.id.0));
             }
         }
+    }
+    out.purge_failed = !out.errors.is_empty();
+    if !out.purge_failed {
+        match remove_tree_no_follow(data_dir) {
+            Ok(()) => out.removed = true,
+            Err(e) => out.errors.push(format!("remove {}: {e}", data_dir.display())),
+        }
+    }
+    for p in payload_parents {
+        // Only empty folders go; anything left (unknown payload, a link) keeps its folders.
+        let _ = ops.mover.remove_empty_dirs(p);
     }
     out
 }
@@ -298,52 +358,97 @@ mod tests {
     }
 
     #[test]
-    fn run_without_trusted_quarantines_removes_the_data_folder_without_asking() {
-        let (_base, data, ops) = env();
-        save_manifest(&ops.manifest_dir, &manifest("untrusted-1", 5)).unwrap();
-        let mut asked = false;
-        let out = run(&ops, &data, &[], &mut |_| {
-            asked = true;
-            Some(Choice::No)
-        });
-        assert!(!asked);
-        assert_eq!(out, CleanupOutcome { exit_code: 0, removed: true, purge_failed: false, errors: vec![] });
-        assert!(std::fs::symlink_metadata(&data).is_err());
+    fn exit_codes_map_to_actions() {
+        let all = [
+            CleanupAction::RemoveDataDir,
+            CleanupAction::PurgeThenRemove,
+            CleanupAction::KeepAll,
+            CleanupAction::AbortUninstall,
+        ];
+        assert_eq!(all.map(exit_code_for), [10, 11, 12, 2]);
+        for a in all {
+            assert_eq!(action_for_exit_code(exit_code_for(a)), Some(a));
+        }
+        assert_eq!(action_for_exit_code(0), None);
+        assert_eq!(action_for_exit_code(1), None);
+        assert_eq!(ApplyMode::parse("remove"), Some(ApplyMode::Remove));
+        assert_eq!(ApplyMode::parse("purge"), Some(ApplyMode::Purge));
+        assert_eq!(ApplyMode::parse("Purge"), None);
     }
 
     #[test]
-    fn run_asks_with_the_total_size_and_keeps_everything_on_no() {
+    fn apply_remove_keeps_all_when_manifests_appeared() {
+        assert_eq!(apply_action(ApplyMode::Remove, 0), CleanupAction::RemoveDataDir);
+        assert_eq!(apply_action(ApplyMode::Remove, 1), CleanupAction::KeepAll);
+        assert_eq!(apply_action(ApplyMode::Purge, 2), CleanupAction::PurgeThenRemove);
+        assert_eq!(apply_action(ApplyMode::Purge, 0), CleanupAction::RemoveDataDir);
+
         let (_base, data, ops) = env();
-        save_manifest(&ops.manifest_dir, &manifest("a-1", 1000)).unwrap();
-        save_manifest(&ops.manifest_dir, &manifest("b-2", 24)).unwrap();
-        save_manifest(&ops.manifest_dir, &manifest("untrusted-3", 7)).unwrap();
-        let mut asked = None;
-        let out = run(&ops, &data, &[], &mut |total| {
-            asked = Some(total);
-            Some(Choice::No)
-        });
-        assert_eq!(asked, Some(1024));
+        save_manifest(&ops.manifest_dir, &manifest("a-1", 10)).unwrap();
+        let out = apply(&ops, &data, &[], ApplyMode::Remove);
         assert_eq!(out, CleanupOutcome::default());
         assert!(ops.manifest_dir.join("a-1").join("manifest.json").is_file());
         assert!(data.join("settings.json").is_file());
     }
 
     #[test]
-    fn run_cancel_exits_with_the_abort_code_and_touches_nothing() {
-        let (_base, data, ops) = env();
-        save_manifest(&ops.manifest_dir, &manifest("a-1", 10)).unwrap();
-        let out = run(&ops, &data, &[], &mut |_| Some(Choice::Cancel));
-        assert_eq!(out.exit_code, EXIT_ABORT);
-        assert!(!out.removed);
-        assert!(ops.manifest_dir.join("a-1").join("manifest.json").is_file());
+    fn ask_never_touches_disk() {
+        for (answer, expected) in [
+            (Some(Choice::Yes), CleanupAction::PurgeThenRemove),
+            (Some(Choice::No), CleanupAction::KeepAll),
+            (Some(Choice::Cancel), CleanupAction::AbortUninstall),
+            (None, CleanupAction::KeepAll),
+        ] {
+            let fake = Arc::new(FakeFileMover::new());
+            let (_base, data, mut ops) = env();
+            ops.mover = fake.clone();
+            save_manifest(&ops.manifest_dir, &manifest("a-1", 1000)).unwrap();
+            save_manifest(&ops.manifest_dir, &manifest("b-2", 24)).unwrap();
+            save_manifest(&ops.manifest_dir, &manifest("untrusted-3", 7)).unwrap();
+            let mut asked = None;
+            let got = decide(&ops, &mut |total| {
+                asked = Some(total);
+                answer
+            });
+            assert_eq!(got, expected);
+            assert_eq!(asked, Some(1024), "untrusted quarantines are not counted");
+            assert_eq!(*fake.log.lock().unwrap(), Vec::<String>::new(), "no move, removal or prune");
+            for id in ["a-1", "b-2", "untrusted-3"] {
+                assert!(ops.manifest_dir.join(id).join("manifest.json").is_file());
+            }
+            assert!(data.join("settings.json").is_file());
+        }
     }
 
     #[test]
-    fn run_yes_purges_then_removes_the_data_folder() {
+    fn ask_without_trusted_quarantines_decides_removal_without_asking() {
+        let (_base, data, ops) = env();
+        save_manifest(&ops.manifest_dir, &manifest("untrusted-1", 5)).unwrap();
+        let mut asked = false;
+        let got = decide(&ops, &mut |_| {
+            asked = true;
+            Some(Choice::No)
+        });
+        assert!(!asked);
+        assert_eq!(got, CleanupAction::RemoveDataDir);
+        assert!(data.join("settings.json").is_file());
+    }
+
+    #[test]
+    fn apply_remove_removes_the_data_folder_without_trusted_quarantines() {
+        let (_base, data, ops) = env();
+        save_manifest(&ops.manifest_dir, &manifest("untrusted-1", 5)).unwrap();
+        let out = apply(&ops, &data, &[], ApplyMode::Remove);
+        assert_eq!(out, CleanupOutcome { removed: true, purge_failed: false, errors: vec![] });
+        assert!(std::fs::symlink_metadata(&data).is_err());
+    }
+
+    #[test]
+    fn apply_purge_purges_then_removes_the_data_folder() {
         let (_base, data, ops) = env();
         save_manifest(&ops.manifest_dir, &manifest("a-1", 0)).unwrap();
-        let out = run(&ops, &data, &[], &mut |_| Some(Choice::Yes));
-        assert_eq!(out, CleanupOutcome { exit_code: 0, removed: true, purge_failed: false, errors: vec![] });
+        let out = apply(&ops, &data, &[], ApplyMode::Purge);
+        assert_eq!(out, CleanupOutcome { removed: true, purge_failed: false, errors: vec![] });
         assert!(std::fs::symlink_metadata(&data).is_err());
     }
 

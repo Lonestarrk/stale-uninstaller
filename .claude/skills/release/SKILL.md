@@ -59,7 +59,8 @@ run `schtasks /run /tn StaleDevElevated`, wait for a new `=== end` line in
 5. Uninstall (only when step 1 found no manifests):
    `%ProgramFiles%\Stale Uninstaller\unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=<file>`;
    check `%ProgramFiles%\Stale Uninstaller`, the uninstall key, the shortcut and
-   `%ProgramData%\Stale Uninstaller` are gone, and that the log has `Stale cleanup exit code: 0`.
+   `%ProgramData%\Stale Uninstaller` are gone, and that the uninstall log has both phases:
+   `Stale cleanup --ask exit code: 10` and `Stale cleanup --apply remove exit code: 0`.
 6. Restore the backup with the same robocopy flags, put the saved SDDL back with `Set-Acl`, and
    check that `settings.json` and `important.json` are back.
 
@@ -85,7 +86,13 @@ The README's Download section points to the Releases page, so it needs no change
 
 ## Uninstall behaviour (what the smoke test exercises)
 
-The uninstaller runs `StaleUninstaller.exe --uninstall-cleanup` before removing files (a silent
-uninstall adds `--silent`). With no quarantine it removes `%ProgramData%\Stale Uninstaller`; with a
-quarantine it asks Yes (empty it and remove the data) / No (keep both) / Cancel (exit code 2 stops
-the uninstall). `--silent` never asks and keeps a quarantine.
+Inno calls `InitializeUninstall` before its own "Are you sure…?" confirmation, so the cleanup runs
+in two phases (`installer/stale.iss`):
+
+1. `InitializeUninstall` runs `StaleUninstaller.exe --uninstall-cleanup --ask` (plus `--silent` for a
+   silent uninstall). It only decides and changes nothing on disk. Exit codes: 10 = remove the data
+   folder (no quarantine), 11 = purge then remove (the user chose Yes), 12 = keep everything (No, or
+   silent with a quarantine), 2 = Cancel, which stops the uninstall. If the exe cannot run, 12.
+2. `CurUninstallStepChanged(usUninstall)`, after the confirmation and before files are removed,
+   runs `--uninstall-cleanup --apply remove|purge` for 10 or 11. It re-checks the quarantine: a
+   quarantine that appeared since phase 1 is kept under `remove`, never purged without consent.

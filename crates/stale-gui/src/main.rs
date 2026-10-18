@@ -59,7 +59,7 @@ fn main() -> eframe::Result {
     // makes sure the program is closed).
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|a| a == "--uninstall-cleanup") {
-        std::process::exit(uninstall_cleanup(args.iter().any(|a| a == "--silent")));
+        std::process::exit(uninstall_cleanup(&args[1..]));
     }
     if !single_instance() {
         message_box(t().already_running, false);
@@ -89,31 +89,54 @@ fn main() -> eframe::Result {
     eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
 }
 
-/// `--uninstall-cleanup [--silent]`: empties or keeps the quarantine and removes
-/// `%ProgramData%\Stale Uninstaller` ([`selfclean::run`]). Returns the exit code: 0 to go on with
-/// the uninstall, [`selfclean::EXIT_ABORT`] to stop it. With `--silent` (a silent uninstall)
-/// nobody is asked, so a quarantine and the data folder are kept.
-fn uninstall_cleanup(silent: bool) -> i32 {
+/// `--uninstall-cleanup`, run by Stale's own uninstaller in two phases:
+/// - `--ask [--silent]` before the uninstaller's own confirmation: only decides (asking about a
+///   quarantine unless `--silent`) and exits with [`selfclean::exit_code_for`]: 10 remove the
+///   data folder, 11 purge then remove, 12 keep everything, 2 stop the uninstall.
+/// - `--apply remove|purge [--silent]` once the uninstall is confirmed: does the work
+///   ([`selfclean::apply`], which re-checks the quarantine) and exits 0.
+///
+/// Anything else changes nothing and exits [`selfclean::EXIT_KEEP`].
+fn uninstall_cleanup(args: &[std::ffi::OsString]) -> i32 {
+    let silent = args.iter().any(|a| a == "--silent");
+    let arg_after = |flag: &str| args.iter().position(|a| a == flag).map(|i| args.get(i + 1).and_then(|v| v.to_str()));
+    let apply_mode = match arg_after("--apply") {
+        None => None,
+        Some(v) => match v.and_then(selfclean::ApplyMode::parse) {
+            Some(mode) => Some(mode),
+            None => {
+                eprintln!("--apply needs remove or purge");
+                return selfclean::EXIT_KEEP;
+            }
+        },
+    };
+    if apply_mode.is_none() && !args.iter().any(|a| a == "--ask") {
+        eprintln!("--uninstall-cleanup needs --ask or --apply remove|purge");
+        return selfclean::EXIT_KEEP;
+    }
     // The folder is locked down first so the settings and manifests below it can be trusted; one
     // that cannot be (e.g. it is a link) is left alone. Nothing is logged: the log lives in it.
     if let Err(e) = stale_core::paths::secure_data_dir() {
         eprintln!("could not lock down the data folder, leaving it: {e}");
-        return 0;
+        return selfclean::EXIT_KEEP;
     }
     let settings = Settings::load_from(&Settings::path());
     strings::set_lang(strings::startup_lang(settings.language.as_deref()));
     let ops = QuarantineOps::live();
-    let data_dir = stale_core::paths::data_dir();
-    let out = selfclean::run(&ops, &data_dir, &selfclean::live_payload_parents(), &mut |total| {
-        if silent { None } else { ask_yes_no_cancel(&strings::uninstall_cleanup_prompt(total)) }
-    });
+    let Some(mode) = apply_mode else {
+        let action = selfclean::decide(&ops, &mut |total| {
+            if silent { None } else { ask_yes_no_cancel(&strings::uninstall_cleanup_prompt(total)) }
+        });
+        return selfclean::exit_code_for(action);
+    };
+    let out = selfclean::apply(&ops, &stale_core::paths::data_dir(), &selfclean::live_payload_parents(), mode);
     for e in &out.errors {
         eprintln!("{e}");
     }
     if out.purge_failed && !silent {
         message_box(t().uninstall_cleanup_failed, true);
     }
-    out.exit_code
+    0
 }
 
 /// `text` in a Yes/No/Cancel message box (No is the default button); `None` when it could not be shown.

@@ -59,26 +59,61 @@ Name: "{autodesktop}\Stale Uninstaller"; Filename: "{app}\StaleUninstaller.exe";
 Filename: "{app}\StaleUninstaller.exe"; Description: "{cm:LaunchProgram,Stale Uninstaller}"; Flags: nowait postinstall skipifsilent shellexec
 
 [Code]
-// Before anything is removed, Stale empties or keeps its quarantine and removes
-// %ProgramData%\Stale Uninstaller (StaleUninstaller.exe --uninstall-cleanup). Exit code 2 means
-// the user chose "Cancel": the uninstall stops. A silent uninstall passes --silent, so nobody is
-// asked and a quarantine is kept. If the exe cannot be started (e.g. it is already gone), the
-// uninstall goes on.
+// Stale's own cleanup of its quarantine and %ProgramData%\Stale Uninstaller runs in two phases,
+// because InitializeUninstall comes before the uninstaller's "Are you sure…?" confirmation:
+//  1. InitializeUninstall: StaleUninstaller.exe --uninstall-cleanup --ask only decides (and asks
+//     about a quarantine). Exit code 10 = remove the data folder, 11 = purge then remove (the user
+//     chose Yes), 12 = keep everything, 2 = cancel the uninstall. A silent uninstall adds --silent:
+//     nobody is asked and a quarantine is kept. If the exe cannot run, everything is kept.
+//  2. CurUninstallStepChanged(usUninstall), after the confirmation and before any file is removed:
+//     for 10 or 11, --apply remove|purge does the work (it re-checks the quarantine and never
+//     purges one it was not asked about).
+var
+  CleanupCode: Integer;
+
+function CleanupParams(Phase: String): String;
+begin
+  Result := '--uninstall-cleanup ' + Phase;
+  if UninstallSilent then
+    Result := Result + ' --silent';
+end;
+
 function InitializeUninstall(): Boolean;
 var
   ResultCode: Integer;
-  Params: String;
 begin
   Result := True;
-  Params := '--uninstall-cleanup';
-  if UninstallSilent then
-    Params := Params + ' --silent';
-  if Exec(ExpandConstant('{app}\StaleUninstaller.exe'), Params, '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) then
+  CleanupCode := 12;
+  if Exec(ExpandConstant('{app}\StaleUninstaller.exe'), CleanupParams('--ask'), '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) then
   begin
-    Log(Format('Stale cleanup exit code: %d', [ResultCode]));
+    Log(Format('Stale cleanup --ask exit code: %d', [ResultCode]));
     if ResultCode = 2 then
-      Result := False;
+      Result := False
+    else if (ResultCode = 10) or (ResultCode = 11) then
+      CleanupCode := ResultCode;
   end
+  else
+    Log('Could not run the Stale cleanup: ' + SysErrorMessage(ResultCode));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  Mode: String;
+begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
+  if CleanupCode = 10 then
+    Mode := 'remove'
+  else if CleanupCode = 11 then
+    Mode := 'purge'
+  else
+  begin
+    Log('Stale cleanup: keeping the quarantine and the data folder');
+    Exit;
+  end;
+  if Exec(ExpandConstant('{app}\StaleUninstaller.exe'), CleanupParams('--apply ' + Mode), '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) then
+    Log(Format('Stale cleanup --apply %s exit code: %d', [Mode, ResultCode]))
   else
     Log('Could not run the Stale cleanup: ' + SysErrorMessage(ResultCode));
 end;
