@@ -120,6 +120,27 @@ pub fn drive_letter(p: &Path) -> Option<char> {
     (letter.is_ascii_alphabetic() && chars.next() == Some(':')).then(|| letter.to_ascii_uppercase())
 }
 
+/// `p` in its long form (`C:\PROGRA~1\X` -> `C:\Program Files\X`) from `GetLongPathNameW`;
+/// `p` itself when the call fails (a missing path, an unreadable folder).
+pub fn long_path_name(p: &Path) -> PathBuf {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let input = HSTRING::from(p.as_os_str());
+    let mut buf = vec![0u16; 512];
+    for _ in 0..2 {
+        // SAFETY: `input` is NUL-terminated and `buf` is a valid, writable buffer.
+        let len = unsafe { GetLongPathNameW(&input, Some(&mut buf)) } as usize;
+        if len == 0 {
+            break;
+        }
+        if len < buf.len() {
+            return PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+        }
+        buf = vec![0u16; len];
+    }
+    p.to_path_buf()
+}
+
 /// Uppercase, backslash-separated, no trailing separator (`C:\` -> `C:`).
 pub fn norm(p: &Path) -> String {
     let s = p.to_string_lossy().replace('/', r"\").to_uppercase();
@@ -332,6 +353,16 @@ mod tests {
         // Quoted paths are taken as they are.
         assert_eq!(r(r#""C:\Gone Vendor\q.exe" /S"#), Some(PathBuf::from(r"C:\Gone Vendor\q.exe")));
         assert_eq!(r("  "), None);
+    }
+
+    #[test]
+    fn long_path_name_expands_short_names_and_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = tmp.path().join("Long Folder Name For Test");
+        std::fs::create_dir(&long).unwrap();
+        assert_eq!(norm(&long_path_name(&long)), norm(&long));
+        let missing = tmp.path().join("missing");
+        assert_eq!(long_path_name(&missing), missing);
     }
 
     #[test]

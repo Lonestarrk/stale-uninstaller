@@ -20,6 +20,9 @@ pub struct GhostSources {
     /// Execution traces the usage scan matched to no installed program.
     pub unmatched_hits: Vec<UsageHit>,
     pub drive_present: Box<dyn Fn(char) -> bool + Send + Sync>,
+    /// A path's long form (`GetLongPathNameW`), the input when it has none: live targets
+    /// written in 8.3 form are compared with the long-named folders.
+    pub long_path: Box<dyn Fn(&Path) -> PathBuf + Send + Sync>,
 }
 
 impl GhostSources {
@@ -33,7 +36,13 @@ impl GhostSources {
             let d = d.to_ascii_uppercase();
             d.is_ascii_uppercase() && present[(d as u8 - b'A') as usize]
         };
-        GhostSources { leftovers: LeftoverSources::live(), programs, unmatched_hits, drive_present: Box::new(drive_present) }
+        GhostSources {
+            leftovers: LeftoverSources::live(),
+            programs,
+            unmatched_hits,
+            drive_present: Box::new(drive_present),
+            long_path: Box::new(crate::pathutil::long_path_name),
+        }
     }
 }
 
@@ -72,7 +81,7 @@ pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
         evidence.extend(c.evidence);
         live_targets.extend(c.live_targets);
     }
-    let live = LiveRefs::from_targets(live_targets);
+    let live = LiveRefs::from_targets(live_targets.iter().map(|p| (src.long_path)(p)));
     let current_profile = fs.env("USERPROFILE").map(PathBuf::from);
     group(evidence, &installed, keep, &roots, current_profile.as_deref(), &live)
 }
@@ -89,6 +98,7 @@ mod tests {
     use crate::leftovers::reg_scan::RegScanRoots;
     use crate::model::Hive;
     use crate::registry::{key, FakeRegistry, RegValue, RegistryReader};
+    use crate::pathutil::norm;
     use crate::usage::UsageSource;
     use chrono::{TimeZone, Utc};
     use std::path::PathBuf;
@@ -115,6 +125,7 @@ mod tests {
             programs: Vec::new(),
             unmatched_hits: Vec::new(),
             drive_present: Box::new(|d| d == 'C'),
+            long_path: Box::new(Path::to_path_buf),
         }
     }
 
@@ -229,6 +240,27 @@ mod tests {
         assert!(!g.evidence.iter().any(|e| matches!(e, Evidence::DanglingRef { .. })), "{g:?}");
     }
 
+    /// A live reference written in 8.3 form still marks the long-named folder in use.
+    #[test]
+    fn short_path_live_target_marks_long_folder_in_use() {
+        let fs = base_fs()
+            .file(r"C:\Program Files\Lumina Studio\tool.exe", 13)
+            .file(r"C:\PROGRA~1\LUMINA~1\tool.exe", 13);
+        let mut reg = FakeRegistry::new();
+        service(&mut reg, "Lumina", r"C:\PROGRA~1\LUMINA~1\tool.exe", 16);
+        let mut src = sources(fs, reg);
+        src.long_path = Box::new(|p: &Path| {
+            if norm(p) == r"C:\PROGRA~1\LUMINA~1\TOOL.EXE" {
+                PathBuf::from(r"C:\Program Files\Lumina Studio\tool.exe")
+            } else {
+                p.to_path_buf()
+            }
+        });
+        let ghosts = scan_ghosts(&src);
+        let g = by_name(&ghosts, "Lumina Studio");
+        assert_eq!((g.assessment, g.reasons.clone()), (Assessment::Uncertain, vec![REASON_IN_USE.to_string()]));
+    }
+
     #[test]
     fn scan_ghosts_end_to_end_with_fakes() {
         let fs = FakeFs::new()
@@ -261,6 +293,7 @@ mod tests {
                 run_count: None,
             }],
             drive_present: Box::new(|d| d == 'C'),
+            long_path: Box::new(Path::to_path_buf),
         };
         let ghosts = scan_ghosts(&src);
         assert_eq!(ghosts.len(), 1, "{ghosts:?}");
