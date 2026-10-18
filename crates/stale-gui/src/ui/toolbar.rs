@@ -24,6 +24,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         if ui.add_enabled(!app.removal_running(), egui::Button::new(quarantine)).clicked() {
             app.show_quarantine();
         }
+        // Like the quarantine button; the view itself waits for the program scan before scanning.
+        if ui.add_enabled(!app.removal_running(), egui::Button::new(strings::GHOSTS)).clicked() {
+            app.show_ghosts();
+        }
         // One scan at a time: refreshing waits for the running scan to finish.
         if ui.add_enabled(!app.scanning, egui::Button::new(strings::REFRESH)).clicked() {
             app.refresh();

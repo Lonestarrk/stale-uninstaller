@@ -9,7 +9,7 @@ use stale_core::quarantine::{DestinationPlan, QuarantineManifest};
 use stale_core::{Hive, RegKeyPath};
 
 use super::STALE_COLOR;
-use crate::app::StaleApp;
+use crate::app::{StaleApp, View};
 use crate::leftover_sel::LeftoverGroup;
 use crate::{format, strings};
 
@@ -25,9 +25,10 @@ enum Action {
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let removing = app.removal_running();
     let mut action = None;
+    let back = back_label(app.leftovers_origin);
     ui.horizontal(|ui| {
         ui.heading(strings::LEFTOVERS_TITLE);
-        if ui.add_enabled(!removing, egui::Button::new(strings::BACK_TO_PROGRAMS)).clicked() {
+        if ui.add_enabled(!removing, egui::Button::new(back)).clicked() {
             action = Some(Action::Back);
         }
     });
@@ -36,7 +37,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         removal_confirm_window(ui, plan, &mut action);
     }
     if app.removal_done {
-        removal_summary(ui, &app.last_manifests, &mut action);
+        removal_summary(ui, &app.last_manifests, back, &mut action);
     } else if let Some(sel) = app.leftovers.as_mut() {
         let (checked, total, bytes) = sel.summary();
         egui::Panel::bottom("leftovers_footer").show(ui, |ui| {
@@ -155,7 +156,7 @@ fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bo
 }
 
 /// After the removal: per program what was moved and what failed, then the way back.
-fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], action: &mut Option<Action>) {
+fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], back: &str, action: &mut Option<Action>) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         for m in manifests {
             ui.strong(&m.program_name);
@@ -170,7 +171,7 @@ fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], action: 
             ui.add_space(6.0);
         }
         ui.separator();
-        if ui.button(strings::BACK_TO_PROGRAMS).clicked() {
+        if ui.button(back).clicked() {
             *action = Some(Action::Back);
         }
     });
@@ -215,6 +216,11 @@ pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     }
 }
 
+/// The back button's text: "Tillbaka" to the ghosts view, else "Till programlistan".
+fn back_label(origin: View) -> &'static str {
+    if origin == View::Ghosts { strings::BACK } else { strings::BACK_TO_PROGRAMS }
+}
+
 /// 0: folders and files, 1: registry, 2: everything else.
 fn section_of(kind: &LeftoverKind) -> usize {
     match kind {
@@ -237,7 +243,7 @@ fn kind_label(kind: &LeftoverKind) -> &'static str {
 }
 
 /// `HKLM\<path>`, `HKCU\<path>` or `HKU\<path>`.
-fn key_text(key: &RegKeyPath) -> String {
+pub(crate) fn key_text(key: &RegKeyPath) -> String {
     let hive = match key.hive {
         Hive::LocalMachine => "HKLM",
         Hive::CurrentUser => "HKCU",
@@ -257,12 +263,24 @@ fn item_text(kind: &LeftoverKind) -> String {
     }
 }
 
-/// The user's text for a core note key; unknown keys are shown as they are.
-fn note_text(note: &str) -> &str {
+/// The user's text for a core note or ghost reason key; unknown keys are shown as they are.
+pub(crate) fn note_text(note: &str) -> &str {
+    use stale_core::ghosts::group as g;
+    use stale_core::leftovers as l;
     match note {
         "user-folder" => strings::NOTE_USER_FOLDER,
         "shared-publisher-key" => strings::NOTE_SHARED_PUBLISHER,
-        stale_core::leftovers::NOTE_OTHER_PROGRAM => strings::NOTE_OTHER_PROGRAM,
+        l::NOTE_OTHER_PROGRAM => strings::NOTE_OTHER_PROGRAM,
+        l::NOTE_CONTAINS_USER_DATA => strings::NOTE_CONTAINS_USER_DATA,
+        l::NOTE_SUFFIX_MATCH => strings::NOTE_SUFFIX_MATCH,
+        l::NOTE_PROGID_OF_PROGRAM => strings::NOTE_PROGID_OF_PROGRAM,
+        g::REASON_APPDATA_ONLY => strings::NOTE_APPDATA_ONLY,
+        g::REASON_DATA_ONLY => strings::NOTE_DATA_ONLY,
+        g::REASON_OTHER_PROFILE => strings::NOTE_OTHER_PROFILE,
+        g::REASON_FIRST_WORD => strings::NOTE_FIRST_WORD,
+        g::REASON_WORD_OF_NAME => strings::NOTE_WORD_OF_INSTALLED,
+        g::REASON_SIBLING_OWNED => strings::NOTE_SIBLING_OWNED,
+        g::REASON_PUBLISHER_OF_INSTALLED => strings::NOTE_PUBLISHER_OF_INSTALLED,
         other => other,
     }
 }
@@ -276,7 +294,27 @@ mod tests {
         assert_eq!(note_text("user-folder"), strings::NOTE_USER_FOLDER);
         assert_eq!(note_text("shared-publisher-key"), strings::NOTE_SHARED_PUBLISHER);
         assert_eq!(note_text("used-by-other-program"), strings::NOTE_OTHER_PROGRAM);
+        for (key, text) in [
+            ("contains-user-data", strings::NOTE_CONTAINS_USER_DATA),
+            ("suffix-match", strings::NOTE_SUFFIX_MATCH),
+            ("progid-of-program", strings::NOTE_PROGID_OF_PROGRAM),
+            ("appdata-only", strings::NOTE_APPDATA_ONLY),
+            ("data-only", strings::NOTE_DATA_ONLY),
+            ("other-profile", strings::NOTE_OTHER_PROFILE),
+            ("first-word-match", strings::NOTE_FIRST_WORD),
+            ("word-of-installed-name", strings::NOTE_WORD_OF_INSTALLED),
+            ("sibling-owned", strings::NOTE_SIBLING_OWNED),
+            ("publisher-of-installed", strings::NOTE_PUBLISHER_OF_INSTALLED),
+        ] {
+            assert_eq!(note_text(key), text, "{key}");
+        }
         assert_eq!(note_text("something-new"), "something-new");
+    }
+
+    #[test]
+    fn back_button_names_its_destination() {
+        assert_eq!(back_label(View::Ghosts), strings::BACK);
+        assert_eq!(back_label(View::Programs), strings::BACK_TO_PROGRAMS);
     }
 
     #[test]

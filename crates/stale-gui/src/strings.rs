@@ -147,6 +147,16 @@ pub const WARNING_ICON: &str = "⚠";
 pub const NOTE_USER_FOLDER: &str = "troligen dina egna filer";
 pub const NOTE_SHARED_PUBLISHER: &str = "delas med andra program från samma utgivare";
 pub const NOTE_OTHER_PROGRAM: &str = "används av ett annat installerat program";
+pub const NOTE_CONTAINS_USER_DATA: &str = "innehåller troligen dina egna filer";
+pub const NOTE_SUFFIX_MATCH: &str = "namnet är programmets namn med ett tillägg";
+pub const NOTE_PROGID_OF_PROGRAM: &str = "filtyp som bär programmets namn";
+pub const NOTE_APPDATA_ONLY: &str = "bara mappar i AppData";
+pub const NOTE_DATA_ONLY: &str = "bara datamappar (ProgramData/AppData)";
+pub const NOTE_OTHER_PROFILE: &str = "ligger i en annan användares profil";
+pub const NOTE_FIRST_WORD: &str = "namnet är första ordet i ett installerat programs namn";
+pub const NOTE_WORD_OF_INSTALLED: &str = "namnet ingår i ett installerat programs namn";
+pub const NOTE_SIBLING_OWNED: &str = "utgivarmappen innehåller ett installerat program";
+pub const NOTE_PUBLISHER_OF_INSTALLED: &str = "namnet är utgivaren av ett installerat program";
 pub const MARK_SAFE: &str = "Markera säkra";
 pub const REMOVE_CHECKED: &str = "Ta bort markerade";
 pub const SERVICE_REBOOT: &str = "Tjänster tas bort helt först efter omstart";
@@ -189,6 +199,70 @@ pub const SEARCH: &str = "Sök";
 pub const SEARCHING: &str = "Söker rester…";
 pub const LEFTOVER_SCAN_THREAD_FAILED: &str = "Kunde inte starta sökningen efter rester";
 pub const LEFTOVER_SCAN_ABORTED: &str = "Sökningen efter rester avbröts oväntat – se loggfilen";
+
+// Ghost programs view
+pub const GHOSTS: &str = "Spökprogram";
+pub const GHOSTS_TITLE: &str = GHOSTS;
+pub const GHOSTS_SCANNING: &str = "Letar efter rester av avinstallerade program…";
+pub const GHOSTS_EMPTY: &str = "Inga spökprogram hittades";
+pub const GHOST_SCAN_THREAD_FAILED: &str = "Kunde inte starta sökningen efter spökprogram";
+pub const GHOST_SCAN_ABORTED: &str = "Sökningen efter spökprogram avbröts oväntat – se loggfilen";
+pub const ASSESS_PROBABLY: &str = "Troligen avinstallerat";
+pub const ASSESS_LEFTOVERS: &str = "Rester utan installation";
+pub const ASSESS_UNCERTAIN: &str = "Osäker";
+pub const KEEP: &str = "Behåll";
+pub const KEEP_SAVE_FAILED: &str = "Kunde inte spara listan över behållna program";
+pub const KEEP_TIP: &str = "Visa aldrig det här programmet, dess mappar eller nycklar igen";
+pub const SHOW_GHOST_LEFTOVERS: &str = "Visa rester för markerade";
+/// The leftovers view's back button when it was opened from the ghosts view.
+pub const BACK: &str = "Tillbaka";
+pub const REF_RUN: &str = "Autostart";
+pub const REF_APP_PATHS: &str = "App Paths";
+pub const REF_CLASSES_SERVER: &str = "COM-komponent";
+pub const REF_SHELL_COMMAND: &str = "Filtyp";
+pub const REF_SERVICE: &str = "Tjänst";
+pub const REF_TASK: &str = "Schemalagd uppgift";
+pub const REF_SHORTCUT: &str = "Genväg";
+
+/// The collapsed section of uncertain ghosts: "Osäkra (3)".
+pub fn uncertain_section(count: usize) -> String {
+    format!("Osäkra ({count})")
+}
+
+/// The header of a ghost's evidence list: "Spår (4)".
+pub fn evidence_header(count: usize) -> String {
+    format!("Spår ({count})")
+}
+
+/// The ghosts view's footer: "2 av 5 markerade · 58 MB".
+pub fn ghost_summary(checked: usize, total: usize, size: &str) -> String {
+    format!("{checked} av {total} markerade · {size}")
+}
+
+/// An orphan folder: "Mapp: C:\Program Files\Foo (38 MB)".
+pub fn evidence_folder(path: &str, size: &str) -> String {
+    format!("Mapp: {path} ({size})")
+}
+
+/// A key whose path value points at a missing file: "Nyckel: HKLM\… (pekar på saknad D:\Foo)".
+pub fn evidence_key_missing_path(key: &str, path: &str) -> String {
+    format!("Nyckel: {key} (pekar på saknad {path})")
+}
+
+/// A vendor key with nothing installed behind it: "Nyckel: HKCU\Software\Foo".
+pub fn evidence_key(key: &str) -> String {
+    format!("Nyckel: {key}")
+}
+
+/// A reference to a missing file: "Autostart: HKLM\…\Run → C:\Foooo.exe".
+pub fn evidence_ref(kind: &str, location: &str, target: &str) -> String {
+    format!("{kind}: {location} → {target}")
+}
+
+/// An execution trace: "Körd 2024-01-20 (Prefetch): C:\Foooo.exe".
+pub fn evidence_usage(date: &str, source: &str, exe: &str) -> String {
+    format!("Körd {date} ({source}): {exe}")
+}
 
 // Quarantine view
 pub const QUARANTINE: &str = "Karantän";

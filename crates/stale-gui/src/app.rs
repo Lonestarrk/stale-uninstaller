@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
+use stale_core::ghosts::Evidence;
+use stale_core::keep::KeepList;
 use stale_core::leftovers::ProgramHint;
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
@@ -16,14 +18,16 @@ use stale_core::session;
 use stale_core::settings::Settings;
 use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
 use stale_core::usage::matching::ProgramUsage;
+use stale_core::usage::UsageHit;
 use stale_core::pathutil::first_path_in_command;
 use stale_core::{Program, ProgramId, Scope};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
+use crate::ghost_sel::GhostSelection;
 use crate::leftover_sel::LeftoverSelection;
-use crate::ui::{details, filter_panel, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
-use crate::worker::{LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
+use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
+use crate::worker::{GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -50,6 +54,7 @@ pub enum View {
     Programs,
     Leftovers,
     Quarantine,
+    Ghosts,
 }
 
 /// One queued program as the summary dialog shows it.
@@ -122,6 +127,17 @@ pub struct StaleApp {
     pub removal_plan: Option<DestinationPlan>,
     /// What the last partial restore could not put back, shown under its row.
     pub last_restore_failures: Option<(QuarantineId, Vec<Failure>)>,
+    /// Execution traces the last scan matched to no installed program (for the ghost scan).
+    pub unmatched_hits: Vec<UsageHit>,
+    /// The ghosts view's rows, once a ghost scan has finished.
+    pub ghosts: Option<GhostSelection>,
+    ghost_rx: Option<Receiver<GhostEvent>>,
+    /// A ghost scan was asked for while the program scan ran; it starts once that is done.
+    ghost_scan_waiting: bool,
+    /// What the user chose to keep ("Behåll"); saved to `paths::keep_list_path()`.
+    pub keep: KeepList,
+    /// The view the leftovers view's back button returns to: `Programs` or `Ghosts`.
+    pub leftovers_origin: View,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
     /// Usage and sizes received so far, kept for hidden programs too.
@@ -133,6 +149,7 @@ impl StaleApp {
     /// Loads settings and starts the background scan.
     pub fn new(_cc: &eframe::CreationContext) -> Self {
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
+        app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
         let id = session::identity();
         if session::runs_as_other_account(&id) {
             app.warnings.push(strings::other_account_warning(id.session_user.as_deref().unwrap_or_default(), &id.token_user));
@@ -175,6 +192,12 @@ impl StaleApp {
             confirm_purge_one: None,
             removal_plan: None,
             last_restore_failures: None,
+            unmatched_hits: Vec::new(),
+            ghosts: None,
+            ghost_rx: None,
+            ghost_scan_waiting: false,
+            keep: KeepList::default(),
+            leftovers_origin: View::Programs,
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
@@ -194,6 +217,7 @@ impl StaleApp {
         self.programs.clear();
         self.usage.clear();
         self.sizes.clear();
+        self.unmatched_hits.clear();
         self.warnings.clear();
     }
 
@@ -212,7 +236,7 @@ impl StaleApp {
                 }
                 self.usage.extend(usage);
             }
-            ScanEvent::UnmatchedHits(_) => {}
+            ScanEvent::UnmatchedHits(hits) => self.unmatched_hits = hits,
             ScanEvent::Sizes(sizes) => {
                 for row in &mut self.rows {
                     if let Some(&s) = sizes.get(&row.program.id) {
@@ -397,18 +421,24 @@ impl StaleApp {
         self.removal_done = false;
         self.last_manifests.clear();
         self.view = View::Leftovers;
+        self.leftovers_origin = View::Programs;
     }
 
-    /// Back to the program list; a finished removal's results are dropped on the way.
+    /// Back to where the leftovers came from (the program list or the ghosts view); a finished
+    /// removal's results are dropped on the way, and after one the ghosts are scanned again.
     pub fn leave_leftovers(&mut self) {
-        self.view = View::Programs;
+        self.view = self.leftovers_origin;
         self.removal_plan = None;
         if self.removal_done {
             self.leftovers = None;
             self.removal_done = false;
             self.last_manifests.clear();
-            // Its reports name what was just quarantined: "Visa rester" must not offer them again.
-            if !self.queue_running() {
+            if self.leftovers_origin == View::Ghosts {
+                // The ghosts just quarantined must not be offered again.
+                self.ghosts = None;
+                self.refresh_ghosts();
+            } else if !self.queue_running() {
+                // Its reports name what was just quarantined: "Visa rester" must not offer them again.
                 self.close_flow();
             }
         }
@@ -606,6 +636,94 @@ impl StaleApp {
         }
     }
 
+    /// "Behåll": keeps ghost `key`'s name, folders and keys, saves the keep list and drops the row.
+    pub fn keep_ghost(&mut self, key: &str) {
+        self.keep_ghost_at(key, &stale_core::paths::keep_list_path());
+    }
+
+    fn keep_ghost_at(&mut self, key: &str, path: &Path) {
+        let Some(sel) = self.ghosts.as_mut() else { return };
+        let Some(ghost) = sel.ghosts.iter().find(|g| g.key == key) else { return };
+        self.keep.keep_name(ghost.name.clone());
+        for e in &ghost.evidence {
+            match e {
+                Evidence::Folder { path, .. } => self.keep.keep_path(path.clone()),
+                Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => self.keep.keep_key(key.clone()),
+                Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } => {}
+            }
+        }
+        sel.remove_by_key(key);
+        if let Err(e) = self.keep.save_to(path) {
+            log::warn!("could not save the keep list to {}: {e}", path.display());
+            self.warnings.push(format!("{}: {e}", strings::KEEP_SAVE_FAILED));
+        }
+    }
+
+    /// "Visa rester för markerade": the checked ghosts' leftovers in the leftovers view.
+    pub fn open_leftovers_from_ghosts(&mut self) {
+        let Some(sel) = &self.ghosts else { return };
+        let reports = sel.checked_reports();
+        if reports.is_empty() {
+            return;
+        }
+        self.show_leftovers(LeftoverSelection::from_reports(&reports));
+        self.leftovers_origin = View::Ghosts;
+    }
+
+    /// True while a ghost scan runs.
+    pub fn ghost_scan_running(&self) -> bool {
+        self.ghost_rx.is_some()
+    }
+
+    /// Switches to the ghosts view and starts a ghost scan; a finished removal is closed first.
+    pub fn show_ghosts(&mut self) {
+        if self.view == View::Leftovers {
+            self.leave_leftovers();
+        }
+        self.view = View::Ghosts;
+        self.refresh_ghosts();
+    }
+
+    /// Starts a ghost scan over the installed programs, unless one runs or the program scan has
+    /// not finished (without the full list every installed program would look like a ghost).
+    /// While the program scan runs, the ghost scan starts once it is done.
+    pub fn refresh_ghosts(&mut self) {
+        if self.ghost_scan_running() {
+            return;
+        }
+        if self.scanning {
+            self.ghost_scan_waiting = true;
+            return;
+        }
+        self.ghost_scan_waiting = false;
+        self.ghost_rx = Some(worker::spawn_ghost_scan(self.programs.clone(), self.unmatched_hits.clone()));
+    }
+
+    /// True while a ghost scan runs or waits for the program scan.
+    pub fn ghost_scan_busy(&self) -> bool {
+        self.ghost_scan_running() || self.ghost_scan_waiting
+    }
+
+    /// Shows the ghost scan's result once it is done.
+    fn drain_ghost_scan(&mut self) {
+        let Some(rx) = self.ghost_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(GhostEvent::Done(ghosts)) => {
+                log::info!("ghost scan found {} ghosts", ghosts.len());
+                self.ghosts = Some(GhostSelection::new(ghosts));
+            }
+            Ok(GhostEvent::Failed(msg)) => {
+                log::error!("{msg}");
+                self.warnings.push(msg);
+            }
+            Err(TryRecvError::Empty) => self.ghost_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                log::error!("ghost scan worker disconnected before Done");
+                self.warnings.push(strings::GHOST_SCAN_ABORTED.to_string());
+            }
+        }
+    }
+
     /// Applies every event waiting on the channel.
     fn drain_events(&mut self) {
         let Some(rx) = self.rx.take() else { return };
@@ -638,7 +756,12 @@ impl eframe::App for StaleApp {
         self.drain_quarantine_events();
         self.drain_leftover_scan();
         self.drain_quarantine_admin();
+        self.drain_ghost_scan();
+        if self.ghost_scan_waiting && !self.scanning {
+            self.refresh_ghosts();
+        }
         if self.scanning
+            || self.ghost_scan_running()
             || self.queue_running()
             || self.removal_running()
             || self.leftover_search_running()
@@ -680,6 +803,7 @@ impl eframe::App for StaleApp {
                 View::Programs => {}
                 View::Leftovers => return leftovers_view::show(ui, self),
                 View::Quarantine => return quarantine_view::show(ui, self),
+                View::Ghosts => return ghosts_view::show(ui, self, now),
             }
             if self.rows.is_empty() {
                 if !self.scanning {
@@ -1013,6 +1137,79 @@ mod tests {
         app.set_quarantine_days_at(7, &path);
         assert_eq!(app.settings.quarantine_days, 7);
         assert_eq!(Settings::load_from(&path).quarantine_days, 7);
+    }
+
+    #[test]
+    fn unmatched_hits_are_stored() {
+        use stale_core::usage::UsageSource;
+        let hit = UsageHit {
+            exe_path: r"C:\Gone\gone.exe".into(),
+            last_run: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
+            source: UsageSource::Prefetch,
+            run_count: Some(3),
+        };
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_event(ScanEvent::UnmatchedHits(vec![hit.clone()]));
+        assert_eq!(app.unmatched_hits, vec![hit]);
+        app.clear_scan_data();
+        assert!(app.unmatched_hits.is_empty(), "a new scan starts without the old hits");
+    }
+
+    #[test]
+    fn keep_ghost_persists_name_and_paths_and_removes_row() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::{Assessment, RefKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        let mut alpha = ghost("Alpha", Assessment::ProbablyUninstalled, 100);
+        let missing = RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Alpha".into() };
+        alpha.evidence.push(Evidence::RegKeyMissingPath { key: missing.clone(), value_name: "Path".into(), path: r"D:\Alpha".into() });
+        alpha.evidence.push(Evidence::DanglingRef {
+            kind: RefKind::Run,
+            location: r"LocalMachine\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            target: r"C:\Program Files\Alpha.exe".into(),
+            value_name: Some("Alpha".into()),
+        });
+        let mut app = StaleApp::empty(Settings::default());
+        app.ghosts = Some(GhostSelection::new(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));
+
+        app.keep_ghost_at("alpha", &path);
+        let saved = KeepList::load_from(&path);
+        assert_eq!(saved, app.keep);
+        assert_eq!(saved.names, vec!["Alpha".to_string()]);
+        assert_eq!(saved.paths, vec![PathBuf::from(r"C:\Program Files\Alpha")]);
+        assert_eq!(saved.keys, vec![RegKeyPath { hive: Hive::LocalMachine, path: r"SOFTWARE\Alpha".into() }, missing]);
+        let names: Vec<&str> = app.ghosts.as_ref().unwrap().ghosts.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"]);
+
+        app.keep_ghost_at("missing", &path);
+        assert_eq!(KeepList::load_from(&path), saved, "an unknown key changes nothing");
+    }
+
+    #[test]
+    fn open_leftovers_from_ghosts_sets_origin_and_groups() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::Assessment;
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Ghosts;
+        app.ghosts = Some(GhostSelection::new(vec![
+            ghost("Alpha", Assessment::ProbablyUninstalled, 100),
+            ghost("Beta", Assessment::Uncertain, 50),
+            ghost("Gamma", Assessment::LeftoversOnly, 7),
+        ]));
+        app.open_leftovers_from_ghosts();
+        assert_eq!((app.view, app.leftovers_origin), (View::Leftovers, View::Ghosts));
+        let sel = app.leftovers.as_ref().expect("selection built");
+        let groups: Vec<(&str, usize)> = sel.groups.iter().map(|g| (g.program_name.as_str(), g.items.len())).collect();
+        assert_eq!(groups, vec![("Alpha", 2), ("Gamma", 2)]);
+
+        app.leave_leftovers();
+        assert_eq!(app.view, View::Ghosts, "back returns to the ghosts view");
+        assert!(app.ghost_rx.is_none(), "no rescan without a removal");
+
+        app.flow = Some(FlowState::new(&[]));
+        app.open_leftovers_from_flow();
+        assert_eq!(app.leftovers_origin, View::Programs, "the uninstall flow's leftovers return to the list");
     }
 
     #[test]

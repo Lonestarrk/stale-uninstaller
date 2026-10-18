@@ -6,6 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use chrono::Utc;
+use stale_core::ghosts::{scan_ghosts, Ghost, GhostSources};
 use stale_core::leftovers::{scan_leftovers, Leftover, LeftoverReport, LeftoverSources, ProgramHint};
 use stale_core::quarantine::{
     list_trusted_manifests, purge, quarantine, restore, QuarantineId, QuarantineManifest, QuarantineOps,
@@ -14,6 +15,7 @@ use stale_core::quarantine::{
 use stale_core::model::{Program, ProgramId};
 use stale_core::scan::{run_scan, ScanEvent, ScanSources};
 use stale_core::uninstall::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
+use stale_core::usage::UsageHit;
 use windows::Win32::Foundation::RPC_E_TOO_LATE;
 use windows::Win32::System::Com::{
     CoInitializeEx, CoInitializeSecurity, CoUninitialize, COINIT_APARTMENTTHREADED, EOAC_NONE,
@@ -232,6 +234,35 @@ pub fn spawn_leftover_scan(hint: ProgramHint, programs: Vec<Program>) -> Receive
     if let Err(e) = spawned {
         log::error!("could not spawn leftover scan thread: {e}");
         let _ = fallback.send(LeftoverScanEvent::Failed(format!("{}: {e}", strings::LEFTOVER_SCAN_THREAD_FAILED)));
+    }
+    rx
+}
+
+/// Result of a ghost program scan.
+#[derive(Clone, Debug)]
+pub enum GhostEvent {
+    Done(Vec<Ghost>),
+    Failed(String),
+}
+
+/// Looks for ghost programs on the "stale-ghosts" thread; `programs` are every installed program
+/// (hidden ones included) and `unmatched` the execution traces the usage scan matched to none.
+pub fn spawn_ghost_scan(programs: Vec<Program>, unmatched: Vec<UsageHit>) -> Receiver<GhostEvent> {
+    let (tx, rx) = channel();
+    let fallback = tx.clone();
+    let spawned = std::thread::Builder::new().name("stale-ghosts".into()).spawn(move || {
+        // Built here, not on the UI thread: it resolves every Start Menu and desktop shortcut.
+        let run = catch_unwind(AssertUnwindSafe(|| scan_ghosts(&GhostSources::live(programs, unmatched))));
+        let ev = match run {
+            Ok(ghosts) => GhostEvent::Done(ghosts),
+            // The panic hook has logged the details.
+            Err(_) => GhostEvent::Failed(strings::GHOST_SCAN_ABORTED.to_string()),
+        };
+        let _ = tx.send(ev);
+    });
+    if let Err(e) = spawned {
+        log::error!("could not spawn ghost scan thread: {e}");
+        let _ = fallback.send(GhostEvent::Failed(format!("{}: {e}", strings::GHOST_SCAN_THREAD_FAILED)));
     }
     rx
 }
