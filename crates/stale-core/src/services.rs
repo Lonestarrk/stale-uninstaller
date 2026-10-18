@@ -32,13 +32,13 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// `ImagePath` -> exe path, judged against the real disk ([`normalize_image_path_with`]).
 pub fn normalize_image_path(raw: &str) -> Option<PathBuf> {
-    normalize_image_path_with(raw, &|p: &Path| p.exists())
+    normalize_image_path_with(raw, &|p: &Path| p.is_file())
 }
 
 /// `ImagePath` -> exe path. Handles `%VAR%`, NT `\??\` paths, `\SystemRoot\…`, paths relative
 /// to the Windows folder (`System32\drivers\x.sys`) and unquoted paths with spaces, which are
-/// resolved by the CreateProcess rule against `exists` ([`resolve_unquoted_path`]).
-pub fn normalize_image_path_with(raw: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+/// resolved by the CreateProcess rule against `is_file` ([`resolve_unquoted_path`]).
+pub fn normalize_image_path_with(raw: &str, is_file: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
     let expanded = expand_env(raw.trim());
     let mut cmd = expanded.as_str();
@@ -56,7 +56,7 @@ pub fn normalize_image_path_with(raw: &str, exists: &dyn Fn(&Path) -> bool) -> O
             p.to_path_buf()
         }
     };
-    let exe = resolve_unquoted_path(&cmd, &|p: &Path| exists(&absolute(p)))?;
+    let exe = resolve_unquoted_path(&cmd, &|p: &Path| is_file(&absolute(p)))?;
     Some(absolute(&exe))
 }
 
@@ -110,6 +110,14 @@ mod tests {
         let rel = PathBuf::from(&sr).join(r"System32\drivers\My Drv\d.sys");
         let exists_rel = |p: &Path| p == rel.as_path();
         assert_eq!(normalize_image_path_with(r"System32\drivers\My Drv\d.sys --x", &exists_rel), Some(rel.clone()));
+    }
+
+    #[test]
+    fn directory_prefix_is_not_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("Vendor")).unwrap();
+        let raw = format!(r"{}\Vendor Suite\gone.sys", tmp.path().display());
+        assert_eq!(normalize_image_path(&raw), Some(PathBuf::from(&raw)));
     }
 
     #[test]

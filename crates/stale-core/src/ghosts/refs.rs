@@ -97,7 +97,7 @@ pub fn service_collect(
             }
         }
         // Unquoted paths with spaces are resolved against the disk, never cut at the first space.
-        let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p))) else {
+        let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p) && !fs.is_dir(p))) else {
             continue;
         };
         if g.is_live(&target) {
@@ -306,6 +306,18 @@ mod tests {
             live,
             vec![PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\agent.bin"), PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\x.sys")]
         );
+    }
+
+    #[test]
+    fn directory_prefix_is_not_accepted() {
+        // `C:\ProgramData\Vendor` is a folder: never the image of `Vendor Suite\gone.exe`.
+        let mut reg = FakeRegistry::new();
+        svc(&mut reg, "VendorSuite", r"C:\ProgramData\Vendor Suite\gone.exe -k run");
+        let fs = FakeFs::new().dir(r"C:\ProgramData\Vendor", 0);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        assert_eq!(got.live_targets, Vec::<PathBuf>::new());
+        assert_eq!(got.evidence, vec![dang(RefKind::Service, "VendorSuite", r"C:\ProgramData\Vendor Suite\gone.exe")]);
     }
 
     #[test]

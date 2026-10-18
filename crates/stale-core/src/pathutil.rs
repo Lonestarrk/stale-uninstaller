@@ -80,9 +80,10 @@ pub fn first_path_in_command(cmd: &str) -> Option<PathBuf> {
 
 /// The executable of a command line by the CreateProcess rule, for paths that may hold unquoted
 /// spaces (`\??\C:\ProgramData\Vendor\Some Dir\x.sys`): a quoted path is taken as is; otherwise
-/// the longest space-separated prefix that `exists`, else the whole string when it ends in a file
-/// extension, else [`first_path_in_command`]. Environment variables are expanded.
-pub fn resolve_unquoted_path(cmd: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+/// the longest space-separated prefix that `is_file` (an existing file, never a folder), else the
+/// whole string when it ends in a file extension, else [`first_path_in_command`]. Environment
+/// variables are expanded.
+pub fn resolve_unquoted_path(cmd: &str, is_file: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     let cmd = expand_env(cmd.trim());
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -94,7 +95,7 @@ pub fn resolve_unquoted_path(cmd: &str, exists: &dyn Fn(&Path) -> bool) -> Optio
     let ends = cmd.match_indices(' ').map(|(i, _)| i).chain(std::iter::once(cmd.len())).collect::<Vec<_>>();
     for &end in ends.iter().rev() {
         let candidate = cmd[..end].trim_end();
-        if !candidate.is_empty() && exists(Path::new(candidate)) {
+        if !candidate.is_empty() && is_file(Path::new(candidate)) {
             return Some(PathBuf::from(candidate));
         }
     }
