@@ -147,31 +147,31 @@ pub fn norm(p: &Path) -> String {
     s.trim_end_matches('\\').to_string()
 }
 
-/// Folders (normalized) that many programs share; resolved from the environment on each call.
+/// Folders (normalized) that many programs share. Windows and ProgramData come from the system
+/// ([`crate::paths`]), never from `%SystemRoot%`/`%ProgramData%`; the per-user and Program Files
+/// folders from the environment, on each call.
 fn shared_folders() -> Vec<String> {
-    const VARS: [&str; 10] = [
+    const VARS: [&str; 6] = [
         "%ProgramFiles%",
         "%ProgramFiles(x86)%",
-        "%ProgramData%",
         "%LOCALAPPDATA%",
         r"%LOCALAPPDATA%\Programs",
         "%APPDATA%",
-        "%SystemRoot%",
-        r"%SystemRoot%\System32",
-        r"%SystemRoot%\SysWOW64",
         "%USERPROFILE%",
     ];
+    let windows = crate::paths::windows_dir();
+    let system = [windows.clone(), windows.join("System32"), windows.join("SysWOW64"), crate::paths::program_data_dir()];
     VARS.iter()
         .map(|v| expand_env(v))
         .filter(|s| !s.contains('%'))
         .map(|s| norm(Path::new(&s)))
+        .chain(system.iter().map(|p| norm(p)))
         .collect()
 }
 
-/// `%SystemDrive%\Users`, normalized.
+/// The Users folder ([`crate::paths::user_profiles_root`]), normalized.
 fn users_root() -> Option<String> {
-    let drive = std::env::var("SystemDrive").ok()?;
-    Some(norm(Path::new(&format!(r"{drive}\Users"))))
+    Some(norm(&crate::paths::user_profiles_root())).filter(|n| !n.is_empty())
 }
 
 /// `\Program Files`-style folders (normalized, without drive) that are shared on any drive.
@@ -266,6 +266,34 @@ mod tests {
         assert!(!is_shared_root(Path::new(r"D:\Program Files\Foo")));
         assert!(!is_shared_root(Path::new(r"D:\Program Files\Common Files\Foo")));
         assert!(!is_shared_root(&windows.join("System32").join("Foo")));
+    }
+
+    #[test]
+    fn shared_folders_ignore_env_override() {
+        let _env = crate::env_lock();
+        let windows = crate::paths::windows_dir();
+        let program_data = crate::paths::program_data_dir();
+        let users = crate::paths::user_profiles_root();
+        let saved: Vec<_> = ["SystemRoot", "ProgramData", "SystemDrive"].map(|v| (v, std::env::var_os(v))).into();
+        std::env::set_var("SystemRoot", r"Q:\EvilWin");
+        std::env::set_var("ProgramData", r"Q:\EvilData");
+        std::env::set_var("SystemDrive", "Q:");
+        let got = (
+            is_shared_root(&windows),
+            is_shared_root(&windows.join("System32")),
+            is_shared_root(&program_data),
+            is_shared_root(&users.join("SomeoneElse")),
+            is_shared_root(Path::new(r"Q:\EvilWin\System32")),
+            is_shared_root(Path::new(r"Q:\EvilData")),
+            is_shared_root(Path::new(r"Q:\Users\X")),
+        );
+        for (var, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        assert_eq!(got, (true, true, true, true, false, false, false));
     }
 
     #[test]
