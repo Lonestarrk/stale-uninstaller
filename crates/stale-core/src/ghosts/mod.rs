@@ -221,20 +221,26 @@ pub struct Collected {
     pub live_targets: Vec<PathBuf>,
 }
 
-/// `Hive\path` (`LocalMachine\SOFTWARE\Foo`), the form [`Evidence::DanglingRef`] uses for a
-/// registry location.
+/// `HIVE\path` (`HKLM\SOFTWARE\Foo`, `HKCU\…`, `HKU\…`), the form [`Evidence::DanglingRef`]
+/// uses for a registry location.
 pub fn format_location(k: &RegKeyPath) -> String {
-    format!(r"{:?}\{}", k.hive, k.path)
+    let hive = match k.hive {
+        Hive::LocalMachine => "HKLM",
+        Hive::CurrentUser => "HKCU",
+        Hive::Users => "HKU",
+    };
+    format!(r"{hive}\{}", k.path)
 }
 
 /// The key a registry [`Evidence::DanglingRef`] location names; `None` for any other location
-/// (a `.lnk` path, a service or task name).
+/// (a `.lnk` path, a service or task name). The form written before (`LocalMachine\…`,
+/// `CurrentUser\…`, `Users\…`) is still read.
 pub fn parse_location(s: &str) -> Option<RegKeyPath> {
     let (hive, path) = s.split_once('\\')?;
     let hive = match hive {
-        "LocalMachine" => Hive::LocalMachine,
-        "CurrentUser" => Hive::CurrentUser,
-        "Users" => Hive::Users,
+        "HKLM" | "LocalMachine" => Hive::LocalMachine,
+        "HKCU" | "CurrentUser" => Hive::CurrentUser,
+        "HKU" | "Users" => Hive::Users,
         _ => return None,
     };
     (!path.is_empty()).then(|| RegKeyPath { hive, path: path.to_string() })
@@ -393,6 +399,38 @@ mod tests {
         assert!(in_launcher_library(Path::new(r"C:\Program Files\Epic Games\Fortnite")));
         assert!(in_launcher_library(Path::new(r"D:\SteamLibrary\steamapps\common\X")));
         assert!(!in_launcher_library(Path::new(r"C:\Program Files\Old Tool")));
+    }
+
+    #[test]
+    fn location_roundtrip_and_legacy_form() {
+        let keys = [
+            RegKeyPath { hive: Hive::LocalMachine, path: r"SOFTWARE\Classes\CLSID\{1}".into() },
+            RegKeyPath { hive: Hive::CurrentUser, path: r"Software\Microsoft\Windows\CurrentVersion\Run".into() },
+            RegKeyPath { hive: Hive::Users, path: r"S-1-5-21-9\Software\Foo".into() },
+        ];
+        let formatted: Vec<String> = keys.iter().map(format_location).collect();
+        assert_eq!(
+            formatted,
+            vec![
+                r"HKLM\SOFTWARE\Classes\CLSID\{1}",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                r"HKU\S-1-5-21-9\Software\Foo",
+            ]
+        );
+        for (k, s) in keys.iter().zip(&formatted) {
+            assert_eq!(parse_location(s).as_ref(), Some(k), "{s}");
+        }
+        // The form written before (the hive's Debug name) still parses.
+        for (legacy, k) in [
+            (r"LocalMachine\SOFTWARE\Classes\CLSID\{1}", &keys[0]),
+            (r"CurrentUser\Software\Microsoft\Windows\CurrentVersion\Run", &keys[1]),
+            (r"Users\S-1-5-21-9\Software\Foo", &keys[2]),
+        ] {
+            assert_eq!(parse_location(legacy).as_ref(), Some(k), "{legacy}");
+        }
+        assert_eq!(parse_location(r"Vendor\Updater"), None);
+        assert_eq!(parse_location("HKLM"), None);
+        assert_eq!(parse_location(r"HKLM\"), None);
     }
 
     #[test]

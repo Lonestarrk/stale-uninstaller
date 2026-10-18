@@ -435,7 +435,7 @@ mod tests {
         let ev = scan(&reg, &fs, &[program("Some Suite", Some(r"D:\Suite"))], &KeepList::default());
         assert_eq!(
             ev,
-            vec![dangling(RefKind::Run, &format!(r"CurrentUser\{RUN}"), r"C:\Gone Tray\tray.exe", Some("Gone"))]
+            vec![dangling(RefKind::Run, &format!(r"HKCU\{RUN}"), r"C:\Gone Tray\tray.exe", Some("Gone"))]
         );
     }
 
@@ -452,10 +452,10 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                dangling(RefKind::AppPaths, &format!(r"LocalMachine\{APP_PATHS}\gone.exe"), r"C:\Gone\gone.exe", None),
+                dangling(RefKind::AppPaths, &format!(r"HKLM\{APP_PATHS}\gone.exe"), r"C:\Gone\gone.exe", None),
                 dangling(
                     RefKind::ShellCommand,
-                    r"LocalMachine\SOFTWARE\Classes\goneproto",
+                    r"HKLM\SOFTWARE\Classes\goneproto",
                     r"C:\Program Files\Gone\gone.exe",
                     None
                 ),
@@ -494,8 +494,8 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                dangling(RefKind::ClassesServer, &format!(r"LocalMachine\{CLSID}\{{A}}"), r"C:\Program Files\Gone Ext\ext.dll", None),
-                dangling(RefKind::ClassesServer, &format!(r"LocalMachine\{CLSID}\{{D}}"), r"D:\Gone\server.exe", None),
+                dangling(RefKind::ClassesServer, &format!(r"HKLM\{CLSID}\{{A}}"), r"C:\Program Files\Gone Ext\ext.dll", None),
+                dangling(RefKind::ClassesServer, &format!(r"HKLM\{CLSID}\{{D}}"), r"D:\Gone\server.exe", None),
             ]
         );
         // One pass: only the root listings and the server defaults are read.
@@ -535,7 +535,7 @@ mod tests {
         reg.set(hklm(&format!(r"{CLSID}\{{Dead}}\LocalServer32")), "", s(r"C:\Apps\Gone\other.exe"));
         let fs = FakeFs::new().file(r"C:\Apps\Live\ext.dll", 1);
         let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
-        let location = format!(r"LocalMachine\{CLSID}\{{Dead}}");
+        let location = format!(r"HKLM\{CLSID}\{{Dead}}");
         assert_eq!(got.evidence, vec![dangling(RefKind::ClassesServer, &location, r"C:\Apps\Gone\other.exe", None)]);
         assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Apps\Live\ext.dll")]);
     }
@@ -598,7 +598,7 @@ mod tests {
         let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![run.clone()], app_paths: vec![] };
         let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
         let x86 = std::env::var("ProgramFiles(x86)").unwrap();
-        let location = format!(r"LocalMachine\{}", run.path);
+        let location = format!(r"HKLM\{}", run.path);
         assert_eq!(
             ev,
             vec![
@@ -616,7 +616,7 @@ mod tests {
         reg.set(theirs.clone(), "Fixed", RegValue::ExpandStr(r"C:\Gone Fixed\f.exe".into()));
         let roots = RegScanRoots { software: vec![], classes: vec![], run: vec![theirs.clone()], app_paths: vec![] };
         let ev = registry_evidence(&reg, &FakeFs::new(), &roots, &InstalledIndex::default(), &KeepList::default(), &all_drives);
-        assert_eq!(ev, vec![dangling(RefKind::Run, &format!(r"Users\{}", theirs.path), r"C:\Gone Fixed\f.exe", Some("Fixed"))]);
+        assert_eq!(ev, vec![dangling(RefKind::Run, &format!(r"HKU\{}", theirs.path), r"C:\Gone Fixed\f.exe", Some("Fixed"))]);
     }
 
     #[test]
