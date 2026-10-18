@@ -69,14 +69,20 @@ fn rank(c: Confidence) -> u8 {
 }
 
 /// Runs every scanner, merges duplicates (higher confidence wins, first on a tie) and sorts
-/// High, Medium, Low, then folders/files, registry, shortcuts/services/tasks.
+/// High, Medium, Low, then folders/files, registry, shortcuts/services/tasks. Shortcuts were
+/// resolved when `src` was built, so only those whose `.lnk` still exists are kept (an
+/// uninstaller may have removed them since).
 pub fn scan_leftovers(src: &LeftoverSources, hint: &ProgramHint) -> LeftoverReport {
     let all = scan_folders(&*src.fs, &src.fs_roots, hint)
         .into_iter()
         .chain(scan_registry(&*src.reg, &src.reg_roots, hint))
         .chain(scan_services(&*src.reg, hint))
         .chain(scan_tasks(&*src.fs, &src.tasks_root, hint))
-        .chain(scan_shortcuts(&src.start_menu_targets, &src.desktop_targets, hint));
+        .chain(
+            scan_shortcuts(&src.start_menu_targets, &src.desktop_targets, hint)
+                .into_iter()
+                .filter(|l| matches!(&l.kind, LeftoverKind::Shortcut { lnk, .. } if src.fs.exists(lnk))),
+        );
 
     let mut items: Vec<Leftover> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -142,7 +148,8 @@ mod tests {
         let fs = FakeFs::new()
             .dir(r"C:\Program Files\Unity Hub", 10)
             .dir(r"C:\Users\A\AppData\Roaming\UnityHub", 5)
-            .dir(r"C:\Users\A\Documents\Unity Hub", 1);
+            .dir(r"C:\Users\A\Documents\Unity Hub", 1)
+            .file(r"C:\Menu\Unity Hub.lnk", 1);
         sources(fs, registry_with_vendor_key(), vec![lnk(r"C:\Program Files\Unity Hub\Unity Hub.exe", r"C:\Menu\Unity Hub.lnk")])
     }
 
@@ -202,6 +209,22 @@ mod tests {
                 (r"C:\Users\A\AppData\Roaming\UnityHub".to_string(), Confidence::Medium),
             ]
         );
+    }
+
+    #[test]
+    fn deleted_shortcut_is_not_listed() {
+        let fs = FakeFs::new().dir(r"C:\Program Files\Unity Hub", 10).file(r"C:\Menu\Kept.lnk", 1);
+        let target = r"C:\Program Files\Unity Hub\Unity Hub.exe";
+        let src = sources(fs, FakeRegistry::new(), vec![lnk(target, r"C:\Menu\Kept.lnk"), lnk(target, r"C:\Menu\Deleted.lnk")]);
+        let shortcuts: Vec<PathBuf> = scan_leftovers(&src, &hint())
+            .items
+            .into_iter()
+            .filter_map(|l| match l.kind {
+                LeftoverKind::Shortcut { lnk, .. } => Some(lnk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shortcuts, vec![PathBuf::from(r"C:\Menu\Kept.lnk")]);
     }
 
     #[test]
