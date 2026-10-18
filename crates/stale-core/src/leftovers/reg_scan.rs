@@ -7,7 +7,7 @@ use super::names::normalize_name;
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_PROGID_OF_PROGRAM};
 use crate::fsys::FsReader;
 use crate::model::{Hive, RegKeyPath};
-use crate::pathutil::{drive_letter, exe_under, expand_env, expand_env_wow64, first_path_in_command, norm, wow64_vars};
+use crate::pathutil::{drive_letter, exe_under, expand_env, expand_env_wow64, first_path_in_command, wow64_vars};
 use crate::programs::other_user_sids;
 use crate::registry::{key, RegValue, RegistryReader};
 use std::collections::HashSet;
@@ -342,18 +342,33 @@ fn run_values(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, foun
     }
 }
 
-/// `norm()`ed exes the `Run`/`RunOnce` values (HKLM, its WOW6432Node, HKCU) start at logon.
-/// Unreadable keys contribute nothing.
+/// `norm()`ed exes the `Run`/`RunOnce` values (HKLM, its WOW6432Node, HKCU) start at logon,
+/// with the target a launcher names in its arguments (Squirrel's `Update.exe --processStart
+/// App.exe`, see [`autostart_targets`](crate::usage::matching::autostart_targets)). Unreadable
+/// keys contribute nothing.
 pub fn run_value_exes(reg: &dyn RegistryReader) -> HashSet<String> {
     let roots = RegScanRoots::standard(reg).run;
     roots
         .iter()
         .filter_map(|root| reg.values(root).ok().map(|values| (root, values)))
-        .flat_map(|(root, values)| {
-            values.into_iter().filter_map(move |(_, v)| string_value(&v, root).as_deref().and_then(first_path_in_command))
+        .flat_map(|(root, values)| values.into_iter().filter_map(move |(_, v)| string_value(&v, root)))
+        .flat_map(|cmd| {
+            let exe = first_path_in_command(&cmd);
+            exe.map(|exe| crate::usage::matching::autostart_targets(&exe, command_arguments(&cmd))).unwrap_or_default()
         })
-        .map(|p| norm(&p))
         .collect()
+}
+
+/// What follows the executable in a command line: after the closing quote of a quoted path,
+/// else after the first `.exe`, else after the first space.
+fn command_arguments(cmd: &str) -> &str {
+    let cmd = cmd.trim();
+    let end = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.find('"').map(|i| i + 2)
+    } else {
+        cmd.to_ascii_lowercase().find(".exe").map(|i| i + 4).or_else(|| cmd.find(' '))
+    };
+    end.and_then(|i| cmd.get(i..)).unwrap_or_default().trim()
 }
 
 /// (e) `App Paths` entries whose default value is the program's exe.
@@ -370,6 +385,7 @@ fn app_path_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pathutil::norm;
     use crate::leftovers::{Confidence, LeftoverKind};
     use crate::model::Hive;
     use crate::fsys::FakeFs;

@@ -296,6 +296,18 @@ pub fn arg_exe_names(arguments: &str) -> Vec<String> {
         .collect()
 }
 
+/// The [`norm`]ed exes an autostart entry (a `Run` value or a Startup shortcut) starts: `exe`
+/// itself and, for a name-excluded launcher such as Squirrel's `Update.exe --processStart
+/// Discord.exe`, each exe named in `arguments` ([`arg_exe_names`]) next to it. The real exe sits
+/// in an `app-<version>` folder; matching compares through [`squirrel_neutral`].
+pub fn autostart_targets(exe: &Path, arguments: &str) -> Vec<String> {
+    let mut out = vec![norm(exe)];
+    if let (true, Some(dir)) = (is_name_excluded(exe), exe.parent()) {
+        out.extend(arg_exe_names(arguments).iter().map(|name| norm(&dir.join(name))));
+    }
+    out
+}
+
 /// `EAAntiCheat.Installer.exe`, `GameSetup.exe`: never the program itself, but running one is
 /// not excluded from usage either (a setup can be the program, e.g. Visual Studio Installer's).
 fn is_installer(exe: &Path) -> bool {
@@ -409,11 +421,16 @@ impl<'a> Candidate<'a> {
         used.or(self.mains.first()).cloned()
     }
 
-    fn is_main(&self, exe: &Path) -> bool {
-        let neutral = match &self.install {
+    /// `exe` [`norm`]ed, its Squirrel `app-<version>` folder removed ([`squirrel_neutral`]).
+    fn neutral(&self, exe: &Path) -> String {
+        match &self.install {
             Some(install) => squirrel_neutral(&norm(exe), install),
             None => norm(exe),
-        };
+        }
+    }
+
+    fn is_main(&self, exe: &Path) -> bool {
+        let neutral = self.neutral(exe);
         self.main.contains(&neutral) || (self.icon_name.is_some() && file_name_upper(exe) == self.icon_name)
     }
 
@@ -464,6 +481,7 @@ fn group_hits(
     hits: Vec<UsageHit>,
     is_main: impl Fn(&Path) -> bool,
     in_folder: impl Fn(&Path) -> bool,
+    neutral: impl Fn(&Path) -> String,
     service_exes: &HashSet<String>,
     task_exes: &HashSet<String>,
     autostart_exes: &HashSet<String>,
@@ -511,7 +529,7 @@ fn group_hits(
                 run_count: group.iter().filter_map(|h| h.run_count).max(),
                 is_main: main,
                 excluded,
-                autostart: listed(task_exes, &exe) || listed(autostart_exes, &exe),
+                autostart: listed(task_exes, &exe) || listed(autostart_exes, &exe) || autostart_exes.contains(&neutral(&exe)),
                 user_launch_only: user_launched && !installer,
             })
         })
@@ -545,14 +563,15 @@ fn summarize(
     hits: Vec<UsageHit>,
     is_main: impl Fn(&Path) -> bool,
     in_folder: impl Fn(&Path) -> bool,
+    neutral: impl Fn(&Path) -> String,
     service_exes: &HashSet<String>,
     task_exes: &HashSet<String>,
     autostart_exes: &HashSet<String>,
 ) -> ProgramUsage {
     let (file_times, real): (Vec<UsageHit>, Vec<UsageHit>) = hits.into_iter().partition(|h| h.source == UsageSource::FileTime);
-    let real = group_hits(real, &is_main, &in_folder, service_exes, task_exes, autostart_exes);
+    let real = group_hits(real, &is_main, &in_folder, &neutral, service_exes, task_exes, autostart_exes);
     let real_exes: HashSet<String> = real.iter().map(|e| norm(&e.exe_path)).collect();
-    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, service_exes, task_exes, autostart_exes)
+    let file_times: Vec<ExeUsage> = group_hits(file_times, &is_main, &in_folder, &neutral, service_exes, task_exes, autostart_exes)
         .into_iter()
         .filter(|e| !real_exes.contains(&norm(&e.exe_path)))
         .collect();
@@ -582,7 +601,15 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
         .iter()
         .zip(assigned)
         .map(|(c, hits)| {
-            let usage = summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes, input.autostart_exes);
+            let usage = summarize(
+                hits,
+                |e| c.is_main(e),
+                |e| c.owns_by_folder(e),
+                |e| c.neutral(e),
+                input.service_exes,
+                input.task_exes,
+                input.autostart_exes,
+            );
             (c.program.id.clone(), ProgramUsage { main_exe: c.main_exe(&usage.exes), ..usage })
         })
         .collect();
@@ -1570,6 +1597,30 @@ mod tests {
         let hits = [hit(exe, 0, UsageSource::FileTime)];
         let r = match_usage(&MatchInput { autostart_exes: &autostart, ..input(&programs, &hits, &shortcuts, &roots, &args, &services) });
         assert!(!usage(&r, "Foo").last_used.autostart);
+    }
+
+    #[test]
+    fn squirrel_run_value_marks_process_start_target_autostart() {
+        use crate::registry::{FakeRegistry, RegValue};
+        let install = r"C:\Users\A\AppData\Local\Discord";
+        let mut reg = FakeRegistry::new();
+        let run = key(Hive::CurrentUser, r"Software\Microsoft\Windows\CurrentVersion\Run");
+        reg.set(run, "Discord", RegValue::Str(format!(r#""{install}\Update.exe" --processStart Discord.exe"#)));
+        let autostart = crate::leftovers::reg_scan::run_value_exes(&reg);
+        assert!(autostart.contains(&norm(Path::new(&format!(r"{install}\Update.exe")))), "{autostart:?}");
+        let programs = [prog("Discord", Some(install))];
+        let exe = format!(r"{install}\app-1.0.9253\Discord.exe");
+        let hits = [hit(&exe, 0, UsageSource::Prefetch)];
+        let (shortcuts, roots, args, services) = (targets(&[]), HashMap::new(), HashMap::new(), HashSet::new());
+        let r = match_usage(&MatchInput { autostart_exes: &autostart, ..input(&programs, &hits, &shortcuts, &roots, &args, &services) });
+        let u = usage(&r, "Discord");
+        assert!(u.exes[0].autostart, "{u:?}");
+        assert!(u.last_used.autostart);
+        // A Startup shortcut at Update.exe names the same target.
+        let from_shortcut = autostart_targets(Path::new(&format!(r"{install}\Update.exe")), "--processStart Discord.exe");
+        assert!(from_shortcut.contains(&norm(Path::new(&format!(r"{install}\Discord.exe")))), "{from_shortcut:?}");
+        // Only a name-excluded launcher's arguments count.
+        assert_eq!(autostart_targets(Path::new(r"C:\Apps\Foo\foo.exe"), "--open bar.exe"), vec![norm(Path::new(r"C:\Apps\Foo\foo.exe"))]);
     }
 
     #[test]

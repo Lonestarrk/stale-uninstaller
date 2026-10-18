@@ -121,7 +121,11 @@ impl ScanSources {
             task_exes: Box::new(|| crate::leftovers::other_scan::task_exes(&crate::fsys::RealFs, &crate::paths::tasks_root())),
             autostart_exes: Box::new(move || {
                 let mut exes = crate::leftovers::reg_scan::run_value_exes(&*autostart_reg);
-                exes.extend(shortcut_targets(&startup_dirs()).iter().map(|t| crate::pathutil::norm(&t.path)));
+                exes.extend(
+                    shortcut_targets(&startup_dirs())
+                        .iter()
+                        .flat_map(|t| crate::usage::matching::autostart_targets(&t.path, &t.arguments)),
+                );
                 exes
             }),
             resolve_lnk: Box::new(resolve_lnk),
