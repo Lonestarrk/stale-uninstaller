@@ -6,11 +6,24 @@ fn env_or(var: &str, fallback: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| fallback.to_string())
 }
 
-fn data_dir_path() -> PathBuf {
-    PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller")
+/// Test-only: when set (and not empty), [`data_dir`] is this folder instead of
+/// `%ProgramData%\Stale Uninstaller`, so the headless end-to-end example (`examples/e2e.rs`) can
+/// run unelevated. The application never sets it.
+pub const E2E_DATA_DIR_ENV: &str = "STALE_E2E_DATA_DIR";
+
+/// `override_dir` when it is a non-empty value, else `<program_data>\Stale Uninstaller`.
+fn data_dir_from(override_dir: Option<std::ffi::OsString>, program_data: &str) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(program_data).join("Stale Uninstaller"),
+    }
 }
 
-/// `%ProgramData%\Stale Uninstaller`, created on demand (creation errors are ignored).
+fn data_dir_path() -> PathBuf {
+    data_dir_from(std::env::var_os(E2E_DATA_DIR_ENV), &env_or("ProgramData", r"C:\ProgramData"))
+}
+
+/// `%ProgramData%\Stale Uninstaller` (or the test-only [`E2E_DATA_DIR_ENV`] folder), created on demand (creation errors are ignored).
 pub fn data_dir() -> PathBuf {
     let dir = data_dir_path();
     let _ = std::fs::create_dir_all(&dir);
@@ -61,4 +74,17 @@ pub fn quarantine_manifest_dir() -> PathBuf {
 /// stays a same-volume rename. Not created here; `FileMover::ensure_payload_root` creates and locks it down.
 pub fn quarantine_payload_root(drive: char) -> PathBuf {
     PathBuf::from(format!(r"{}:\Stale Uninstaller\quarantine", drive.to_ascii_uppercase()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dir_override_is_ignored_when_unset_or_empty() {
+        let expected = PathBuf::from(r"C:\ProgramData\Stale Uninstaller");
+        assert_eq!(data_dir_from(None, r"C:\ProgramData"), expected);
+        assert_eq!(data_dir_from(Some("".into()), r"C:\ProgramData"), expected);
+        assert_eq!(data_dir_from(Some(r"C:	mp\e2e".into()), r"C:\ProgramData"), PathBuf::from(r"C:	mp\e2e"));
+    }
 }

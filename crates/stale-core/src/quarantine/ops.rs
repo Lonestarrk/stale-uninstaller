@@ -156,10 +156,70 @@ fn live_create_task(name: &str, xml: &Path) -> Result<(), String> {
     tool("schtasks.exe", &["/create".as_ref(), "/xml".as_ref(), xml.as_os_str(), "/tn".as_ref(), tn.as_ref(), "/f".as_ref()])
 }
 
+/// Test-only: `STALE_E2E_TRUST_ALL=1` makes [`QuarantineOps::live`] trust every manifest folder
+/// and skip the Administrators/SYSTEM lock-down of the manifest and payload folders (they are
+/// created as plain folders), so the headless end-to-end example (`examples/e2e.rs`) can
+/// quarantine, restore and purge unelevated. It removes a security check: the application never
+/// sets it, and it is meant to be combined with `STALE_E2E_DATA_DIR`.
+pub const E2E_TRUST_ALL_ENV: &str = "STALE_E2E_TRUST_ALL";
+
+/// Whether the [`E2E_TRUST_ALL_ENV`] value asks for trust-all: exactly `"1"`.
+fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// [`RealFileMover`] without the lock-down, for [`E2E_TRUST_ALL_ENV`] only: payload roots and
+/// locked folders are created as plain folders (a reparse point is still refused).
+struct UnlockedFileMover;
+
+impl FileMover for UnlockedFileMover {
+    fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError> {
+        RealFileMover.move_path(from, to)
+    }
+    fn ensure_payload_root(&self, root: &Path) -> Result<(), String> {
+        if root.parent().into_iter().chain([root]).any(|p| RealFileMover.is_reparse(p)) {
+            return Err(format!("{} is a link or reparse point", root.display()));
+        }
+        std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))
+    }
+    fn create_locked_dir(&self, p: &Path) -> Result<(), String> {
+        if RealFileMover.exists(p) {
+            return Ok(());
+        }
+        std::fs::create_dir(p).map_err(|e| format!("create {}: {e}", p.display()))
+    }
+    fn size_of(&self, p: &Path) -> u64 {
+        RealFileMover.size_of(p)
+    }
+    fn exists(&self, p: &Path) -> bool {
+        RealFileMover.exists(p)
+    }
+    fn is_reparse(&self, p: &Path) -> bool {
+        RealFileMover.is_reparse(p)
+    }
+    fn remove_all(&self, p: &Path) -> Result<(), String> {
+        RealFileMover.remove_all(p)
+    }
+    fn remove_empty_dirs(&self, p: &Path) -> Result<bool, String> {
+        RealFileMover.remove_empty_dirs(p)
+    }
+    fn volume_ok(&self, drive: char) -> bool {
+        RealFileMover.volume_ok(drive)
+    }
+}
+
 impl QuarantineOps {
+    /// Production operations. With the test-only [`E2E_TRUST_ALL_ENV`] set to `1`, folders are
+    /// not locked down and every manifest folder is trusted.
     pub fn live() -> QuarantineOps {
+        let trust_all = trust_all_requested(std::env::var_os(E2E_TRUST_ALL_ENV));
+        if trust_all {
+            log::warn!("{E2E_TRUST_ALL_ENV}=1: quarantine folders are not locked down (test only)");
+        }
+        let mover: Arc<dyn FileMover> = if trust_all { Arc::new(UnlockedFileMover) } else { Arc::new(RealFileMover) };
+        let trusted_dir: TrustCheck = if trust_all { Box::new(|_| Some(true)) } else { Box::new(owned_by_admins) };
         QuarantineOps {
-            mover: Arc::new(RealFileMover),
+            mover,
             regw: Arc::new(WinRegistryWriter),
             reg: Arc::new(WinRegistry),
             fs: Arc::new(RealFs),
@@ -169,7 +229,7 @@ impl QuarantineOps {
             stop_service: Box::new(live_stop_service),
             delete_task: Box::new(live_delete_task),
             create_task: Box::new(live_create_task),
-            trusted_dir: Box::new(owned_by_admins),
+            trusted_dir,
             reinherit: Box::new(crate::acl::reinherit),
         }
     }
@@ -1063,6 +1123,15 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use std::cell::RefCell;
     use std::sync::Mutex;
+
+    #[test]
+    fn trust_all_override_is_ignored_unless_exactly_one() {
+        assert!(!trust_all_requested(None));
+        assert!(!trust_all_requested(Some("".into())));
+        assert!(!trust_all_requested(Some("0".into())));
+        assert!(!trust_all_requested(Some("true".into())));
+        assert!(trust_all_requested(Some("1".into())));
+    }
 
     const TASKS: &str = r"C:\Windows\System32\Tasks";
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
