@@ -193,6 +193,7 @@ mod tests {
             tasks_root: PathBuf::from(r"C:\Windows\System32\Tasks"),
             start_menu_targets: Vec::new(),
             desktop_targets: Vec::new(),
+            keep: crate::keep::KeepList::default(),
             reg: reg.clone(),
             fs: fs.clone(),
         };

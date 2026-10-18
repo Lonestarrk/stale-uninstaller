@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod devicepath;
 pub mod fsys;
+pub mod keep;
 pub mod knownfolders;
 pub mod leftovers;
 pub mod model;

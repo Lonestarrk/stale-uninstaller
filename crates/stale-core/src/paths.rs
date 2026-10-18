@@ -33,6 +33,11 @@ fn create_ours(dir: &std::path::Path) {
     }
 }
 
+/// `data_dir()\important.json`: the keep list.
+pub fn keep_list_path() -> PathBuf {
+    data_dir().join("important.json")
+}
+
 /// `data_dir()\logs`, created on demand (creation errors are ignored).
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");

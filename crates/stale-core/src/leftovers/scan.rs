@@ -4,6 +4,7 @@ use super::fs_scan::{scan_folders, FsScanRoots};
 use super::other_scan::{desktop_dirs, scan_services, scan_shortcuts, scan_tasks};
 use super::reg_scan::{scan_registry, RegScanRoots};
 use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, LeftoverReport, ProgramHint};
+use crate::keep::KeepList;
 use crate::fsys::{FsReader, RealFs};
 use crate::pathutil::norm;
 use crate::registry::{RegistryReader, WinRegistry};
@@ -21,6 +22,7 @@ pub struct LeftoverSources {
     pub tasks_root: PathBuf,
     pub start_menu_targets: Vec<ShortcutTarget>,
     pub desktop_targets: Vec<ShortcutTarget>,
+    pub keep: KeepList,
 }
 
 impl LeftoverSources {
@@ -34,6 +36,7 @@ impl LeftoverSources {
             tasks_root: PathBuf::from(system_root).join("System32").join("Tasks"),
             start_menu_targets: shortcut_targets(&start_menu_dirs()),
             desktop_targets: shortcut_targets(&desktop_dirs(&*fs)),
+            keep: KeepList::load_from(&crate::paths::keep_list_path()),
             reg,
             fs,
         }
@@ -102,7 +105,21 @@ pub fn scan_leftovers(src: &LeftoverSources, hint: &ProgramHint) -> LeftoverRepo
     }
     mark_used_by_others(&mut items, &hint.other_locations);
     items.sort_by_key(|l| (rank(l.confidence), kind_group(&l.kind)));
-    LeftoverReport { items }
+    filter_kept(LeftoverReport { items }, &src.keep)
+}
+
+/// Drops what the user asked to keep: folders and files under a kept path, registry keys and
+/// values under a kept key, shortcuts targeting, and services and tasks running, something under
+/// a kept path.
+pub fn filter_kept(report: LeftoverReport, keep: &KeepList) -> LeftoverReport {
+    let kept = |kind: &LeftoverKind| match kind {
+        LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => keep.is_path_kept(path),
+        LeftoverKind::RegKey { key } | LeftoverKind::RegValue { key, .. } => keep.is_key_kept(key),
+        LeftoverKind::Shortcut { target, .. } => keep.is_path_kept(target),
+        LeftoverKind::Service { image, .. } => keep.is_path_kept(image),
+        LeftoverKind::ScheduledTask { command, .. } => keep.is_path_kept(command),
+    };
+    LeftoverReport { items: report.items.into_iter().filter(|l| !kept(&l.kind)).collect() }
 }
 
 /// "Markera säkra": true for High and Medium, false for Low.
@@ -127,6 +144,7 @@ mod tests {
             tasks_root: PathBuf::from(r"C:\Windows\System32\Tasks"),
             start_menu_targets: shortcuts,
             desktop_targets: Vec::new(),
+            keep: KeepList::default(),
             reg,
             fs,
         }
