@@ -78,7 +78,7 @@ pub(crate) fn rank(c: Confidence) -> u8 {
 pub fn scan_leftovers(src: &LeftoverSources, hint: &ProgramHint) -> LeftoverReport {
     let all = scan_folders(&*src.fs, &src.fs_roots, hint)
         .into_iter()
-        .chain(scan_registry(&*src.reg, &src.reg_roots, hint))
+        .chain(scan_registry(&*src.reg, &*src.fs, &src.reg_roots, hint))
         .chain(scan_services(&*src.reg, hint))
         .chain(scan_tasks(&*src.fs, &src.tasks_root, hint))
         .chain(

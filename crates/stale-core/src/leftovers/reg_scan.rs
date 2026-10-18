@@ -5,8 +5,9 @@ use super::names::{
 };
 use super::names::normalize_name;
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_PROGID_OF_PROGRAM};
+use crate::fsys::FsReader;
 use crate::model::{Hive, RegKeyPath};
-use crate::pathutil::{exe_under, expand_env, first_path_in_command};
+use crate::pathutil::{drive_letter, exe_under, expand_env, first_path_in_command};
 use crate::programs::other_user_sids;
 use crate::registry::{key, RegValue, RegistryReader};
 use std::collections::HashSet;
@@ -154,13 +155,14 @@ impl Found {
     }
 }
 
-/// High-confidence items come first; a key found by several rules is listed once.
-pub fn scan_registry(reg: &dyn RegistryReader, roots: &RegScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
+/// High-confidence items come first; a key found by several rules is listed once. `fs` tells
+/// whether a file type's handler still exists.
+pub fn scan_registry(reg: &dyn RegistryReader, fs: &dyn FsReader, roots: &RegScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
     let mut found = Found::default();
     uninstall_key(reg, hint, &mut found);
     let target = Target::from_hint(hint);
     for root in roots.classes.iter().filter(|r| reg.key_exists(r)) {
-        class_keys(reg, root, target.as_ref(), hint, &mut found);
+        class_keys(reg, fs, root, target.as_ref(), hint, &mut found);
     }
     if let Some(target) = target {
         for root in roots.run.iter().filter(|r| reg.key_exists(r)) {
@@ -229,11 +231,17 @@ fn progid_names_program(progid: &str, program_first_word: &str) -> bool {
 }
 
 /// (c) COM classes, file types, ProgIDs and protocols that point at the program (High), and file
-/// types whose ProgID is named like the program (Medium, with that ProgID's key if it still
-/// exists; the extension keys outlive the ProgIDs' commands). One pass over the root: per subkey
-/// only its default value and `shell\open\command`; per `CLSID\{…}` only the
+/// types whose ProgID is named like the program (Medium; see [`named_file_type`]). One pass over
+/// the root: per subkey only its default value and `shell\open\command`; per `CLSID\{…}` only the
 /// `InprocServer32`/`LocalServer32` defaults.
-fn class_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: Option<&Target>, hint: &ProgramHint, found: &mut Found) {
+fn class_keys(
+    reg: &dyn RegistryReader,
+    fs: &dyn FsReader,
+    root: &RegKeyPath,
+    target: Option<&Target>,
+    hint: &ProgramHint,
+    found: &mut Found,
+) {
     let Ok(subkeys) = reg.subkeys(root) else { return };
     let normalized = normalize_name(&hint.name);
     let first_word = normalized.split(' ').next().unwrap_or("");
@@ -265,11 +273,42 @@ fn class_keys(reg: &dyn RegistryReader, root: &RegKeyPath, target: Option<&Targe
     }
     // After the High pass, so a ProgID that points into the install folder stays High.
     for (ext, progid) in named_progids {
-        found.key(ext, Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM));
-        let progid_key = child(root, &progid);
-        if !progid.contains('\\') && reg.key_exists(&progid_key) {
-            found.key(progid_key, Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM));
-        }
+        named_file_type(reg, fs, root, ext, &progid, target, found);
+    }
+}
+
+/// A file type `ext` whose ProgID `progid` is named like the program is listed (Medium) only when
+/// it is orphaned or the program's: the ProgID key is missing, or its `shell\open\command` exe is
+/// missing on disk or lies inside the program's target. The ProgID key itself is listed only in
+/// the latter two cases. A file type whose handler is a live exe elsewhere (a side-by-side
+/// Python's `.py` → `Python.File` → `py.exe`) is never listed.
+fn named_file_type(
+    reg: &dyn RegistryReader,
+    fs: &dyn FsReader,
+    root: &RegKeyPath,
+    ext: RegKeyPath,
+    progid: &str,
+    target: Option<&Target>,
+    found: &mut Found,
+) {
+    if progid.contains('\\') {
+        return;
+    }
+    let note = Some(NOTE_PROGID_OF_PROGRAM);
+    let progid_key = child(root, progid);
+    if !reg.key_exists(&progid_key) {
+        found.key(ext, Confidence::Medium, note);
+        return;
+    }
+    let exe = default_string(reg, &child(&progid_key, r"shell\open\command")).as_deref().and_then(path_in_value);
+    // A handler without a drive letter (`notepad.exe`, `rundll32.exe`) resolves through the
+    // search path: treated as live.
+    let ours = exe.is_some_and(|exe| {
+        (drive_letter(&exe).is_some() && !fs.exists(&exe)) || target.is_some_and(|t| t.refers_to(&exe))
+    });
+    if ours {
+        found.key(ext, Confidence::Medium, note);
+        found.key(progid_key, Confidence::Medium, note);
     }
 }
 
@@ -300,6 +339,7 @@ mod tests {
     use super::*;
     use crate::leftovers::{Confidence, LeftoverKind};
     use crate::model::Hive;
+    use crate::fsys::FakeFs;
     use crate::registry::{key, FakeRegistry, RegValue};
     use std::path::PathBuf;
 
@@ -344,12 +384,12 @@ mod tests {
         reg.set(uk.clone(), "DisplayName", s("Foo Studio"));
         let mut h = hint("Foo Studio", None, None);
         h.uninstall_key = Some(uk.clone());
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &h);
         assert_eq!(out, vec![Leftover { kind: LeftoverKind::RegKey { key: uk }, confidence: Confidence::High, note: None }]);
 
         // A key that is already gone is not reported.
         let empty = FakeRegistry::new();
-        assert!(scan_registry(&empty, &RegScanRoots::standard(&empty), &h).is_empty());
+        assert!(scan_registry(&empty, &FakeFs::new(), &RegScanRoots::standard(&empty), &h).is_empty());
     }
 
     #[test]
@@ -369,7 +409,7 @@ mod tests {
         reg.add_key(key(Hive::Users, r"S-1-5-21-9\Software\Foo Corp Inc\Foo Studio"));
         reg.add_key(key(Hive::Users, r".DEFAULT\Software\Foo Studio"));
         let roots = RegScanRoots::standard(&reg);
-        let out = scan_registry(&reg, &roots, &hint("Foo Studio", Some("Foo Corp"), None));
+        let out = scan_registry(&reg, &FakeFs::new(), &roots, &hint("Foo Studio", Some("Foo Corp"), None));
         assert_eq!(
             found(&out),
             vec![
@@ -386,7 +426,7 @@ mod tests {
         let mut reg = FakeRegistry::new();
         reg.add_key(key(Hive::CurrentUser, r"Software\Foo Corp\Foo Studio\Settings"));
         reg.add_key(key(Hive::CurrentUser, r"Software\Foo Corp\Bar Player"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Foo Studio", Some("Foo Corp Inc."), None));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Foo Studio", Some("Foo Corp Inc."), None));
         assert_eq!(
             found(&out),
             vec![(
@@ -408,7 +448,7 @@ mod tests {
         reg.set(key(Hive::CurrentUser, r"Software\Classes\foo\shell\open\command"), "", s(&format!(r#""{INSTALL}\foo.exe" "%1""#)));
         reg.set(key(Hive::LocalMachine, r"SOFTWARE\Classes\FooStudio.Project"), "", RegValue::ExpandStr(format!(r"{INSTALL}\foo.exe")));
         reg.set(key(Hive::LocalMachine, r"SOFTWARE\Classes\.txt"), "", s("txtfile"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
         assert_eq!(
             found(&out),
             vec![
@@ -427,7 +467,7 @@ mod tests {
         reg.set(key(Hive::CurrentUser, RUN), "Other", s(r#""C:\Other\other.exe""#));
         let once = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce";
         reg.set(key(Hive::LocalMachine, once), "FooOnce", s(&format!(r"{INSTALL}\setup helper.exe /x")));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
         assert_eq!(
             found(&out),
             vec![
@@ -441,7 +481,7 @@ mod tests {
         h.display_icon = Some(PathBuf::from(r"C:\Elsewhere\FOO.EXE"));
         h.uninstall_string = Some(r"MsiExec.exe /X{123}".into());
         reg.set(key(Hive::CurrentUser, RUN), "Msi", s(r"C:\Windows\System32\msiexec.exe /fa {123}"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &h);
         assert_eq!(found(&out), vec![(format!(r"CurrentUser\{HKCU_RUN}:FooStudio"), Confidence::High, None)]);
     }
 
@@ -454,7 +494,7 @@ mod tests {
         reg.set(key(Hive::CurrentUser, &format!(r"{APP_PATHS}\Obsidian.exe")), "", s(&format!(r"{dir}\Obsidian.exe")));
         let mut h = hint("Obsidian", None, None);
         h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &h);
         assert_eq!(
             found(&out),
             vec![
@@ -474,15 +514,18 @@ mod tests {
         reg.set(ck(".canvas"), "", s("Obsidian Canvas"));
         reg.set(ck(".base"), "", s("Obsidian Base"));
         reg.set(ck(".obs"), "", s("Obsidian.Note.1"));
-        // A ProgID that still exists is listed as well.
+        // A ProgID whose handler is gone from disk is listed as well.
         reg.set(ck(".vault"), "", s("Obsidian.Vault"));
-        reg.add_key(ck(r"Obsidian.Vault\DefaultIcon"));
+        reg.set(ck(r"Obsidian.Vault\shell\open\command"), "", s(r#""C:\Gone\Obsidian.exe" "%1""#));
+        // A ProgID without a command is not the program's for sure: neither is listed.
+        reg.set(ck(".note"), "", s("Obsidian.Note"));
+        reg.add_key(ck(r"Obsidian.Note\DefaultIcon"));
         // Unrelated ProgIDs and non-extension keys are not.
         reg.set(ck(".md"), "", s("Markdown"));
         reg.set(ck(".txt"), "", s("ObsidianLike.txt"));
         reg.set(ck("Obsidian Notes"), "", s("Obsidian Canvas"));
         let roots = RegScanRoots { software: vec![], classes: vec![key(Hive::CurrentUser, classes)], run: vec![], app_paths: vec![] };
-        let out = scan_registry(&reg, &roots, &hint("Obsidian", None, None));
+        let out = scan_registry(&reg, &FakeFs::new(), &roots, &hint("Obsidian", None, None));
         let note = Some(NOTE_PROGID_OF_PROGRAM.to_string());
         assert_eq!(
             found(&out),
@@ -499,11 +542,67 @@ mod tests {
         // A ProgID whose command points into the install folder stays High.
         let dir = r"C:\Apps\Obsidian";
         reg.set(ck(r"Obsidian.Vault\shell\open\command"), "", s(&format!(r#""{dir}\Obsidian.exe" "%1""#)));
-        let out = scan_registry(&reg, &roots, &hint("Obsidian", None, Some(dir)));
+        let out = scan_registry(&reg, &FakeFs::new(), &roots, &hint("Obsidian", None, Some(dir)));
         let vault = found(&out).into_iter().find(|(k, ..)| k.ends_with("Obsidian.Vault")).unwrap();
         assert_eq!(vault.1, Confidence::High);
         // A generic first word matches nothing.
-        assert!(scan_registry(&reg, &roots, &hint("App Obsidian", None, None)).is_empty());
+        assert!(scan_registry(&reg, &FakeFs::new(), &roots, &hint("App Obsidian", None, None)).is_empty());
+    }
+
+    /// `.py`/`.pyw` → `Python.File`/`Python.NoConFile` → `C:\Windows\py.exe`, as the Python
+    /// launcher registers them.
+    fn python_classes(reg: &mut FakeRegistry) -> RegScanRoots {
+        let ck = |p: &str| key(Hive::CurrentUser, &format!(r"Software\Classes\{p}"));
+        reg.set(ck(".py"), "", s("Python.File"));
+        reg.set(ck(".pyw"), "", s("Python.NoConFile"));
+        reg.set(ck(r"Python.File\shell\open\command"), "", s(r#""C:\Windows\py.exe" "%L" %*"#));
+        reg.set(ck(r"Python.NoConFile\shell\open\command"), "", s(r#""C:\Windows\pyw.exe" "%L" %*"#));
+        RegScanRoots { software: vec![], classes: vec![key(Hive::CurrentUser, r"Software\Classes")], run: vec![], app_paths: vec![] }
+    }
+
+    #[test]
+    fn python_file_types_with_live_handler_are_not_listed() {
+        let mut reg = FakeRegistry::new();
+        let roots = python_classes(&mut reg);
+        let fs = FakeFs::new().file(r"C:\Windows\py.exe", 1).file(r"C:\Windows\pyw.exe", 1);
+        let h = hint("Python 3.11.4 (64-bit)", None, Some(r"C:\Users\A\AppData\Local\Programs\Python\Python311"));
+        let out = scan_registry(&reg, &fs, &roots, &h);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn orphaned_progid_file_type_is_listed() {
+        let mut reg = FakeRegistry::new();
+        let roots = python_classes(&mut reg);
+        reg.set(key(Hive::CurrentUser, r"Software\Classes\.pyz"), "", s("Python.ArchiveFile"));
+        let fs = FakeFs::new().file(r"C:\Windows\py.exe", 1).file(r"C:\Windows\pyw.exe", 1);
+        let out = scan_registry(&reg, &fs, &roots, &hint("Python 3.11.4 (64-bit)", None, None));
+        assert_eq!(
+            found(&out),
+            vec![(r"CurrentUser\Software\Classes\.pyz".to_string(), Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM.to_string()))]
+        );
+    }
+
+    #[test]
+    fn file_type_whose_handler_is_under_target_is_listed() {
+        let dir = r"C:\Users\A\AppData\Local\Programs\Obsidian";
+        let mut reg = FakeRegistry::new();
+        let ck = |p: &str| key(Hive::CurrentUser, &format!(r"Software\Classes\{p}"));
+        reg.set(ck(".canvas"), "", s("Obsidian Canvas"));
+        reg.set(ck(r"Obsidian Canvas\shell\open\command"), "", s(&format!(r#""{dir}\Obsidian.exe" "%1""#)));
+        let roots = RegScanRoots { software: vec![], classes: vec![key(Hive::CurrentUser, r"Software\Classes")], run: vec![], app_paths: vec![] };
+        // The handler still exists (before the uninstall) but lies in the program's folder.
+        let fs = FakeFs::new().file(&format!(r"{dir}\Obsidian.exe"), 1);
+        let mut h = hint("Obsidian", None, None);
+        h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
+        let out = scan_registry(&reg, &fs, &roots, &h);
+        assert_eq!(
+            found(&out),
+            vec![
+                (r"CurrentUser\Software\Classes\.canvas".to_string(), Confidence::Medium, Some(NOTE_PROGID_OF_PROGRAM.to_string())),
+                (r"CurrentUser\Software\Classes\Obsidian Canvas".to_string(), Confidence::High, None),
+            ]
+        );
     }
 
     #[test]
@@ -512,7 +611,7 @@ mod tests {
         reg.set(key(Hive::LocalMachine, &format!(r"{APP_PATHS}\foo.exe")), "", s(&format!(r"{INSTALL}\foo.exe")));
         reg.set(key(Hive::LocalMachine, &format!(r"{APP_PATHS}\bar.exe")), "", s(r"C:\Bar\bar.exe"));
         reg.set(key(Hive::CurrentUser, &format!(r"{APP_PATHS}\FooStudio.exe")), "", s(&format!(r#""{INSTALL}\foo.exe""#)));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Foo Studio", None, Some(INSTALL)));
         assert_eq!(
             found(&out),
             vec![
@@ -527,7 +626,7 @@ mod tests {
         let mut reg = FakeRegistry::new();
         reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Google\Chrome"));
         reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Google\Update"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Google Chrome", None, None));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Google Chrome", None, None));
         assert_eq!(
             found(&out),
             vec![(r"LocalMachine\SOFTWARE\Google\Chrome".to_string(), Confidence::Medium, Some("shared-publisher-key".to_string()))]
@@ -540,7 +639,7 @@ mod tests {
         reg.set(key(Hive::CurrentUser, RUN), "Discord", s(r"C:\Users\A\AppData\Local\discord\Update.exe --processStart Discord.exe"));
         let mut h = hint("Slack", None, None);
         h.uninstall_string = Some(r#""C:\Users\A\AppData\Local\slack\Update.exe" --uninstall"#.into());
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &h);
         assert!(out.is_empty(), "{out:?}");
     }
 
@@ -552,7 +651,7 @@ mod tests {
         reg.set(key(Hive::CurrentUser, RUN), "OtherFoo", s(r#""C:\Apps\Other\bin\foo.exe" /tray"#));
         let mut h = hint("Foo Studio", None, None);
         h.display_icon = Some(PathBuf::from(r"C:\Apps\Foo Studio\foo.exe"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &h);
         assert_eq!(found(&out), vec![(format!(r"CurrentUser\{HKCU_RUN}:Foo"), Confidence::High, None)]);
     }
 
@@ -562,7 +661,7 @@ mod tests {
         reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Tools"));
         reg.add_key(key(Hive::CurrentUser, r"Software\Tools\Tools"));
         reg.set(key(Hive::CurrentUser, RUN), "Tools", s(r"C:\Tools\tools.exe"));
-        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Tools", Some("Tools"), None));
+        let out = scan_registry(&reg, &FakeFs::new(), &RegScanRoots::standard(&reg), &hint("Tools", Some("Tools"), None));
         assert!(out.is_empty(), "{out:?}");
     }
 
@@ -580,7 +679,7 @@ mod tests {
             run: vec![],
             app_paths: vec![],
         };
-        let out = scan_registry(&reg, &roots, &hint("Foo Studio", None, Some(INSTALL)));
+        let out = scan_registry(&reg, &FakeFs::new(), &roots, &hint("Foo Studio", None, Some(INSTALL)));
         assert_eq!(found(&out), vec![(format!(r"LocalMachine\{guid}"), Confidence::High, None)]);
         let reads = reg.reads();
         let inproc = format!(r"LocalMachine\{guid}\InprocServer32");
