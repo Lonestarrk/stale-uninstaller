@@ -7,16 +7,17 @@ fn env_or(var: &str, fallback: &str) -> String {
 }
 
 /// `%ProgramData%\Stale Uninstaller`, created on demand (creation errors are ignored).
-/// A folder left by early builds (`%ProgramData%\Stale`) is renamed on first use.
 pub fn data_dir() -> PathBuf {
-    let base = PathBuf::from(env_or("ProgramData", r"C:\ProgramData"));
-    let dir = base.join("Stale Uninstaller");
-    let legacy = base.join("Stale");
-    if !dir.exists() && legacy.is_dir() {
-        let _ = std::fs::rename(&legacy, &dir);
-    }
+    let dir = PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Locks `data_dir()` down to Administrators and SYSTEM (owner and inherited ACL, refusing a link
+/// or reparse point), like a quarantine payload root: settings and manifests below it are trusted.
+pub fn secure_data_dir() -> Result<(), String> {
+    use crate::quarantine::fsmove::{FileMover, RealFileMover};
+    RealFileMover.ensure_payload_root(&data_dir())
 }
 
 /// `data_dir()\logs`, created on demand (creation errors are ignored).

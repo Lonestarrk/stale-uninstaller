@@ -4,6 +4,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -43,9 +44,16 @@ pub fn save_manifest(dir: &Path, m: &QuarantineManifest) -> Result<(), String> {
 
 /// Every readable manifest below `dir`, newest first; unreadable or mismatching ones are skipped.
 pub fn list_manifests(dir: &Path) -> Vec<QuarantineManifest> {
+    list_trusted_manifests(dir, &|_| Some(true))
+}
+
+/// Like [`list_manifests`], but only `<id>` folders for which `trusted` returns `Some(true)`
+/// (in production [`owned_by_admins`]), so a manifest planted by an unprivileged user is ignored.
+pub fn list_trusted_manifests(dir: &Path, trusted: &dyn Fn(&Path) -> Option<bool>) -> Vec<QuarantineManifest> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out: Vec<QuarantineManifest> = rd
         .flatten()
+        .filter(|e| trusted(&e.path()) == Some(true))
         .filter_map(|e| {
             let text = std::fs::read_to_string(e.path().join(MANIFEST_FILE)).ok()?;
             let m: QuarantineManifest = serde_json::from_str(&text).ok()?;
@@ -56,8 +64,101 @@ pub fn list_manifests(dir: &Path) -> Vec<QuarantineManifest> {
     out
 }
 
+/// Whether `path` is owned by BUILTIN\Administrators or LocalSystem; `None` when the owner
+/// cannot be read (e.g. the path does not exist).
+pub fn owned_by_admins(path: &Path) -> Option<bool> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut owner = PSID::default();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `owner` points into `sd`, which the
+    // call allocates and which is freed below with `LocalFree` after the last use of `owner`.
+    unsafe {
+        let err = GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut sd,
+        );
+        if err != ERROR_SUCCESS {
+            return None;
+        }
+        let ok = !owner.is_invalid()
+            && (IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+                || IsWellKnownSid(owner, WinLocalSystemSid).as_bool());
+        LocalFree(Some(HLOCAL(sd.0)));
+        Some(ok)
+    }
+}
+
 /// `"<yyyymmdd-hhmmss>-<4 hex>"`; the suffix is random.
 pub fn new_id(now: DateTime<Utc>) -> QuarantineId {
     let random = RandomState::new().hash_one(now.timestamp_nanos_opt().unwrap_or_default()) & 0xffff;
     QuarantineId(format!("{}-{:04x}", now.format("%Y%m%d-%H%M%S"), random))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quarantine::QuarantineId;
+
+    fn manifest(id: &str, created: DateTime<Utc>) -> QuarantineManifest {
+        QuarantineManifest {
+            id: QuarantineId(id.to_string()),
+            program_name: id.to_string(),
+            created,
+            moved: vec![],
+            keys: vec![],
+            values: vec![],
+            services: vec![],
+            tasks: vec![],
+            failures: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn list_trusted_manifests_keeps_only_trusted_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let (a, b, c) = (manifest("a-1", now), manifest("b-2", now), manifest("c-3", now));
+        for m in [&a, &b, &c] {
+            save_manifest(dir.path(), m).unwrap();
+        }
+        let (trusted_a, unknown_c) = (dir.path().join("a-1"), dir.path().join("c-3"));
+        let trusted = move |p: &Path| {
+            if p == trusted_a {
+                Some(true)
+            } else if p == unknown_c {
+                None
+            } else {
+                Some(false)
+            }
+        };
+        assert_eq!(list_trusted_manifests(dir.path(), &trusted), vec![a]);
+        assert_eq!(list_manifests(dir.path()).len(), 3, "the unfiltered listing is unchanged");
+    }
+
+    /// Run with `cargo test -p stale-core -- --ignored owned_by_admins`.
+    #[test]
+    #[ignore]
+    fn owned_by_admins_live() {
+        let programdata = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        assert_eq!(owned_by_admins(Path::new(&programdata)), Some(true), "ProgramData is owned by SYSTEM");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(owned_by_admins(dir.path()), Some(false), "an unelevated user's temp folder");
+        assert_eq!(owned_by_admins(&dir.path().join("missing")), None);
+    }
+}
+

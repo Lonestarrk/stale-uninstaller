@@ -5,7 +5,7 @@ pub mod ops;
 pub mod store;
 
 pub use ops::{auto_purge, purge, quarantine, restore, QuarantineOps, QuarantineProgress, RestoreOutcome};
-pub use store::{list_manifests, manifest_path, new_id};
+pub use store::{list_manifests, list_trusted_manifests, manifest_path, new_id, owned_by_admins};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

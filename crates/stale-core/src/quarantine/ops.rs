@@ -11,7 +11,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 
 use super::fsmove::{stored_path_for, FileMover, MoveError, RealFileMover};
-use super::store::{list_manifests, new_id, save_manifest, valid_id};
+use super::store::{list_trusted_manifests, new_id, owned_by_admins, save_manifest, valid_id};
 use super::{
     ExportedKey, Failure, MovedItem, QuarantineId, QuarantineManifest, RemovedService, RemovedTask, RemovedValue,
 };
@@ -29,6 +29,8 @@ const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 pub type NameCommand = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Re-creates a task `name` from an XML file.
 pub type CreateTaskCommand = Box<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
+/// Whether a folder is owned by a trusted account; `None` when that cannot be told.
+pub type TrustCheck = Box<dyn Fn(&Path) -> Option<bool> + Send + Sync>;
 
 /// Everything quarantine needs from the system; `live()` for production, fakes in tests.
 pub struct QuarantineOps {
@@ -46,6 +48,9 @@ pub struct QuarantineOps {
     pub delete_task: NameCommand,
     /// `schtasks /create /xml <file> /tn <name> /f`.
     pub create_task: CreateTaskCommand,
+    /// Whether a `<manifest dir>\<id>` folder may be acted on: `Some(true)` only when it is owned by
+    /// Administrators or SYSTEM (`owned_by_admins`), so a planted manifest is never restored or purged.
+    pub trusted_dir: TrustCheck,
 }
 
 fn tool(name: &str, args: &[&OsStr]) -> Result<(), String> {
@@ -89,6 +94,7 @@ impl QuarantineOps {
             stop_service: Box::new(live_stop_service),
             delete_task: Box::new(live_delete_task),
             create_task: Box::new(live_create_task),
+            trusted_dir: Box::new(owned_by_admins),
         }
     }
 }
@@ -384,6 +390,15 @@ fn secure_manifest_dir(ops: &QuarantineOps) -> Result<(), String> {
     ops.mover.ensure_payload_root(&ops.manifest_dir)
 }
 
+/// Refuses a `<manifest dir>\<id>` folder that `ops.trusted_dir` does not vouch for.
+fn check_trusted(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), String> {
+    let folder = ops.manifest_dir.join(&id.0);
+    match (ops.trusted_dir)(&folder) {
+        Some(true) => Ok(()),
+        _ => Err(format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display())),
+    }
+}
+
 /// Quarantines `items` in the order services, tasks, registry values, registry keys, shortcuts,
 /// files/folders. Every failure is recorded in the manifest and the rest continues; the manifest
 /// is saved before anything is touched and after each group (a failed save stops further groups).
@@ -591,12 +606,13 @@ fn restore_services(
 /// Puts a quarantine back: files/shortcuts, then registry keys/values, tasks, services. Items that
 /// cannot go back stay in the (re-saved) manifest; once nothing is left the manifest folder and the
 /// payload folders are deleted. A full restore drops the manifest, so callers that want to say
-/// "restored services need a reboot" look at `m.services`.
+/// "restored services need a reboot" look at `m.services`. A quarantine folder not owned by
+/// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
 pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
     if !valid_id(&m.id) {
         return RestoreOutcome::Partial(vec![Failure { what: m.id.0.clone(), error: "invalid quarantine id".to_string() }]);
     }
-    if let Err(error) = secure_manifest_dir(ops) {
+    if let Err(error) = secure_manifest_dir(ops).and_then(|()| check_trusted(ops, &m.id)) {
         return RestoreOutcome::Partial(vec![Failure { what: "manifest".to_string(), error }]);
     }
     let mut failures = Vec::new();
@@ -637,7 +653,8 @@ fn remove_manifest_folder(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), 
 }
 
 /// Deletes the payload folders and then the manifest folder for good. If a payload folder cannot
-/// be deleted the manifest is kept, so nothing is orphaned and the purge can be retried.
+/// be deleted the manifest is kept, so nothing is orphaned and the purge can be retried. A quarantine
+/// folder not owned by Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
 pub fn purge(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
     secure_manifest_dir(ops)?;
     purge_secured(ops, m)
@@ -647,6 +664,7 @@ fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), Stri
     if !valid_id(&m.id) {
         return Err(format!("invalid quarantine id {:?}", m.id.0));
     }
+    check_trusted(ops, &m.id)?;
     let errors: Vec<String> = payload_dirs(ops, &m.id).iter().filter_map(|d| ops.mover.remove_all(d).err()).collect();
     if !errors.is_empty() {
         return Err(errors.join("; "));
@@ -655,7 +673,7 @@ fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), Stri
 }
 
 /// Purges every quarantine created more than `days` days before `now`; `0` turns this off.
-/// Returns the purged ids.
+/// Quarantines whose folder `ops.trusted_dir` does not vouch for are skipped. Returns the purged ids.
 pub fn auto_purge(ops: &QuarantineOps, days: u32, now: DateTime<Utc>) -> Vec<QuarantineId> {
     if days == 0 {
         return Vec::new();
@@ -665,7 +683,7 @@ pub fn auto_purge(ops: &QuarantineOps, days: u32, now: DateTime<Utc>) -> Vec<Qua
         log::warn!("auto-purge: {e}");
         return Vec::new();
     }
-    list_manifests(&ops.manifest_dir)
+    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir)
         .into_iter()
         .filter(|m| m.created < cutoff)
         .filter_map(|m| match purge_secured(ops, &m) {
@@ -760,6 +778,7 @@ mod tests {
             stop_service: Box::new(stop_service),
             delete_task: Box::new(delete_task),
             create_task: Box::new(create_task),
+            trusted_dir: Box::new(|_| Some(true)),
         };
         Env { ops, mover, regw, calls, dir }
     }
@@ -1221,5 +1240,44 @@ mod tests {
         assert!(e.calls.lock().unwrap().is_empty(), "task not deleted");
         assert_eq!(e.regw.log.lock().unwrap().len(), 1, "only the service export");
         assert!(exists(&e, r"C:\Apps\Foo\a.dll"));
+    }
+
+    #[test]
+    fn restore_refuses_untrusted_manifest_dir() {
+        let mut e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\a.dll", 1);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo"), key_item(r"SOFTWARE\Foo")]);
+        let folder = e.dir.path().join(&m.id.0);
+        e.ops.trusted_dir = Box::new(|_| Some(false));
+        e.mover.log.lock().unwrap().clear();
+        e.regw.log.lock().unwrap().clear();
+
+        let untrusted = format!("quarantine folder not owned by Administrators or SYSTEM: {}", folder.display());
+        assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail("manifest", &untrusted)]));
+        assert!(!e.mover.log.lock().unwrap().iter().any(|l| l.starts_with("move")), "nothing moved back");
+        assert!(e.regw.log.lock().unwrap().is_empty(), "nothing imported");
+        assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")));
+
+        e.ops.trusted_dir = Box::new(|_| None);
+        assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail("manifest", &untrusted)]), "unknown owner is refused too");
+        assert_eq!(purge(&e.ops, &m), Err(untrusted));
+        assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")), "purge refused");
+        assert!(folder.exists());
+    }
+
+    #[test]
+    fn auto_purge_skips_untrusted_dirs() {
+        let mut e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Old\a", 1);
+        e.mover.add_file(r"C:\Planted\b", 1);
+        let old = quarantine(&e.ops, "Old", &[dir_item(r"C:\Old")], now() - Duration::days(40), &|_| {});
+        let planted = quarantine(&e.ops, "Planted", &[dir_item(r"C:\Planted")], now() - Duration::days(41), &|_| {});
+        let trusted_folder = e.dir.path().join(&old.id.0);
+        e.ops.trusted_dir = Box::new(move |p| Some(p == trusted_folder));
+
+        assert_eq!(auto_purge(&e.ops, 30, now()), vec![old.id.clone()]);
+        assert!(!e.mover.exists(&old.moved[0].stored));
+        assert!(e.mover.exists(&planted.moved[0].stored), "untrusted quarantine is left alone");
+        assert_eq!(list_manifests(e.dir.path()), vec![planted]);
     }
 }
