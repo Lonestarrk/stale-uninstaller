@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::leftovers::ProgramHint;
-use stale_core::quarantine::QuarantineManifest;
+use stale_core::quarantine::{Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
 use stale_core::settings::Settings;
 use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
@@ -20,8 +20,8 @@ use stale_core::{Program, ProgramId};
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
 use crate::leftover_sel::LeftoverSelection;
-use crate::ui::{details, filter_panel, leftovers_view, table, toolbar, uninstall_dialog};
-use crate::worker::{LeftoverScanEvent, QuarantineEvent};
+use crate::ui::{details, filter_panel, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
+use crate::worker::{LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -94,6 +94,15 @@ pub struct StaleApp {
     /// The "Sök rester" window, when open.
     pub search: Option<SearchDialog>,
     leftover_scan_rx: Option<Receiver<LeftoverScanEvent>>,
+    /// The quarantine view's rows, newest first.
+    pub quarantine: Vec<QuarantineManifest>,
+    /// True while a quarantine list, restore or purge runs (one at a time).
+    pub quarantine_busy: bool,
+    quarantine_admin_rx: Option<Receiver<QuarantineAdminEvent>>,
+    /// The "Töm karantän" confirmation is open.
+    pub confirm_purge_all: bool,
+    /// What the last partial restore could not put back, shown under its row.
+    pub last_restore_failures: Option<(QuarantineId, Vec<Failure>)>,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
     /// Usage and sizes received so far, kept for hidden programs too.
@@ -107,6 +116,8 @@ impl StaleApp {
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
         app.rx = Some(worker::spawn_scan());
         app.scanning = true;
+        // For the toolbar's count.
+        app.refresh_quarantine();
         app
     }
 
@@ -134,6 +145,11 @@ impl StaleApp {
             last_manifests: Vec::new(),
             search: None,
             leftover_scan_rx: None,
+            quarantine: Vec::new(),
+            quarantine_busy: false,
+            quarantine_admin_rx: None,
+            confirm_purge_all: false,
+            last_restore_failures: None,
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
@@ -215,6 +231,18 @@ impl StaleApp {
         if self.selected.as_ref().is_some_and(|id| !ids.contains(id)) {
             self.selected = None;
         }
+        if let Err(e) = self.settings.save_to(path) {
+            log::warn!("could not save settings to {}: {e}", path.display());
+        }
+    }
+
+    /// Sets the auto-purge age (0 turns it off) and saves.
+    pub fn set_quarantine_days(&mut self, days: u32) {
+        self.set_quarantine_days_at(days, &Settings::path());
+    }
+
+    fn set_quarantine_days_at(&mut self, days: u32, path: &Path) {
+        self.settings.quarantine_days = days;
         if let Err(e) = self.settings.save_to(path) {
             log::warn!("could not save settings to {}: {e}", path.display());
         }
@@ -384,6 +412,7 @@ impl StaleApp {
                     self.removal_progress = None;
                     self.removal_done = true;
                     self.last_manifests = manifests;
+                    self.refresh_quarantine();
                     return;
                 }
                 Ok(QuarantineEvent::Failed(msg)) => {
@@ -400,6 +429,82 @@ impl StaleApp {
                     log::error!("quarantine worker disconnected before Finished");
                     self.removal_progress = None;
                     self.warnings.push(strings::QUARANTINE_ABORTED.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Switches to the quarantine view and reloads its rows; a finished removal is closed first.
+    pub fn show_quarantine(&mut self) {
+        if self.view == View::Leftovers {
+            self.leave_leftovers();
+        }
+        self.view = View::Quarantine;
+        self.refresh_quarantine();
+    }
+
+    /// Lists the quarantines on a worker (no-op while another quarantine action runs).
+    pub fn refresh_quarantine(&mut self) {
+        self.start_quarantine_admin(worker::spawn_quarantine_list);
+    }
+
+    /// Restores quarantine `id` on a worker.
+    pub fn restore_quarantine(&mut self, id: QuarantineId) {
+        self.start_quarantine_admin(|| worker::spawn_restore(id));
+    }
+
+    /// Purges `ids` for good on a worker (nothing given: no-op).
+    pub fn purge_quarantine(&mut self, ids: Vec<QuarantineId>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.start_quarantine_admin(|| worker::spawn_purge(ids));
+    }
+
+    fn start_quarantine_admin(&mut self, spawn: impl FnOnce() -> Receiver<QuarantineAdminEvent>) {
+        if self.quarantine_busy {
+            return;
+        }
+        self.quarantine_admin_rx = Some(spawn());
+        self.quarantine_busy = true;
+    }
+
+    /// Folds one quarantine list/restore/purge result into the state.
+    pub fn apply_quarantine_admin(&mut self, ev: QuarantineAdminEvent) {
+        match ev {
+            QuarantineAdminEvent::Listed(manifests) => self.quarantine = manifests,
+            QuarantineAdminEvent::Restored { id, outcome: RestoreOutcome::Restored } => {
+                self.quarantine.retain(|m| m.id != id);
+                if self.last_restore_failures.as_ref().is_some_and(|(f, _)| *f == id) {
+                    self.last_restore_failures = None;
+                }
+            }
+            QuarantineAdminEvent::Restored { id, outcome: RestoreOutcome::Partial(failures) } => {
+                self.last_restore_failures = Some((id, failures));
+            }
+            QuarantineAdminEvent::Purged(id) => self.quarantine.retain(|m| m.id != id),
+            QuarantineAdminEvent::PurgedAll => {}
+            QuarantineAdminEvent::Failed(msg) => {
+                log::error!("{msg}");
+                self.warnings.push(msg);
+            }
+        }
+    }
+
+    /// Applies every quarantine list/restore/purge result waiting on the channel.
+    fn drain_quarantine_admin(&mut self) {
+        let Some(rx) = self.quarantine_admin_rx.take() else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => self.apply_quarantine_admin(ev),
+                Err(TryRecvError::Empty) => {
+                    self.quarantine_admin_rx = Some(rx);
+                    return;
+                }
+                // The worker sends `Failed` itself when it panics, so a disconnect just means done.
+                Err(TryRecvError::Disconnected) => {
+                    self.quarantine_busy = false;
                     return;
                 }
             }
@@ -456,7 +561,13 @@ impl eframe::App for StaleApp {
         self.drain_uninstall_events();
         self.drain_quarantine_events();
         self.drain_leftover_scan();
-        if self.scanning || self.queue_running() || self.removal_running() || self.leftover_search_running() {
+        self.drain_quarantine_admin();
+        if self.scanning
+            || self.queue_running()
+            || self.removal_running()
+            || self.leftover_search_running()
+            || self.quarantine_busy
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -492,10 +603,7 @@ impl eframe::App for StaleApp {
             match self.view {
                 View::Programs => {}
                 View::Leftovers => return leftovers_view::show(ui, self),
-                View::Quarantine => {
-                    ui.label(strings::VIEW_PENDING);
-                    return;
-                }
+                View::Quarantine => return quarantine_view::show(ui, self),
             }
             if self.rows.is_empty() {
                 if !self.scanning {
@@ -513,8 +621,11 @@ impl eframe::App for StaleApp {
 
 #[cfg(test)]
 mod tests {
+    use stale_core::quarantine::{Failure, QuarantineId, RestoreOutcome};
     use stale_core::usage::matching::LastUsed;
     use stale_core::{Hive, RegKeyPath, Scope};
+
+    use crate::worker::QuarantineAdminEvent;
 
     use super::*;
 
@@ -721,4 +832,82 @@ mod tests {
         app.remove_checked_leftovers();
         assert!(app.quarantine_rx.is_none());
     }
+
+    fn manifest(id: &str) -> QuarantineManifest {
+        QuarantineManifest {
+            id: QuarantineId(id.to_string()),
+            program_name: format!("App {id}"),
+            created: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
+            moved: vec![],
+            keys: vec![],
+            values: vec![],
+            services: vec![],
+            tasks: vec![],
+            failures: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn quarantine_list_event_replaces_rows() {
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_quarantine_admin(QuarantineAdminEvent::Listed(vec![manifest("a"), manifest("b")]));
+        assert_eq!(app.quarantine, vec![manifest("a"), manifest("b")]);
+        app.apply_quarantine_admin(QuarantineAdminEvent::Listed(vec![manifest("c")]));
+        assert_eq!(app.quarantine, vec![manifest("c")]);
+        app.apply_quarantine_admin(QuarantineAdminEvent::Failed("nope".into()));
+        assert_eq!(app.quarantine, vec![manifest("c")], "a failure keeps the rows");
+        assert_eq!(app.warnings, vec!["nope".to_string()]);
+    }
+
+    #[test]
+    fn restored_entry_is_removed_from_list_when_fully_restored_and_kept_when_partial() {
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_quarantine_admin(QuarantineAdminEvent::Listed(vec![manifest("a"), manifest("b"), manifest("c")]));
+
+        let failures = vec![Failure { what: r"C:\Apps\B".into(), error: "occupied".into() }];
+        app.apply_quarantine_admin(QuarantineAdminEvent::Restored {
+            id: QuarantineId("b".into()),
+            outcome: RestoreOutcome::Partial(failures.clone()),
+        });
+        assert_eq!(app.quarantine.len(), 3, "partially restored entry is kept");
+        assert_eq!(app.last_restore_failures, Some((QuarantineId("b".into()), failures)));
+
+        app.apply_quarantine_admin(QuarantineAdminEvent::Restored {
+            id: QuarantineId("b".into()),
+            outcome: RestoreOutcome::Restored,
+        });
+        assert_eq!(app.quarantine, vec![manifest("a"), manifest("c")]);
+        assert_eq!(app.last_restore_failures, None, "its failures are gone with it");
+
+        app.apply_quarantine_admin(QuarantineAdminEvent::Purged(QuarantineId("a".into())));
+        app.apply_quarantine_admin(QuarantineAdminEvent::PurgedAll);
+        assert_eq!(app.quarantine, vec![manifest("c")]);
+    }
+
+    #[test]
+    fn quarantine_days_setting_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings::default());
+        app.set_quarantine_days_at(7, &path);
+        assert_eq!(app.settings.quarantine_days, 7);
+        assert_eq!(Settings::load_from(&path).quarantine_days, 7);
+    }
+
+    #[test]
+    fn quarantine_admin_disconnect_clears_busy() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = StaleApp::empty(Settings::default());
+        app.quarantine_admin_rx = Some(rx);
+        app.quarantine_busy = true;
+        tx.send(QuarantineAdminEvent::Listed(vec![manifest("a")])).unwrap();
+        app.drain_quarantine_admin();
+        assert!(app.quarantine_busy && app.quarantine_admin_rx.is_some(), "still running");
+        drop(tx);
+        app.drain_quarantine_admin();
+        assert!(!app.quarantine_busy && app.quarantine_admin_rx.is_none());
+        assert_eq!(app.quarantine.len(), 1);
+    }
 }
+

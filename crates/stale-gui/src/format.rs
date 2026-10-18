@@ -1,5 +1,7 @@
 //! Swedish display formatting of dates and sizes (no egui).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use stale_core::usage::UsageSource;
 
@@ -43,6 +45,15 @@ pub fn human_size(bytes: Option<u64>) -> String {
         let gb = format!("{:.1}", bytes as f64 / GIB as f64).replace('.', ",");
         format!("{gb} {}", strings::GB)
     }
+}
+
+/// "C: 38 MB · D: 41 MB"; "0 MB" when nothing is held on any drive.
+pub fn drive_sizes(per_drive: &BTreeMap<char, u64>) -> String {
+    if per_drive.is_empty() {
+        return human_size(Some(0));
+    }
+    let parts: Vec<String> = per_drive.iter().map(|(d, &b)| format!("{d}: {}", human_size(Some(b)))).collect();
+    parts.join(strings::LIST_SEPARATOR)
 }
 
 /// "2024-01-20" or "–".
@@ -128,6 +139,13 @@ mod tests {
         assert_eq!(source_label(UsageSource::Bam), "BAM");
         assert_eq!(source_label(UsageSource::UserAssist), "UserAssist");
         assert_eq!(source_label(UsageSource::FileTime), "filtid");
+    }
+
+    #[test]
+    fn drive_sizes_lists_each_drive() {
+        let per = BTreeMap::from([('D', 41 * 1024 * 1024), ('C', 38 * 1024 * 1024)]);
+        assert_eq!(drive_sizes(&per), "C: 38 MB · D: 41 MB");
+        assert_eq!(drive_sizes(&BTreeMap::new()), "0 MB");
     }
 
     #[test]

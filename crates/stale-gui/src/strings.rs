@@ -45,10 +45,15 @@ pub const YEARS_AGO: &str = "år sedan";
 pub const MB: &str = "MB";
 pub const GB: &str = "GB";
 pub const UNKNOWN_VALUE: &str = "–";
+/// Between items on one line: "C: 38 MB · D: 41 MB".
+pub const LIST_SEPARATOR: &str = " · ";
 
 // Settings menu
 pub const SETTINGS_MENU: &str = "⚙";
 pub const SHOW_HIDDEN: &str = "Visa dolda poster";
+pub const AUTO_PURGE_DAYS: &str = "Töm karantän automatiskt efter N dagar";
+/// Next to the auto-purge days when they are 0.
+pub const AUTO_PURGE_OFF: &str = "(av)";
 
 // Details panel
 pub const NO_SELECTION: &str = "Inget program valt";
@@ -104,9 +109,6 @@ pub const SHOW_LEFTOVERS: &str = "Visa rester";
 pub const RETRY: &str = "Försök igen";
 pub const CLOSE: &str = "Stäng";
 
-// Views
-pub const VIEW_PENDING: &str = "Vyn kommer i nästa steg";
-
 // Leftovers view
 pub const LEFTOVERS_TITLE: &str = "Rester";
 pub const BACK_TO_PROGRAMS: &str = "Till programlistan";
@@ -153,3 +155,37 @@ pub const SEARCH: &str = "Sök";
 pub const SEARCHING: &str = "Söker rester…";
 pub const LEFTOVER_SCAN_THREAD_FAILED: &str = "Kunde inte starta sökningen efter rester";
 pub const LEFTOVER_SCAN_ABORTED: &str = "Sökningen efter rester avbröts oväntat – se loggfilen";
+
+// Quarantine view
+pub const QUARANTINE: &str = "Karantän";
+
+/// The toolbar's quarantine button: "Karantän", or "Karantän (3)" when it holds anything.
+pub fn quarantine_button(count: usize) -> String {
+    if count == 0 { QUARANTINE.to_string() } else { format!("{QUARANTINE} ({count})") }
+}
+
+pub const QUARANTINE_TITLE: &str = "Karantän";
+pub const QUARANTINE_EMPTY: &str = "Karantänen är tom";
+pub const PURGE_ALL: &str = "Töm karantän";
+pub const PURGE: &str = "Töm";
+pub const COL_PROGRAM: &str = "Program";
+pub const COL_DATE: &str = "Datum";
+pub const COL_STATUS: &str = "Status";
+pub const STATUS_OK: &str = "ok";
+pub const RESTORE: &str = "Ångra";
+pub const PURGE_ONE: &str = "Ta bort permanent";
+pub const RESTORE_PARTIAL: &str = "Delvis återställt – följande kunde inte återställas:";
+pub const QUARANTINE_ENTRY_MISSING: &str = "Karantänposten finns inte längre";
+pub const PURGE_FAILED: &str = "Kunde inte ta bort karantänposten permanent";
+pub const QUARANTINE_ADMIN_THREAD_FAILED: &str = "Kunde inte starta karantänåtgärden";
+pub const QUARANTINE_ADMIN_ABORTED: &str = "Karantänåtgärden avbröts oväntat – se loggfilen";
+
+/// The "Töm karantän" confirmation.
+pub fn purge_all_confirm(size: &str) -> String {
+    format!("Detta frigör {size} och kan inte ångras.")
+}
+
+/// A quarantine's status column: "2 fel".
+pub fn error_count(n: usize) -> String {
+    format!("{n} fel")
+}

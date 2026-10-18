@@ -1,13 +1,16 @@
-//! Runs the scan and the uninstall queue on background threads.
+//! Runs the scan, the uninstall queue and quarantine work on background threads.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use chrono::Utc;
 use stale_core::leftovers::{scan_leftovers, Leftover, LeftoverReport, LeftoverSources, ProgramHint};
-use stale_core::quarantine::{quarantine, QuarantineManifest, QuarantineOps, QuarantineProgress};
+use stale_core::quarantine::{
+    list_trusted_manifests, purge, quarantine, restore, QuarantineId, QuarantineManifest, QuarantineOps,
+    QuarantineProgress, RestoreOutcome,
+};
 use stale_core::scan::{run_scan, ScanEvent, ScanSources};
 use stale_core::uninstall::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
@@ -93,6 +96,97 @@ pub fn spawn_quarantine(batches: Vec<(String, Vec<Leftover>)>) -> Receiver<Quara
         let _ = fallback.send(QuarantineEvent::Failed(format!("{}: {e}", strings::QUARANTINE_THREAD_FAILED)));
     }
     rx
+}
+
+/// Results of listing, restoring and purging quarantines.
+#[derive(Clone, Debug)]
+pub enum QuarantineAdminEvent {
+    /// Every trusted quarantine, newest first.
+    Listed(Vec<QuarantineManifest>),
+    Restored { id: QuarantineId, outcome: RestoreOutcome },
+    Purged(QuarantineId),
+    /// Sent after the last `Purged` of a purge.
+    PurgedAll,
+    Failed(String),
+}
+
+/// Runs `job` with live quarantine ops on the "stale-quarantine-admin" thread.
+fn spawn_quarantine_admin<F>(job: F) -> Receiver<QuarantineAdminEvent>
+where
+    F: FnOnce(&QuarantineOps, &Sender<QuarantineAdminEvent>) + Send + 'static,
+{
+    let (tx, rx) = channel();
+    let fallback = tx.clone();
+    let spawned = std::thread::Builder::new().name("stale-quarantine-admin".into()).spawn(move || {
+        // Built here, not on the UI thread: it creates and locks down folders.
+        let run = catch_unwind(AssertUnwindSafe(|| job(&QuarantineOps::live(), &tx)));
+        if run.is_err() {
+            // The panic hook has logged the details.
+            let _ = tx.send(QuarantineAdminEvent::Failed(strings::QUARANTINE_ADMIN_ABORTED.to_string()));
+        }
+    });
+    if let Err(e) = spawned {
+        log::error!("could not spawn quarantine admin thread: {e}");
+        let _ = fallback.send(QuarantineAdminEvent::Failed(format!("{}: {e}", strings::QUARANTINE_ADMIN_THREAD_FAILED)));
+    }
+    rx
+}
+
+/// Quarantines whose folders are owned by Administrators or SYSTEM.
+fn trusted_manifests(ops: &QuarantineOps) -> Vec<QuarantineManifest> {
+    list_trusted_manifests(&ops.manifest_dir, &*ops.trusted_dir)
+}
+
+fn find_manifest(ops: &QuarantineOps, id: &QuarantineId) -> Option<QuarantineManifest> {
+    trusted_manifests(ops).into_iter().find(|m| &m.id == id)
+}
+
+/// Lists the quarantines.
+pub fn spawn_quarantine_list() -> Receiver<QuarantineAdminEvent> {
+    spawn_quarantine_admin(|ops, tx| {
+        let _ = tx.send(QuarantineAdminEvent::Listed(trusted_manifests(ops)));
+    })
+}
+
+/// Restores quarantine `id`, then sends the fresh list.
+pub fn spawn_restore(id: QuarantineId) -> Receiver<QuarantineAdminEvent> {
+    spawn_quarantine_admin(move |ops, tx| {
+        let ev = match find_manifest(ops, &id) {
+            Some(m) => {
+                let outcome = restore(ops, &m);
+                log::info!("restore of quarantine {}: {outcome:?}", id.0);
+                QuarantineAdminEvent::Restored { id, outcome }
+            }
+            None => QuarantineAdminEvent::Failed(format!("{}: {}", strings::QUARANTINE_ENTRY_MISSING, id.0)),
+        };
+        let _ = tx.send(ev);
+        let _ = tx.send(QuarantineAdminEvent::Listed(trusted_manifests(ops)));
+    })
+}
+
+/// Purges each of `ids` (`Purged` or `Failed` per id), then sends `PurgedAll` and the fresh list.
+pub fn spawn_purge(ids: Vec<QuarantineId>) -> Receiver<QuarantineAdminEvent> {
+    spawn_quarantine_admin(move |ops, tx| {
+        let manifests = trusted_manifests(ops);
+        for id in ids {
+            let ev = match manifests.iter().find(|m| m.id == id) {
+                Some(m) => match purge(ops, m) {
+                    Ok(()) => {
+                        log::info!("purged quarantine {}", id.0);
+                        QuarantineAdminEvent::Purged(id)
+                    }
+                    Err(e) => {
+                        log::warn!("purge of quarantine {}: {e}", id.0);
+                        QuarantineAdminEvent::Failed(format!("{} ({}): {e}", strings::PURGE_FAILED, m.program_name))
+                    }
+                },
+                None => QuarantineAdminEvent::Failed(format!("{}: {}", strings::QUARANTINE_ENTRY_MISSING, id.0)),
+            };
+            let _ = tx.send(ev);
+        }
+        let _ = tx.send(QuarantineAdminEvent::PurgedAll);
+        let _ = tx.send(QuarantineAdminEvent::Listed(trusted_manifests(ops)));
+    })
 }
 
 /// Result of a standalone leftover search.

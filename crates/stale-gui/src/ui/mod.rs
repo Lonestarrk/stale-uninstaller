@@ -5,6 +5,7 @@ use eframe::egui;
 pub mod details;
 pub mod filter_panel;
 pub mod leftovers_view;
+pub mod quarantine_view;
 pub mod table;
 pub mod toolbar;
 pub mod uninstall_dialog;

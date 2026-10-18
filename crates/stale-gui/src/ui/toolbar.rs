@@ -1,4 +1,4 @@
-//! Action buttons, scan progress and the search box.
+//! Action buttons, the settings menu, scan progress and the search box.
 
 use eframe::egui;
 use stale_core::uninstall::UninstallMode;
@@ -19,17 +19,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         if ui.add_enabled(can_search, egui::Button::new(strings::FIND_LEFTOVERS)).clicked() {
             app.search = Some(SearchDialog::default());
         }
+        // Leaving the leftovers view waits for a running removal, like its own back button.
+        let quarantine = strings::quarantine_button(app.quarantine.len());
+        if ui.add_enabled(!app.removal_running(), egui::Button::new(quarantine)).clicked() {
+            app.show_quarantine();
+        }
         // One scan at a time: refreshing waits for the running scan to finish.
         if ui.add_enabled(!app.scanning, egui::Button::new(strings::REFRESH)).clicked() {
             app.refresh();
         }
         let mut show_hidden = app.settings.show_hidden;
         let mut toggled = false;
+        let mut days = app.settings.quarantine_days;
         ui.menu_button(strings::SETTINGS_MENU, |ui| {
             toggled = ui.checkbox(&mut show_hidden, strings::SHOW_HIDDEN).changed();
+            ui.horizontal(|ui| {
+                ui.label(strings::AUTO_PURGE_DAYS);
+                ui.add(egui::DragValue::new(&mut days).range(0..=365));
+                if days == 0 {
+                    ui.label(strings::AUTO_PURGE_OFF);
+                }
+            });
         });
         if toggled {
             app.toggle_show_hidden();
+        }
+        if days != app.settings.quarantine_days {
+            app.set_quarantine_days(days);
         }
         if app.scanning {
             ui.spinner();
