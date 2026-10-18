@@ -286,6 +286,7 @@ mod tests {
     fn from_program_copies_fields() {
         let key = RegKeyPath { hive: Hive::LocalMachine, path: r"Software\X".into() };
         let p = Program {
+            account: None,
             id: ProgramId("id".into()),
             key: key.clone(),
             name: "Foo".into(),
@@ -314,6 +315,7 @@ mod tests {
 
     fn other(id: &str, install: Option<&str>, icon: Option<&str>, uninstall: Option<&str>, hidden: bool) -> Program {
         Program {
+            account: None,
             id: ProgramId(id.into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"Software\{id}") },
             name: id.into(),

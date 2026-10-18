@@ -344,6 +344,7 @@ mod tests {
 
     fn prog(id: &str, install: Option<&str>) -> Program {
         Program {
+            account: None,
             id: ProgramId(id.to_string()),
             key: key(Hive::LocalMachine, id),
             name: id.to_string(),

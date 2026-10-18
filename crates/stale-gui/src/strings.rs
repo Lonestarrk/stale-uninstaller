@@ -83,6 +83,18 @@ pub const SOURCE_FILETIME: &str = "filtid";
 pub const UNINSTALL_THREAD_FAILED: &str = "Kunde inte starta avinstallationen";
 pub const QUEUE_ABORTED: &str = "Avinstallationen avbröts oväntat – se loggfilen";
 pub const QUEUE_TITLE: &str = "Avinstallera";
+pub const OTHER_ACCOUNT_QUEUE: &str = "Program från andra konton avinstalleras med dina administratörsrättigheter; kontrollera avinstallerarens sökväg nedan.";
+pub const UNKNOWN_ACCOUNT: &str = "okänt konto";
+
+/// Start-up warning: the elevated token's account differs from the logged-in user.
+pub fn other_account_warning(session: &str, token: &str) -> String {
+    format!("Du kör som {token} men är inloggad som {session}: per-användarprogram och AppData avser {token}.")
+}
+
+/// A queue item belonging to another account; `account` is `None` when it could not be resolved.
+pub fn other_account_item(name: &str, account: Option<&str>) -> String {
+    format!("{name} (konto: {})", account.unwrap_or(UNKNOWN_ACCOUNT))
+}
 pub const OPT_RESTORE_POINT: &str = "Skapa återställningspunkt för hela omgången";
 pub const OPT_RUN_VENDOR: &str = "Kör programmens egna avinstallerare";
 pub const CANCEL: &str = "Avbryt";
@@ -269,6 +281,16 @@ mod tests {
         assert_eq!(core_error("unknown-content-left"), UNKNOWN_CONTENT_LEFT);
         assert_eq!(core_error("something else"), "something else");
         assert_eq!(incomplete_count(2), "2 ofullständiga");
+    }
+
+    #[test]
+    fn other_account_warning_text_is_swedish() {
+        assert_eq!(
+            other_account_warning(r"PC\jimmy", r"PC\admin"),
+            r"Du kör som PC\admin men är inloggad som PC\jimmy: per-användarprogram och AppData avser PC\admin."
+        );
+        assert_eq!(other_account_item("Foo", Some(r"PC\anna")), r"Foo (konto: PC\anna)");
+        assert_eq!(other_account_item("Foo", None), "Foo (konto: okänt konto)");
     }
 
     #[test]

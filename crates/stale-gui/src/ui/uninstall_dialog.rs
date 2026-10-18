@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 use stale_core::uninstall::{RestorePointStatus, UninstallMode};
-use stale_core::ProgramId;
+use stale_core::{ProgramId, Scope};
 
 use crate::app::{PendingQueue, StaleApp, View};
 use crate::flow::{FlowState, ItemState, Step};
@@ -28,11 +28,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]);
     let mut action = None;
     if let Some(pending) = app.pending.as_mut() {
-        let rows = &app.rows;
-        window.show(&ctx, |ui| {
-            let name = |id: &ProgramId| rows.iter().find(|r| &r.program.id == id).map(|r| r.program.name.as_str());
-            action = summary(ui, pending, name);
-        });
+        window.show(&ctx, |ui| action = summary(ui, pending));
     } else if let (Some(flow), View::Programs) = (app.flow.as_ref(), app.view) {
         let can_requeue = !app.scanning;
         window.show(&ctx, |ui| action = progress(ui, flow, can_requeue));
@@ -54,16 +50,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 }
 
 /// The summary before starting: names, options, Avbryt / Starta.
-fn summary<'a>(
-    ui: &mut egui::Ui,
-    pending: &mut PendingQueue,
-    name: impl Fn(&ProgramId) -> Option<&'a str>,
-) -> Option<Action> {
+fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-        for id in &pending.ids {
-            ui.label(name(id).unwrap_or(&id.0));
+        for entry in &pending.entries {
+            if entry.scope == Scope::OtherUser {
+                ui.label(strings::other_account_item(&entry.name, entry.account.as_deref()));
+                ui.weak(entry.uninstall_path.as_deref().unwrap_or(strings::UNKNOWN_VALUE));
+            } else {
+                ui.label(&entry.name);
+            }
         }
     });
+    if pending.entries.iter().any(|e| e.scope == Scope::OtherUser) {
+        ui.separator();
+        ui.label(strings::OTHER_ACCOUNT_QUEUE);
+    }
     ui.separator();
     ui.checkbox(&mut pending.restore_point, strings::OPT_RESTORE_POINT);
     let normal = pending.mode == UninstallMode::Normal;

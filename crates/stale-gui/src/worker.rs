@@ -291,6 +291,7 @@ mod tests {
     #[test]
     fn hint_with_others_counts_every_listed_program() {
         let program = Program {
+            account: None,
             id: ProgramId("x".into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: r"Software\X".into() },
             name: "X".into(),

@@ -241,6 +241,7 @@ mod tests {
 
     fn program(name: &str, install: Option<&str>, hidden: bool) -> Program {
         Program {
+            account: None,
             id: ProgramId(name.into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"Software\{name}") },
             name: name.into(),

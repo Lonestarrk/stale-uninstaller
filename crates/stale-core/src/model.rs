@@ -45,4 +45,7 @@ pub struct Program {
     pub drive: Option<char>,
     pub hidden: bool,
     pub scope: Scope,
+    /// Account (DOMAIN, backslash, name) owning the hive of a `Scope::OtherUser` program, when resolved.
+    #[serde(default)]
+    pub account: Option<String>,
 }

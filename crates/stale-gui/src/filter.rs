@@ -208,6 +208,7 @@ mod tests {
     fn row(name: &str, days_ago: Option<i64>) -> Row {
         Row {
             program: Program {
+                account: None,
                 id: ProgramId(name.to_string()),
                 key: RegKeyPath { hive: Hive::LocalMachine, path: name.to_string() },
                 name: name.to_string(),

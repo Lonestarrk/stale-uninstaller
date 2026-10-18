@@ -12,10 +12,12 @@ use eframe::egui;
 use stale_core::leftovers::ProgramHint;
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
+use stale_core::session;
 use stale_core::settings::Settings;
 use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
 use stale_core::usage::matching::ProgramUsage;
-use stale_core::{Program, ProgramId};
+use stale_core::pathutil::first_path_in_command;
+use stale_core::{Program, ProgramId, Scope};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
@@ -50,10 +52,23 @@ pub enum View {
     Quarantine,
 }
 
+/// One queued program as the summary dialog shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueEntry {
+    pub name: String,
+    pub scope: Scope,
+    /// Owning account of an `OtherUser` program, when resolved.
+    pub account: Option<String>,
+    /// The program's uninstaller executable, from its uninstall command.
+    pub uninstall_path: Option<String>,
+}
+
 /// The summary dialog's state before a queue starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingQueue {
     pub ids: Vec<ProgramId>,
+    /// What the summary shows per id (same order), so the dialog does not look the programs up.
+    pub entries: Vec<QueueEntry>,
     pub mode: UninstallMode,
     pub restore_point: bool,
     pub run_vendor: bool,
@@ -118,6 +133,10 @@ impl StaleApp {
     /// Loads settings and starts the background scan.
     pub fn new(_cc: &eframe::CreationContext) -> Self {
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
+        let id = session::identity();
+        if session::runs_as_other_account(&id) {
+            app.warnings.push(strings::other_account_warning(id.session_user.as_deref().unwrap_or_default(), &id.token_user));
+        }
         app.rx = Some(worker::spawn_scan());
         app.scanning = true;
         // For the toolbar's count.
@@ -271,8 +290,25 @@ impl StaleApp {
         if ids.is_empty() {
             return;
         }
+        let entries = ids
+            .iter()
+            .map(|id| match self.rows.iter().find(|r| &r.program.id == id) {
+                Some(r) => QueueEntry {
+                    name: r.program.name.clone(),
+                    scope: r.program.scope,
+                    account: r.program.account.clone(),
+                    uninstall_path: r
+                        .program
+                        .uninstall_string
+                        .as_deref()
+                        .and_then(first_path_in_command)
+                        .map(|p| p.display().to_string()),
+                },
+                None => QueueEntry { name: id.0.clone(), scope: Scope::Machine, account: None, uninstall_path: None },
+            })
+            .collect();
         self.pending =
-            Some(PendingQueue { ids, mode, restore_point: true, run_vendor: mode == UninstallMode::Normal });
+            Some(PendingQueue { ids, entries, mode, restore_point: true, run_vendor: mode == UninstallMode::Normal });
     }
 
     /// True while a queue has been started and has not finished.
@@ -671,6 +707,7 @@ mod tests {
 
     fn program(id: &str, hidden: bool) -> Program {
         Program {
+            account: None,
             id: ProgramId(id.to_string()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: id.to_string() },
             name: format!("App {id}"),
@@ -809,6 +846,23 @@ mod tests {
         assert_eq!(pending.ids, vec![ProgramId("keep".into())]);
         assert_eq!(pending.mode, UninstallMode::Normal);
         assert!(pending.restore_point && pending.run_vendor);
+    }
+
+    #[test]
+    fn pending_queue_carries_scope_and_account() {
+        let mut app = StaleApp::empty(Settings::default());
+        let mut other = program("o", false);
+        other.scope = Scope::OtherUser;
+        other.account = Some(r"PC\anna".into());
+        other.uninstall_string = Some(r#""C:\Users\anna\AppData\Local\X\unins000.exe" /S"#.into());
+        app.apply_event(ScanEvent::Programs(vec![program("m", false), other]));
+        app.open_queue_dialog_for(vec![ProgramId("m".into()), ProgramId("o".into())], UninstallMode::Normal);
+        let entries = app.pending.expect("dialog opened").entries;
+        assert_eq!((entries[0].scope, entries[0].account.as_deref(), entries[0].uninstall_path.as_deref()), (Scope::Machine, None, None));
+        assert_eq!(entries[1].name, "App o");
+        assert_eq!(entries[1].scope, Scope::OtherUser);
+        assert_eq!(entries[1].account.as_deref(), Some(r"PC\anna"));
+        assert_eq!(entries[1].uninstall_path.as_deref(), Some(r"C:\Users\anna\AppData\Local\X\unins000.exe"));
     }
 
     #[test]

@@ -22,14 +22,70 @@ const USER_UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninsta
 /// Never fails; unreadable roots or keys are skipped. Besides the machine and current-user
 /// roots, reads every other loaded user hive under `HKU` (`Scope::OtherUser`).
 pub fn enumerate_programs(reg: &dyn RegistryReader) -> Vec<Program> {
+    enumerate_programs_with(reg, &live_account_lookup)
+}
+
+/// As `enumerate_programs`, with `sid_to_account` naming the owner of each other user's hive.
+pub(crate) fn enumerate_programs_with(
+    reg: &dyn RegistryReader,
+    sid_to_account: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Program> {
     let mut programs = Vec::new();
     for (hive, root, scope) in UNINSTALL_ROOTS {
         read_root(reg, hive, root, scope, &mut programs);
     }
     for sid in other_user_sids(reg) {
+        let first = programs.len();
         read_root(reg, Hive::Users, &format!(r"{sid}\{USER_UNINSTALL}"), Scope::OtherUser, &mut programs);
+        if programs.len() > first {
+            let account = sid_to_account(&sid);
+            for p in &mut programs[first..] {
+                p.account = account.clone();
+            }
+        }
     }
     programs
+}
+
+/// `DOMAIN\name` of the account with this SID string, via `LookupAccountSidW`.
+fn live_account_lookup(sid: &str) -> Option<String> {
+    use windows::core::{HSTRING, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
+
+    let mut psid = PSID::default();
+    // SAFETY: `psid` receives a LocalAlloc'd SID that is freed below; the lookup buffers are sized
+    // by the first call and `LookupAccountSidW` writes at most the lengths given.
+    unsafe {
+        ConvertStringSidToSidW(&HSTRING::from(sid), &mut psid).ok()?;
+        let (mut name_len, mut domain_len) = (0u32, 0u32);
+        let mut kind = SID_NAME_USE::default();
+        let _ = LookupAccountSidW(None, psid, None, &mut name_len, None, &mut domain_len, &mut kind);
+        let result = if name_len == 0 {
+            None
+        } else {
+            let mut name = vec![0u16; name_len as usize];
+            let mut domain = vec![0u16; domain_len.max(1) as usize];
+            LookupAccountSidW(
+                None,
+                psid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut kind,
+            )
+            .ok()
+            .map(|()| {
+                let name = String::from_utf16_lossy(&name[..name_len as usize]);
+                let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+                if domain.is_empty() { name } else { format!(r"{domain}\{name}") }
+            })
+        };
+        let _ = LocalFree(Some(HLOCAL(psid.0)));
+        result
+    }
 }
 
 fn read_root(reg: &dyn RegistryReader, hive: Hive, root: &str, scope: Scope, out: &mut Vec<Program>) {
@@ -132,6 +188,7 @@ pub fn program_from_values(
     };
 
     Some(Program {
+        account: None,
         id: ProgramId(format!(r"{:?}\{}", key.hive, key.path)),
         name: display_name.unwrap_or(leaf),
         publisher: string(values, "Publisher"),
@@ -315,6 +372,20 @@ mod tests {
         assert_eq!(progs[0].scope, Scope::Machine);
         assert_eq!(progs[1].scope, Scope::CurrentUser);
         assert_ne!(progs[0].id, progs[1].id);
+    }
+
+    #[test]
+    fn other_user_program_gets_account_name() {
+        let mut reg = FakeRegistry::new();
+        reg.set(key(Hive::Users, &format!(r"S-1-5-21-2\{USER_UNINSTALL}\B")), "DisplayName", Str("B".into()));
+        reg.set(key(Hive::Users, &format!(r"S-1-5-21-3\{USER_UNINSTALL}\C")), "DisplayName", Str("C".into()));
+        let lookup = |sid: &str| (sid == "S-1-5-21-2").then(|| r"PC\anna".to_string());
+        let progs = enumerate_programs_with(&reg, &lookup);
+        assert_eq!(progs.len(), 2);
+        assert_eq!(progs[0].account.as_deref(), Some(r"PC\anna"));
+        assert_eq!(progs[1].account, None);
+        let machine = program_from_values(k("M"), Scope::Machine, &vals(&[("DisplayName", Str("M".into()))])).unwrap();
+        assert_eq!(machine.account, None);
     }
 
     #[test]

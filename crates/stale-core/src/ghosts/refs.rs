@@ -281,6 +281,7 @@ mod tests {
     #[test]
     fn installed_target_is_not_evidence() {
         let p = Program {
+            account: None,
             id: ProgramId("Suite".into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: r"Software\Suite".into() },
             name: "Suite".into(),

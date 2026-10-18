@@ -384,6 +384,7 @@ mod tests {
 
     fn program(leaf: &str, uninstall: Option<&str>, is_msi: bool, install: Option<&str>) -> Program {
         Program {
+            account: None,
             id: ProgramId(leaf.into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"{UNINSTALL}\{leaf}") },
             name: "Foo".into(),

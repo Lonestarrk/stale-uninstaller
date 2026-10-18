@@ -140,6 +140,7 @@ mod tests {
 
     fn program(name: &str, uninstall: Option<&str>) -> Program {
         Program {
+            account: None,
             id: ProgramId(name.into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"{UNINSTALL}\{name}") },
             name: name.into(),

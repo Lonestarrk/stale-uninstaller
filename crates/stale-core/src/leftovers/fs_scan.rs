@@ -325,6 +325,7 @@ mod tests {
     fn installed(id: &str, name: &str, install: &str) -> crate::model::Program {
         use crate::model::{Hive, Program, ProgramId, RegKeyPath, Scope};
         Program {
+            account: None,
             id: ProgramId(id.into()),
             key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"Software\{id}") },
             name: name.into(),
