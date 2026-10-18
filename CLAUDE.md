@@ -30,3 +30,8 @@ Stale Uninstaller is a Windows 10/11 x64 uninstaller (toolchain `stable-x86_64-p
 - `crates/stale-gui` (bin `StaleUninstaller`): eframe 0.37 front end. The `App` trait here is `logic()` (channel draining) + `ui()` (drawing), not `update()`. Unit tests live in the lib target (`src/lib.rs`) because the embedded admin manifest blocks the bin's test harness. All user-visible strings are Swedish and live in `src/strings.rs`; `filter.rs`/`format.rs`/`flow.rs`/`leftover_sel.rs`/`ghost_sel.rs` are pure and tested. Views: program list, leftovers, quarantine, ghosts (`View` enum); every long operation runs on a named worker thread in `worker.rs` and reports over an mpsc channel.
 
 Persistent data goes under `%ProgramData%\Stale Uninstaller\` (settings.json, important.json, logs\stale.log, quarantine\). The `e2e-overrides` cargo feature (debug builds only; `compile_error!` in release) enables the `STALE_E2E_*` env overrides used by `examples/e2e.rs` — never enable it for `stale-gui`. Add dependencies with `cargo add -p <crate> <dep>`. Design spec is in `docs/design/`, implementation plans in `docs/plans/`; research notes and e2e logs in `docs/research/`.
+
+## Conventions
+
+- Keep `README.md` up to date: whenever a change adds, removes or changes a user-visible feature, update its Features / Future features lists in the same commit. The README holds only a short description, features, future features, build instructions and the license — no status, plans or roadmap tables.
+- Documentation is tool-neutral: design docs in `docs/design/`, implementation plans in `docs/plans/`, research and test logs in `docs/research/`. `.superpowers/` is local scratch and gitignored.
