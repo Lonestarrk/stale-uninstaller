@@ -5,10 +5,10 @@ use super::{format_location, Collected, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
 use crate::leftovers::names::name_matches_exact;
-use crate::leftovers::reg_scan::{child, default_string, path_in_value, string_value, RegScanRoots};
+use crate::leftovers::reg_scan::{child, command_arguments, default_string, path_in_value, string_value, RegScanRoots};
 use crate::leftovers::system_root_norm;
 use crate::model::RegKeyPath;
-use crate::pathutil::{drive_letter, first_path_in_command, is_shared_root, norm, normed_under};
+use crate::pathutil::{drive_letter, expand_env, first_path_in_command, is_shared_root, norm, normed_under};
 use crate::registry::RegistryReader;
 use std::path::{Path, PathBuf};
 
@@ -210,16 +210,13 @@ fn rundll32_dll(cmd: &str) -> Option<PathBuf> {
     if !exe.file_stem()?.to_string_lossy().eq_ignore_ascii_case("rundll32") {
         return None;
     }
-    let lower = cmd.to_ascii_lowercase();
-    let mut at = lower.find("rundll32")? + "rundll32".len();
-    if lower[at..].starts_with(".exe") {
-        at += ".exe".len();
-    }
-    let rest = cmd[at..].trim_start_matches('"').trim_start();
+    // What follows the exe path itself (a folder may be named `rundll32` too).
+    let rest = command_arguments(cmd);
     let dll = match rest.strip_prefix('"') {
         Some(quoted) => quoted.split('"').next()?,
         None => rest.split(',').next()?,
     };
+    let dll = expand_env(dll.trim());
     let dll = dll.trim();
     (!dll.is_empty()).then(|| PathBuf::from(dll))
 }
@@ -296,7 +293,6 @@ mod tests {
     use crate::fsys::FakeFs;
     use crate::ghosts::RefKind;
     use crate::model::{Hive, Program, ProgramId, RegKeyPath, Scope};
-    use crate::pathutil::expand_env;
     use crate::registry::{key, FakeRegistry, RegValue};
     use std::path::PathBuf;
 
@@ -553,6 +549,7 @@ mod tests {
 
     #[test]
     fn rundll32_dll_is_live() {
+        let _env = crate::env_lock();
         let mut reg = FakeRegistry::new();
         let run = key(Hive::CurrentUser, RUN);
         let rundll32 = expand_env(r"%SystemRoot%\System32\rundll32.exe");
@@ -568,6 +565,18 @@ mod tests {
         let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
         live.sort();
         assert_eq!(live, vec![r"C:\Vendor Tools\bare.dll", r"C:\Vendor Tools\helper.dll", r"C:\Vendor Tools\quoted.dll"]);
+    }
+
+    #[test]
+    fn rundll32_dll_follows_the_exe_path() {
+        let _env = crate::env_lock();
+        // "rundll32" in a folder name is not where the arguments start.
+        assert_eq!(rundll32_dll(r"C:\Tools\rundll32\rundll32.exe x.dll,Go"), Some(PathBuf::from("x.dll")));
+        assert_eq!(rundll32_dll(r#""C:\Tools\rundll32\rundll32.exe" "C:\A B\y.dll",Go"#), Some(PathBuf::from(r"C:\A B\y.dll")));
+        assert_eq!(rundll32_dll(r"rundll32 C:\Vendor Tools\bare.dll,Go"), Some(PathBuf::from(r"C:\Vendor Tools\bare.dll")));
+        // Variables in the DLL path are expanded.
+        assert_eq!(rundll32_dll(r"rundll32.exe %SystemRoot%\x.dll,Go"), Some(PathBuf::from(expand_env(r"%SystemRoot%\x.dll"))));
+        assert_eq!(rundll32_dll(r"C:\Tools\other.exe x.dll,Go"), None);
     }
 
     #[test]

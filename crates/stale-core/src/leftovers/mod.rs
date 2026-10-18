@@ -175,7 +175,7 @@ fn in_temp_or_installer_cache(dir: &Path) -> bool {
         .strip_prefix(&users)
         .and_then(|r| r.strip_prefix('\\'))
         .is_some_and(|r| r.split('\\').skip(1).take(3).eq(["APPDATA", "LOCAL", "TEMP"]));
-    if profile_temp {
+    if profile_temp || in_profile_temp(&n, profile_roots()) {
         return true;
     }
     let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%LOCALAPPDATA%\Package Cache"];
@@ -189,6 +189,26 @@ fn in_temp_or_installer_cache(dir: &Path) -> bool {
         .chain(std::iter::once(package_cache))
         .any(|r| n == r || normed_under(&n, &r))
         || dir.components().any(|c| INSTALLER_CACHE_NAMES.contains(&c.as_os_str().to_string_lossy().to_lowercase().as_str()))
+}
+
+/// Every profile folder ([`FsReader::profile_dirs`](crate::fsys::FsReader::profile_dirs) and
+/// `%USERPROFILE%`), [`norm`]ed; read once per process.
+fn profile_roots() -> &'static [String] {
+    use crate::fsys::FsReader;
+    static PROFILES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PROFILES.get_or_init(|| {
+        let mut out: Vec<String> = crate::fsys::RealFs.profile_dirs().iter().map(|p| norm(p)).collect();
+        out.extend(std::env::var_os("USERPROFILE").map(|p| norm(Path::new(&p))));
+        out
+    })
+}
+
+/// The [`norm`]ed `n` is at or under `<profile>\AppData\Local\Temp` of one of `profiles`.
+fn in_profile_temp(n: &str, profiles: &[String]) -> bool {
+    profiles.iter().any(|p| {
+        let temp = format!(r"{p}\APPDATA\LOCAL\TEMP");
+        n == temp || normed_under(n, &temp)
+    })
 }
 
 /// `dir` is, holds or lies inside a user folder ([`USER_FOLDERS`]) of `%USERPROFILE%` or of the
@@ -440,6 +460,15 @@ mod tests {
         assert!(!in_temp_or_installer_cache(&users.join("SomeoneElse").join(r"AppData\Local\Programs\Obsidian")));
         assert!(!in_temp_or_installer_cache(&users.join(r"SomeoneElse\Temp")));
         assert!(!in_temp_or_installer_cache(Path::new(r"D:\Apps\AppData\Local\Temp")));
+        // A profile outside the Users folder counts too.
+        let profiles = [norm(Path::new(r"D:\Profiles\Bob"))];
+        assert!(in_profile_temp(&norm(Path::new(r"D:\Profiles\Bob\AppData\Local\Temp\{X}")), &profiles));
+        assert!(in_profile_temp(&norm(Path::new(r"D:\Profiles\Bob\AppData\Local\Temp")), &profiles));
+        assert!(!in_profile_temp(&norm(Path::new(r"D:\Profiles\Bob\AppData\Local\Programs")), &profiles));
+        // Every profile the file system lists is covered.
+        for p in profile_roots() {
+            assert!(in_temp_or_installer_cache(&Path::new(p).join(r"AppData\Local\Temp\x")), "{p}");
+        }
     }
 
     #[test]

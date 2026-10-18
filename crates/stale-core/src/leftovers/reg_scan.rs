@@ -361,7 +361,7 @@ pub fn run_value_exes(reg: &dyn RegistryReader) -> HashSet<String> {
 
 /// What follows the executable in a command line: after the closing quote of a quoted path,
 /// else after the first `.exe`, else after the first space.
-fn command_arguments(cmd: &str) -> &str {
+pub(crate) fn command_arguments(cmd: &str) -> &str {
     let cmd = cmd.trim();
     let end = if let Some(rest) = cmd.strip_prefix('"') {
         rest.find('"').map(|i| i + 2)

@@ -159,19 +159,31 @@ fn shared_folders() -> Vec<String> {
         "%APPDATA%",
         "%USERPROFILE%",
     ];
-    let windows = crate::paths::windows_dir();
-    let system = [windows.clone(), windows.join("System32"), windows.join("SysWOW64"), crate::paths::program_data_dir()];
     VARS.iter()
         .map(|v| expand_env(v))
         .filter(|s| !s.contains('%'))
         .map(|s| norm(Path::new(&s)))
-        .chain(system.iter().map(|p| norm(p)))
+        .chain(system_shared().iter().cloned())
         .collect()
 }
 
-/// The Users folder ([`crate::paths::user_profiles_root`]), normalized.
+/// Windows, its System32 and SysWOW64, and ProgramData ([`norm`]ed), from the system API; read
+/// once per process.
+fn system_shared() -> &'static [String] {
+    static SYSTEM: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        let windows = crate::paths::windows_dir();
+        [windows.clone(), windows.join("System32"), windows.join("SysWOW64"), crate::paths::program_data_dir()]
+            .iter()
+            .map(|p| norm(p))
+            .collect()
+    })
+}
+
+/// The Users folder ([`crate::paths::user_profiles_root`]), normalized; read once per process.
 fn users_root() -> Option<String> {
-    Some(norm(&crate::paths::user_profiles_root())).filter(|n| !n.is_empty())
+    static USERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    Some(USERS.get_or_init(|| norm(&crate::paths::user_profiles_root())).clone()).filter(|n| !n.is_empty())
 }
 
 /// `\Program Files`-style folders (normalized, without drive) that are shared on any drive.
@@ -266,6 +278,14 @@ mod tests {
         assert!(!is_shared_root(Path::new(r"D:\Program Files\Foo")));
         assert!(!is_shared_root(Path::new(r"D:\Program Files\Common Files\Foo")));
         assert!(!is_shared_root(&windows.join("System32").join("Foo")));
+    }
+
+    #[test]
+    fn system_shared_folders_are_read_once() {
+        let (a, b) = (system_shared(), system_shared());
+        assert!(std::ptr::eq(a, b), "cached");
+        assert_eq!(a[0], norm(&crate::paths::windows_dir()));
+        assert_eq!(a.len(), 4);
     }
 
     #[test]
@@ -391,6 +411,28 @@ mod tests {
         assert_eq!(norm(&long_path_name(&long)), norm(&long));
         let missing = tmp.path().join("missing");
         assert_eq!(long_path_name(&missing), missing);
+        // A real 8.3 name, when the volume makes them.
+        let short = short_path_name(&long);
+        if norm(&short) == norm(&long) {
+            eprintln!("no 8.3 names on this volume; short-name case skipped");
+            return;
+        }
+        assert!(short.to_string_lossy().contains('~'), "{}", short.display());
+        assert_eq!(norm(&long_path_name(&short)), norm(&long));
+    }
+
+    /// `GetShortPathNameW`, or `p` itself when it fails.
+    fn short_path_name(p: &Path) -> PathBuf {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let input = HSTRING::from(p.as_os_str());
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `input` is NUL-terminated and `buf` is a valid, writable buffer.
+        let len = unsafe { GetShortPathNameW(&input, Some(&mut buf)) } as usize;
+        if len == 0 || len >= buf.len() {
+            return p.to_path_buf();
+        }
+        PathBuf::from(String::from_utf16_lossy(&buf[..len]))
     }
 
     #[test]
