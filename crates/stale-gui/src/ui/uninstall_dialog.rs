@@ -6,6 +6,7 @@ use eframe::egui;
 use stale_core::uninstall::{RestorePointStatus, UninstallMode};
 use stale_core::{ProgramId, Scope};
 
+use super::STALE_COLOR;
 use crate::app::{PendingQueue, StaleApp, View};
 use crate::flow::{dependencies_acknowledged, FlowState, ItemState, Step};
 use crate::strings;
@@ -56,7 +57,8 @@ fn summary(ui: &mut egui::Ui, pending: &mut PendingQueue) -> Option<Action> {
         for entry in &mut pending.entries {
             if entry.scope == Scope::OtherUser {
                 ui.label(strings::other_account_item(&entry.name, entry.account.as_deref()));
-                ui.weak(entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
+                // Another account's uninstaller runs elevated here: shown plainly, in the warning colour.
+                ui.colored_label(STALE_COLOR, entry.uninstall_path.as_deref().unwrap_or(strings::t().unknown_value));
             } else {
                 ui.label(&entry.name);
             }
