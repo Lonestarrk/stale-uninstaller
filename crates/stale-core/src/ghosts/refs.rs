@@ -7,7 +7,7 @@ use crate::keep::KeepList;
 use crate::leftovers::other_scan::{task_commands, task_files};
 use crate::leftovers::system_root_norm;
 use crate::model::Hive;
-use crate::pathutil::{drive_letter, norm, normed_under};
+use crate::pathutil::{drive_letter, expand_env, norm, normed_under};
 use crate::registry::{key, RegValue, RegistryReader};
 use crate::services::{normalize_image_path_with, SERVICES_ROOT};
 use crate::shortcuts::ShortcutTarget;
@@ -73,8 +73,8 @@ pub fn service_evidence(
 }
 
 /// Win32 services (`Type` 16/32) whose `ImagePath` executable is missing. The existing
-/// `ImagePath` of every service and driver (kernel and file system drivers included) is a live
-/// target.
+/// `ImagePath` of every service and driver (kernel and file system drivers included), and an
+/// existing `Parameters\ServiceDll`, is a live target.
 pub fn service_collect(
     reg: &dyn RegistryReader,
     fs: &dyn FsReader,
@@ -96,6 +96,10 @@ pub fn service_collect(
                 _ => {}
             }
         }
+        // A shared-process service's DLL (`Parameters\ServiceDll`) is loaded as long as it runs.
+        if let Some(dll) = service_dll(reg, &name).filter(|p| g.is_live(p)) {
+            out.live_targets.push(dll);
+        }
         // Unquoted paths with spaces are resolved against the disk, never cut at the first space.
         let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p) && !fs.is_dir(p))) else {
             continue;
@@ -107,6 +111,18 @@ pub fn service_collect(
         }
     }
     out
+}
+
+/// `Services\<name>\Parameters\ServiceDll`, expanded and unquoted.
+fn service_dll(reg: &dyn RegistryReader, name: &str) -> Option<PathBuf> {
+    let values = reg.values(&key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}\Parameters"))).ok()?;
+    let raw = values.into_iter().find_map(|(n, v)| match v {
+        RegValue::Str(s) | RegValue::ExpandStr(s) if n.eq_ignore_ascii_case("ServiceDll") => Some(s),
+        _ => None,
+    })?;
+    let dll = expand_env(raw.trim());
+    let dll = dll.trim().trim_matches('"').trim();
+    (!dll.is_empty()).then(|| PathBuf::from(dll))
 }
 
 /// [`task_collect`]'s evidence.
@@ -289,6 +305,20 @@ mod tests {
             ]
         );
         assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Program Files\ldplayer9box\Ld9BoxSup.sys")]);
+    }
+
+    #[test]
+    fn service_dll_is_live() {
+        let _env = crate::env_lock();
+        let mut reg = FakeRegistry::new();
+        svc_typed(&mut reg, "VendorHost", r"%SystemRoot%\System32\svchost.exe -k vendor", 32);
+        let params = key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\VendorHost\Parameters"));
+        reg.set(params, "ServiceDll", RegValue::ExpandStr(r"C:\Program Files\Vendor\vsvc.dll".into()));
+        let fs = FakeFs::new().file(r"C:\Program Files\Vendor\vsvc.dll", 1);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        assert_eq!(got.evidence, vec![]);
+        assert!(got.live_targets.contains(&PathBuf::from(r"C:\Program Files\Vendor\vsvc.dll")), "{:?}", got.live_targets);
     }
 
     #[test]

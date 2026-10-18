@@ -54,13 +54,18 @@ impl Ctx<'_> {
             && !self.fs.exists(p)
     }
 
+    /// Records `p` as a live target when it is an existing absolute path; true then.
+    fn note_live(&self, p: &Path) -> bool {
+        let live = p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p);
+        if live {
+            self.live.borrow_mut().push(p.to_path_buf());
+        }
+        live
+    }
+
     /// [`Self::is_dead`] for a reference's target; an existing target is recorded as live instead.
     fn is_dead_ref(&self, p: &Path) -> bool {
-        if p.is_absolute() && drive_letter(p).is_some() && self.fs.exists(p) {
-            self.live.borrow_mut().push(p.to_path_buf());
-            return false;
-        }
-        self.is_dead(p)
+        !self.note_live(p) && self.is_dead(p)
     }
 
     fn examines(&self, k: &RegKeyPath) -> bool {
@@ -196,14 +201,39 @@ fn looks_like_file(p: &Path) -> bool {
     })
 }
 
-/// (b) Autostart command lines whose exe is missing.
-fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
-    if !cx.examines(root) {
-        return;
+/// The DLL a `rundll32 <dll>,<entry>` command line loads; `None` for any other command.
+fn rundll32_dll(cmd: &str) -> Option<PathBuf> {
+    let exe = first_path_in_command(cmd)?;
+    if !exe.file_stem()?.to_string_lossy().eq_ignore_ascii_case("rundll32") {
+        return None;
     }
+    let lower = cmd.to_ascii_lowercase();
+    let mut at = lower.find("rundll32")? + "rundll32".len();
+    if lower[at..].starts_with(".exe") {
+        at += ".exe".len();
+    }
+    let rest = cmd[at..].trim_start_matches('"').trim_start();
+    let dll = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split(',').next()?,
+    };
+    let dll = dll.trim();
+    (!dll.is_empty()).then(|| PathBuf::from(dll))
+}
+
+/// (b) Autostart command lines whose exe is missing. The existing exe, and the DLL of a
+/// `rundll32` line, are live targets, under a kept key too.
+fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
+    let kept = !cx.examines(root);
     for (name, value) in cx.reg.values(root).unwrap_or_default() {
-        if let Some(target) = string_value(&value, root).as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
-            out.push(dangling(RefKind::Run, root, target, Some(name)));
+        let Some(cmd) = string_value(&value, root) else { continue };
+        if let Some(dll) = rundll32_dll(&cmd) {
+            cx.note_live(&dll);
+        }
+        if let Some(target) = first_path_in_command(&cmd).filter(|p| cx.is_dead_ref(p)) {
+            if !kept {
+                out.push(dangling(RefKind::Run, root, target, Some(name)));
+            }
         }
     }
 }
@@ -212,26 +242,25 @@ fn run_values(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
 fn app_path_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
     for sub in cx.reg.subkeys(root).unwrap_or_default() {
         let k = child(root, &sub);
-        if !cx.examines(&k) {
-            continue;
-        }
+        let kept = !cx.examines(&k);
         if let Some(target) = default_string(cx.reg, &k).as_deref().and_then(path_in_value).filter(|p| cx.is_dead_ref(p)) {
-            out.push(dangling(RefKind::AppPaths, &k, target, None));
+            if !kept {
+                out.push(dangling(RefKind::AppPaths, &k, target, None));
+            }
         }
     }
 }
 
 /// (d) One pass over a classes root: per `CLSID\{…}` only the [`SERVER_KEYS`] defaults, per
-/// other subkey only the `shell\open\command` default; nothing deeper.
+/// other subkey only the `shell\open\command` default; nothing deeper. A kept key is never
+/// evidence, but its existing targets are live.
 fn class_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
     for sub in cx.reg.subkeys(root).unwrap_or_default() {
         let k = child(root, &sub);
         if sub.eq_ignore_ascii_case("CLSID") {
             for clsid in cx.reg.subkeys(&k).unwrap_or_default() {
                 let c = child(&k, &clsid);
-                if !cx.examines(&c) {
-                    continue;
-                }
+                let kept = !cx.examines(&c);
                 // Every server is checked, so each existing one is recorded as live.
                 let mut target = None;
                 for p in SERVER_KEYS.iter().filter_map(|s| default_string(cx.reg, &child(&c, s)).as_deref().and_then(path_in_value)) {
@@ -239,14 +268,16 @@ fn class_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
                         target = Some(p);
                     }
                 }
-                if let Some(target) = target {
+                if let Some(target) = target.filter(|_| !kept) {
                     out.push(dangling(RefKind::ClassesServer, &c, target, None));
                 }
             }
-        } else if cx.examines(&k) {
+        } else {
             let command = default_string(cx.reg, &child(&k, r"shell\open\command"));
             if let Some(target) = command.as_deref().and_then(first_path_in_command).filter(|p| cx.is_dead_ref(p)) {
-                out.push(dangling(RefKind::ShellCommand, &k, target, None));
+                if cx.examines(&k) {
+                    out.push(dangling(RefKind::ShellCommand, &k, target, None));
+                }
             }
         }
     }
@@ -486,6 +517,55 @@ mod tests {
         let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
         live.sort();
         assert_eq!(live, vec![r"C:\Apps\Live\ext.dll", r"C:\Apps\Live\live.exe", r"C:\Apps\Live\open.exe", r"C:\Apps\Live\tray.exe"]);
+    }
+
+    #[test]
+    fn rundll32_dll_is_live() {
+        let mut reg = FakeRegistry::new();
+        let run = key(Hive::CurrentUser, RUN);
+        let rundll32 = expand_env(r"%SystemRoot%\System32\rundll32.exe");
+        reg.set(run.clone(), "Plain", s(&format!(r"{rundll32} C:\Vendor Tools\helper.dll,Start /x")));
+        reg.set(run.clone(), "Quoted", s(&format!(r#""{rundll32}" "C:\Vendor Tools\quoted.dll",Run"#)));
+        reg.set(run, "Bare", s(r"rundll32 C:\Vendor Tools\bare.dll,Go"));
+        let fs = FakeFs::new()
+            .file(r"C:\Vendor Tools\helper.dll", 1)
+            .file(r"C:\Vendor Tools\quoted.dll", 1)
+            .file(r"C:\Vendor Tools\bare.dll", 1);
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
+        assert_eq!(got.evidence, vec![]);
+        let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
+        live.sort();
+        assert_eq!(live, vec![r"C:\Vendor Tools\bare.dll", r"C:\Vendor Tools\helper.dll", r"C:\Vendor Tools\quoted.dll"]);
+    }
+
+    #[test]
+    fn kept_key_target_is_live() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(key(Hive::CurrentUser, RUN), "Tray", s(r#""C:\Apps\Kept\tray.exe" --min"#));
+        reg.set(hklm(&format!(r"{APP_PATHS}\kept.exe")), "", s(r"C:\Apps\Kept\kept.exe"));
+        reg.set(hklm(&format!(r"{CLSID}\{{K}}\InprocServer32")), "", s(r"C:\Apps\Kept\ext.dll"));
+        reg.set(hklm(&format!(r"{CLSID}\{{K}}\LocalServer32")), "", s(r"C:\Apps\Gone\server.exe"));
+        reg.set(hklm(r"SOFTWARE\Classes\keptproto\shell\open\command"), "", s(r#""C:\Apps\Kept\open.exe" "%1""#));
+        let fs = FakeFs::new()
+            .file(r"C:\Apps\Kept\tray.exe", 1)
+            .file(r"C:\Apps\Kept\kept.exe", 1)
+            .file(r"C:\Apps\Kept\ext.dll", 1)
+            .file(r"C:\Apps\Kept\open.exe", 1);
+        let keep = KeepList {
+            keys: vec![
+                key(Hive::CurrentUser, RUN),
+                hklm(&format!(r"{APP_PATHS}\kept.exe")),
+                hklm(&format!(r"{CLSID}\{{K}}")),
+                hklm(r"SOFTWARE\Classes\keptproto"),
+            ],
+            ..KeepList::default()
+        };
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &keep, &all_drives, &[]);
+        assert_eq!(got.evidence, vec![], "kept keys are never evidence");
+        let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
+        live.sort();
+        assert_eq!(live, vec![r"C:\Apps\Kept\ext.dll", r"C:\Apps\Kept\kept.exe", r"C:\Apps\Kept\open.exe", r"C:\Apps\Kept\tray.exe"]);
     }
 
     #[test]
