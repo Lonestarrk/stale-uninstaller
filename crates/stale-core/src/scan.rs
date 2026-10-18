@@ -70,7 +70,7 @@ impl ScanSources {
     /// The real machine: registry, BAM, UserAssist, Prefetch, Start Menu shortcuts, file system.
     pub fn live() -> ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
         let services_reg = reg.clone();
         ScanSources {
             providers: vec![

@@ -8,10 +8,14 @@ use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 /// Unknown or malformed GUIDs yield `None`.
 pub fn resolve(guid: &str) -> Option<PathBuf> {
     let inner = guid.strip_prefix('{')?.strip_suffix('}')?;
-    let guid = GUID::try_from(inner).ok()?;
-    // SAFETY: `guid` outlives the call; the returned buffer is freed exactly once below.
+    resolve_id(&GUID::try_from(inner).ok()?)
+}
+
+/// The path of the known folder `id` (`FOLDERID_ProgramData`, ...); `None` when the call fails.
+pub fn resolve_id(id: &GUID) -> Option<PathBuf> {
+    // SAFETY: `id` outlives the call; the returned buffer is freed exactly once below.
     unsafe {
-        let pwstr = SHGetKnownFolderPath(&guid, KF_FLAG_DEFAULT, None).ok()?;
+        let pwstr = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = pwstr.to_string();
         CoTaskMemFree(Some(pwstr.0 as *const _));
         s.ok().map(PathBuf::from)

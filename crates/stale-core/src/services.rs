@@ -39,7 +39,7 @@ pub fn normalize_image_path(raw: &str) -> Option<PathBuf> {
 /// to the Windows folder (`System32\drivers\x.sys`) and unquoted paths with spaces, which are
 /// resolved by the CreateProcess rule against `exists` ([`resolve_unquoted_path`]).
 pub fn normalize_image_path_with(raw: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
     let expanded = expand_env(raw.trim());
     let mut cmd = expanded.as_str();
     if let Some(rest) = strip_prefix_ci(cmd, r"\??\") {
@@ -66,7 +66,7 @@ mod tests {
     use crate::registry::FakeRegistry;
 
     fn system_root() -> String {
-        std::env::var("SystemRoot").unwrap().to_uppercase()
+        crate::paths::windows_dir().to_string_lossy().to_uppercase()
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
             Some(PathBuf::from(r"C:\ProgramData\Vendor\Other Dir\y.sys"))
         );
         // Relative paths are checked below the Windows folder.
-        let sr = std::env::var("SystemRoot").unwrap();
+        let sr = crate::paths::windows_dir();
         let rel = PathBuf::from(&sr).join(r"System32\drivers\My Drv\d.sys");
         let exists_rel = |p: &Path| p == rel.as_path();
         assert_eq!(normalize_image_path_with(r"System32\drivers\My Drv\d.sys --x", &exists_rel), Some(rel.clone()));

@@ -161,8 +161,16 @@ const INSTALLER_CACHE_NAMES: [&str; 3] = ["package cache", "downloaded installat
 /// setup, and its folder is not the install folder.
 fn in_temp_or_installer_cache(dir: &Path) -> bool {
     let n = norm(dir);
-    let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%ProgramData%\Package Cache", r"%LOCALAPPDATA%\Package Cache"];
-    roots.iter().map(|r| expand_env(r)).filter(|r| !r.contains('%')).map(|r| norm(Path::new(&r))).any(|r| n == r || normed_under(&n, &r))
+    let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%LOCALAPPDATA%\Package Cache"];
+    // ProgramData from the system, never from the environment.
+    let package_cache = norm(&crate::paths::program_data_dir().join("Package Cache"));
+    roots
+        .iter()
+        .map(|r| expand_env(r))
+        .filter(|r| !r.contains('%'))
+        .map(|r| norm(Path::new(&r)))
+        .chain(std::iter::once(package_cache))
+        .any(|r| n == r || normed_under(&n, &r))
         || dir.components().any(|c| INSTALLER_CACHE_NAMES.contains(&c.as_os_str().to_string_lossy().to_lowercase().as_str()))
 }
 
@@ -206,9 +214,9 @@ pub(crate) fn user_folder_relation(user_folders: &[PathBuf], profiles: &[PathBuf
     None
 }
 
-/// `%SystemRoot%` [`norm`]ed (`C:\WINDOWS` when unset).
+/// The Windows folder ([`crate::paths::windows_dir`]) [`norm`]ed.
 pub(crate) fn system_root_norm() -> String {
-    norm(Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())))
+    norm(&crate::paths::windows_dir())
 }
 
 /// The folders `p` occupies, [`norm`]ed: install folder, display-icon folder and uninstaller

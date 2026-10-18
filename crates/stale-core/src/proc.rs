@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// `%SystemRoot%\System32\<name>` (fallback `C:\Windows`), so a same-named exe next to ours is never run.
+/// `System32\<name>`, System32 from the system ([`crate::paths::system32_dir`]), never from
+/// `%SystemRoot%`, so neither a same-named exe next to ours nor a changed environment is run.
 pub fn system32_tool(name: &str) -> PathBuf {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    PathBuf::from(root).join("System32").join(name)
+    crate::paths::system32_dir().join(name)
 }
 
 /// Console tool output as text: decoded with the OEM code page the tools write in (`GetOEMCP`,
@@ -72,7 +72,25 @@ mod tests {
     fn system32_tool_is_absolute_under_system_root() {
         let p = system32_tool("reg.exe");
         assert!(p.is_absolute(), "{}", p.display());
-        assert!(p.ends_with(r"System32\reg.exe"), "{}", p.display());
+        assert!(p.to_string_lossy().to_lowercase().ends_with(r"system32\reg.exe"), "{}", p.display());
+    }
+
+    #[test]
+    fn system32_tool_does_not_depend_on_env() {
+        let real = crate::paths::windows_dir();
+        let saved = std::env::var_os("SystemRoot");
+        // Edition 2021: set_var is safe; restored right after.
+        std::env::set_var("SystemRoot", r"C:\Evil");
+        let (tool, tasks, windows) = (system32_tool("reg.exe"), crate::paths::tasks_root(), crate::paths::windows_dir());
+        match saved {
+            Some(v) => std::env::set_var("SystemRoot", v),
+            None => std::env::remove_var("SystemRoot"),
+        }
+        let under_real = |p: &Path| p.to_string_lossy().to_lowercase().starts_with(&real.to_string_lossy().to_lowercase());
+        assert!(!real.to_string_lossy().to_lowercase().starts_with(r"c:\evil"), "{}", real.display());
+        assert!(under_real(&tool) && tool.to_string_lossy().to_lowercase().ends_with(r"system32\reg.exe"), "{}", tool.display());
+        assert!(under_real(&tasks), "{}", tasks.display());
+        assert_eq!(windows, real);
     }
 
     #[test]
