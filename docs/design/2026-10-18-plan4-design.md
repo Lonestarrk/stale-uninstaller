@@ -49,6 +49,14 @@ Upphöjd `dump` på utvecklarens dator: Prefetch har 490 filer och BAM 151 värd
 
 Beslutat i samtalet: ett program räknas som använt när **någon** av dess exe-filer har körts, inte bara huvudprogrammet. Uppdaterare, tjänster, kraschrapportörer, tray-hjälpare och avinstallerare räknas fortfarande inte (samma namnregler som i plan 1, plus registrerade tjänster). Kolumnen visar källan i parentes när det inte var huvudprogrammet: "Idag (via link.exe)". Verifierat underlag: på utvecklarens dator har Prefetch `LINK.EXE` (idag), `VCTIP.EXE`, `MSBUILD.EXE` under Visual Studios installationsmapp.
 
+Förtydligat under genomförandet (2026-10-18):
+- Bara exe-filer i programmets egen installationsmapp räknas som delkomponenter. En träff som hör till programmet bara via filnamnet räknas bara om den är huvudprogrammet.
+- Ett program som autostartar räknas som använt, eftersom det körs. En schemalagd uppgift som startar programmets eget huvudprogram räknas.
+- Schemalagda underhållsjobb som inte är huvudprogrammet räknas inte, till exempel Office ActionsServer och Firefox default-browser-agent.
+- Tjänster räknas aldrig, inte ens när tjänsten är programmets ikonfil (Office ClickToRun).
+- En installationsfil räknas bara när den är programmets eget huvudprogram och körningen syns i Prefetch eller BAM. Ett program vars enda spår är dess egen cachade installationsfil räknas som aldrig använt.
+- En undantagen hjälpfil som användaren själv har startat från Start eller skrivbordet räknas, men dateras bara efter de egna starterna.
+
 ### 3.3 Beroenden
 
 Program som andra program behöver – SDK:er, runtimes, Visual C++-redistributables, .NET, Windows SDK, Python/Node/Java när andra program pekar dit – märks "används av andra program" i listan och kräver en extra bekräftelse innan de läggs i avinstallationskön. Byggarens val hur beroenden upptäcks (namnmönster + referenser från andra programs mappar är en rimlig början).
