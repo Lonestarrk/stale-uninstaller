@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn keep_path_rejects_drive_root() {
         let mut k = KeepList::default();
-        for p in [r"C:\", "C:", "", r"\", "c:/"] {
+        for p in [r"C:\", "C:", "", r"\", "c:/", r"\\?\C:\", r"\\server\share\", r"\\server\share"] {
             k.keep_path(PathBuf::from(p));
         }
         assert!(k.paths.is_empty(), "{:?}", k.paths);

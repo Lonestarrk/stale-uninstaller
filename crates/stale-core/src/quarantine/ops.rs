@@ -740,8 +740,11 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
             }
         };
         // Back in place, it should inherit its parent's ACL again; a failure leaves it restored.
+        // Never through a link swapped in meanwhile (`acl::reinherit` checks again on its handle).
         if back {
-            if let Err(e) = (ops.reinherit)(&item.original) {
+            if ops.mover.is_reparse(&item.original) {
+                fail("acl-not-reinherited: reparse".to_string());
+            } else if let Err(e) = (ops.reinherit)(&item.original) {
                 fail(format!("acl-not-reinherited: {e}"));
             }
         }
@@ -1387,6 +1390,21 @@ mod tests {
             vec![PathBuf::from(r"C:\ProgramData\Foo"), PathBuf::from(r"C:\Apps\Foo")],
             "only what was moved back"
         );
+    }
+
+    #[test]
+    fn reinherit_is_skipped_for_reparse_original() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\foo.exe", 10);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
+        // Swapped for a junction right after the move back.
+        e.mover.set_reparse(r"C:\Apps\Foo");
+
+        assert_eq!(
+            restore(&e.ops, &m),
+            RestoreOutcome::Partial(vec![fail(r"C:\Apps\Foo", "acl-not-reinherited: reparse")])
+        );
+        assert!(e.reinherited.lock().unwrap().is_empty(), "nothing re-inherited through a link");
     }
 
     #[test]

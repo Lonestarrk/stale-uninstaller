@@ -9,7 +9,7 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_INVALID_OWNER, ERROR_SUCCESS, HANDLE, HLOCAL, LUID};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW,
@@ -288,7 +288,8 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
         let child = path.join(&name);
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
         // Plain files (settings.json, logs) are never moved aside: only folders and links matter.
-        if !is_dir && !(ops.is_reparse)(&child) {
+        let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+        if !is_dir && !is_link && !(ops.is_reparse)(&child) {
             continue;
         }
         if untrusted(&child) {
@@ -315,19 +316,48 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
     Ok(warnings)
 }
 
+/// FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC.
+const REINHERIT_ACCESS: u32 = 0x80 | 0x2_0000 | 0x4_0000;
+
+/// `Err` of [`reinherit`] when `path` cannot be opened or is a link or reparse point.
+pub const REPARSE_OR_OPEN_FAILED: &str = "reparse-or-open-failed";
+
 /// Makes `path` inherit its parent's ACL again: an empty, unprotected DACL clears the explicit
 /// ACEs and turns inheritance back on (the inherited ACEs are recomputed, also below `path`). The
 /// owner is left as it is.
+///
+/// `path` itself (never a link's target) is opened without delete sharing and the DACL is set
+/// through that handle, so a junction swapped in cannot redirect the change; a link, reparse point
+/// or an object that cannot be opened is `Err("reparse-or-open-failed")`.
 pub fn reinherit(path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(REINHERIT_ACCESS)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .and_then(|f| f.metadata().map(|md| (f, md)));
+    let file = match opened {
+        Ok((f, md)) if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 => f,
+        Ok(_) => {
+            log::warn!("reinherit {}: link or reparse point", path.display());
+            return Err(REPARSE_OR_OPEN_FAILED.to_string());
+        }
+        Err(e) => {
+            log::warn!("reinherit {}: {e}", path.display());
+            return Err(REPARSE_OR_OPEN_FAILED.to_string());
+        }
+    };
     let mut empty = ACL::default();
     // SAFETY: `empty` is an ACL header of exactly the size passed; an ACL with no ACEs fits in it.
     unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
         .map_err(|e| format!("initialize ACL: {}", e.message()))?;
-    let name = wide(path);
-    // SAFETY: `name` is NUL-terminated and `empty` an initialized ACL; both outlive the call.
+    // SAFETY: `file` is open with WRITE_DAC and READ_CONTROL and lives for the call; `empty` is an
+    // initialized ACL.
     let err = unsafe {
-        SetNamedSecurityInfoW(
-            PCWSTR(name.as_ptr()),
+        SetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
             None,
@@ -459,11 +489,57 @@ mod tests {
     }
 
     #[test]
+    fn sweep_moves_reparse_files_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("link.dll"), b"x").unwrap();
+        std::fs::write(dir.join("plain.dll"), b"x").unwrap();
+        let link = dir.join("link.dll");
+        let is_reparse = |p: &Path| p == link;
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()) };
+        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!link.exists(), "the link-looking file is moved aside");
+        assert!(dir.join("plain.dll").is_file(), "the plain file stays");
+    }
+
+    #[test]
+    fn reinherit_refuses_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = tmp.path().join("link");
+        let mklink = crate::proc::system32_tool("cmd.exe");
+        crate::proc::run_hidden(&mklink, &["/c".as_ref(), "mklink".as_ref(), "/J".as_ref(), link.as_os_str(), target.as_os_str()])
+            .unwrap();
+        assert_eq!(reinherit(&link), Err(REPARSE_OR_OPEN_FAILED.to_string()));
+        assert_eq!(reinherit(&tmp.path().join("missing")), Err(REPARSE_OR_OPEN_FAILED.to_string()));
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    #[test]
     fn reinherit_drops_the_protected_dacl() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("restored");
         std::fs::create_dir(&dir).unwrap();
-        set_security(&dir, false).unwrap();
+        // The locked DACL plus full control for the owner, so an unelevated test can open it too.
+        let sd = Sd::from_sddl("D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)").unwrap();
+        let (_, locked_dacl) = sd.parts().unwrap();
+        let name = wide(&dir);
+        // SAFETY: `name` is NUL-terminated; `locked_dacl` points into `sd`, alive for the call.
+        let err = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(name.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(locked_dacl),
+                None,
+            )
+        };
+        assert_eq!(err, ERROR_SUCCESS);
         let locked = sddl_of(&dir).unwrap();
         assert!(locked.contains("D:P"), "{locked}");
         reinherit(&dir).unwrap();
