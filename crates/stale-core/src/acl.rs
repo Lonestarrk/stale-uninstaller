@@ -231,6 +231,8 @@ struct DirOps<'a> {
     is_reparse: &'a dyn Fn(&Path) -> bool,
     owned_by_admins: &'a dyn Fn(&Path) -> Option<bool>,
     apply: &'a dyn Fn(&Path) -> Result<(), String>,
+    /// Makes Administrators the owner of a plain file and resets its DACL to inherited.
+    take_over: &'a dyn Fn(&Path) -> Result<(), String>,
 }
 
 /// Locks `path` down to Administrators and SYSTEM, replacing the whole DACL and the owner.
@@ -243,15 +245,23 @@ struct DirOps<'a> {
 /// that is an error unless the folder was created by us (`created_by_us`, or just now), since its
 /// DACL is then already right.
 ///
-/// Then each direct child folder or reparse point (plain files are left alone) that is a reparse
-/// point or not owned by Administrators/SYSTEM is renamed
-/// aside to `<name>.untrusted-<timestamp>` (one warning each in the returned list) — re-checked
-/// against a fresh listing of `path` just before; names already holding `.untrusted-` are left
-/// alone. Trusted child folders get the same descriptor (one level: the DACL is inheritable below).
+/// Then each direct child folder or reparse point that is a reparse point or not owned by
+/// Administrators/SYSTEM is renamed aside to `<name>.untrusted-<timestamp>` (one warning each in
+/// the returned list) — re-checked against a fresh listing of `path` just before; names already
+/// holding `.untrusted-` are left alone. A plain file not owned by Administrators/SYSTEM (a
+/// planted `settings.json`) is taken over instead: owner Administrators, DACL reset to the
+/// inherited one ([`take_over_file`]); when that fails it is moved aside too. Admin-owned files
+/// are left alone. Trusted child folders get the same descriptor (one level: the DACL is
+/// inheritable below).
 pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, String> {
     use crate::quarantine::fsmove::is_reparse_point;
     use crate::quarantine::store::owned_by_admins;
-    let ops = DirOps { is_reparse: &is_reparse_point, owned_by_admins: &owned_by_admins, apply: &apply_locked };
+    let ops = DirOps {
+        is_reparse: &is_reparse_point,
+        owned_by_admins: &owned_by_admins,
+        apply: &apply_locked,
+        take_over: &take_over_file,
+    };
     secure_dir_with(path, created_by_us, &ops)
 }
 
@@ -287,10 +297,20 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
         }
         let child = path.join(&name);
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        // Plain files (settings.json, logs) are never moved aside: only folders and links matter.
         let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
         if !is_dir && !is_link && !(ops.is_reparse)(&child) {
-            continue;
+            // A plain file (settings.json, important.json, logs): an admin-owned one is ours; any
+            // other is taken over, and moved aside below only when that fails.
+            if (ops.owned_by_admins)(&child) == Some(true) {
+                continue;
+            }
+            match (ops.take_over)(&child) {
+                Ok(()) => {
+                    warnings.push(format!("{} (not owned by Administrators or SYSTEM) taken over", child.display()));
+                    continue;
+                }
+                Err(e) => warnings.push(format!("{} could not be taken over: {e}", child.display())),
+            }
         }
         if untrusted(&child) {
             // Only what a fresh listing of the (pinned) folder still shows, still untrusted.
@@ -318,6 +338,52 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
 
 /// FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC.
 const REINHERIT_ACCESS: u32 = 0x80 | 0x2_0000 | 0x4_0000;
+/// [`REINHERIT_ACCESS`] | WRITE_OWNER.
+const TAKE_OVER_ACCESS: u32 = REINHERIT_ACCESS | 0x8_0000;
+
+/// Makes Administrators the owner of the plain file `path` and resets its DACL to the inherited
+/// one (an empty, unprotected DACL: explicit ACEs go, the parent's inheritable ACEs apply). The
+/// file itself (never a link's target) is opened without delete sharing and changed through that
+/// handle; a link, reparse point or folder is refused.
+fn take_over_file(path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    let _privileges = OwnerPrivileges::enable();
+    let file = std::fs::OpenOptions::new()
+        .access_mode(TAKE_OVER_ACCESS)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let md = file.metadata().map_err(|e| format!("read {}: {e}", path.display()))?;
+    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !md.is_file() {
+        return Err(format!("{} is not a plain file", path.display()));
+    }
+    let sd = Sd::from_sddl("O:BA")?;
+    let (owner, _) = sd.parts()?;
+    let mut empty = ACL::default();
+    // SAFETY: `empty` is an ACL header of exactly the size passed; an ACL with no ACEs fits in it.
+    unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
+        .map_err(|e| format!("initialize ACL: {}", e.message()))?;
+    // SAFETY: `file` is open with WRITE_OWNER, WRITE_DAC and READ_CONTROL and lives for the call;
+    // `owner` points into `sd`, alive for the call; `empty` is an initialized ACL.
+    let err = unsafe {
+        SetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            Some(owner),
+            None,
+            Some(&empty),
+            None,
+        )
+    };
+    if err == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("take over {}: {}", path.display(), windows::core::Error::from(err.to_hresult()).message()))
+    }
+}
 
 /// `Err` of [`reinherit`] when `path` cannot be opened or is a link or reparse point.
 pub const REPARSE_OR_OPEN_FAILED: &str = "reparse-or-open-failed";
@@ -438,7 +504,7 @@ mod tests {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply, take_over: &|_| Ok(()) };
         assert_eq!(secure_dir_with(&dir, false, &ops), Err(REPARSE_AFTER_LOCK.to_string()));
         assert!(dir.join("planted").is_dir(), "nothing renamed");
         assert_eq!(*applied.borrow(), vec![dir.clone()], "no child touched");
@@ -451,15 +517,16 @@ mod tests {
         for child in ["ours", "planted", "old.untrusted-20261018120000"] {
             std::fs::create_dir_all(dir.join(child)).unwrap();
         }
-        std::fs::write(dir.join("planted.txt"), b"x").unwrap();
+        std::fs::write(dir.join("ours.txt"), b"x").unwrap();
         let ours = dir.join("ours");
-        let owned = |p: &Path| Some(p == ours);
+        let ours_txt = dir.join("ours.txt");
+        let owned = |p: &Path| Some(p == ours || p == ours_txt);
         let applied = std::cell::RefCell::new(Vec::new());
         let apply = |p: &Path| {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply, take_over: &|p| Err(format!("unexpected {}", p.display())) };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let mut names: Vec<String> =
@@ -468,7 +535,7 @@ mod tests {
         assert_eq!(names.len(), 4, "{names:?}");
         assert!(names.contains(&"ours".to_string()) && names.contains(&"old.untrusted-20261018120000".to_string()));
         assert!(names.iter().any(|n| n.starts_with("planted.untrusted-")), "{names:?}");
-        assert!(names.contains(&"planted.txt".to_string()), "plain files stay: {names:?}");
+        assert!(names.contains(&"ours.txt".to_string()), "admin-owned files stay: {names:?}");
         assert_eq!(*applied.borrow(), vec![dir.clone(), ours.clone()]);
 
         // A second run finds nothing new to move aside.
@@ -476,16 +543,42 @@ mod tests {
     }
 
     #[test]
-    fn sweep_leaves_files_alone() {
+    fn take_over_file_refuses_folders_and_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(take_over_file(tmp.path()).unwrap_err().contains("not a plain file"));
+        assert!(take_over_file(&tmp.path().join("missing.json")).is_err());
+    }
+
+    #[test]
+    fn untrusted_file_is_taken_over() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("root");
         std::fs::create_dir_all(dir.join("planted")).unwrap();
-        std::fs::write(dir.join("settings.json"), b"{}").unwrap();
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &|_| Some(false), apply: &|_| Ok(()) };
+        for f in ["settings.json", "important.json", "admin.json"] {
+            std::fs::write(dir.join(f), b"{}").unwrap();
+        }
+        let admin = dir.join("admin.json");
+        let important = dir.join("important.json");
+        let owned = |p: &Path| Some(p == admin);
+        let taken = std::cell::RefCell::new(Vec::new());
+        let take_over = |p: &Path| {
+            taken.borrow_mut().push(p.file_name().unwrap().to_string_lossy().into_owned());
+            if p == important {
+                Err("access denied".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &|_| Ok(()), take_over: &take_over };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(dir.join("settings.json").is_file(), "the file is not renamed");
-        assert!(!dir.join("planted").exists(), "the folder is");
+        let mut taken = taken.into_inner();
+        taken.sort();
+        assert_eq!(taken, vec!["important.json", "settings.json"], "admin-owned files are left alone");
+        assert!(dir.join("settings.json").is_file() && admin.is_file(), "taken over in place");
+        assert!(!important.exists(), "a file that cannot be taken over is moved aside");
+        assert!(!dir.join("planted").exists(), "the untrusted folder is moved aside");
+        // settings.json taken over; important.json failed and moved aside; planted moved aside.
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
     }
 
     #[test]
@@ -497,7 +590,7 @@ mod tests {
         std::fs::write(dir.join("plain.dll"), b"x").unwrap();
         let link = dir.join("link.dll");
         let is_reparse = |p: &Path| p == link;
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()) };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()), take_over: &|_| Ok(()) };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(!link.exists(), "the link-looking file is moved aside");
