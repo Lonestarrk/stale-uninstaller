@@ -4,7 +4,7 @@ A Windows uninstaller that tells you **when you last used each program**, so you
 
 Think Revo Uninstaller, but sorted by "last used" and showing which drive everything lives on.
 
-> Status: early development. The program list with last-used dates works. Uninstalling, leftover cleanup and quarantine are being built (see [Roadmap](#roadmap)). The user interface is in Swedish.
+> Status: early development. The program list with last-used dates, the uninstall queue, leftover cleanup and quarantine with undo are built but have had limited real-world testing. Ghost-program detection is next (see [Roadmap](#roadmap)). The user interface is in Swedish.
 
 ## What it does
 
@@ -13,7 +13,7 @@ Think Revo Uninstaller, but sorted by "last used" and showing which drive everyt
 - **Filters** for "not used in 6 months", "not used in a year", "never seen", per drive, and "over 1 GB". Sortable table, search, and a details panel that lists every executable with its last run and the source of the date.
 - **Honest about uncertainty.** Each date shows which source it came from, and rows are marked "pending" until the scan has finished rather than showing a wrong value.
 
-Planned (in progress):
+Also built (plan 2, limited real-world testing so far):
 
 - Queue several programs and uninstall them in one go, with an optional System Restore point.
 - Find leftovers in the file system, registry, services, scheduled tasks and shortcuts, grouped by confidence. Anything that might be your own data is unchecked by default.
@@ -62,7 +62,7 @@ cargo run -p stale-core --example dump   # prints the program list to the consol
 | Version | Scope | Status |
 |---|---|---|
 | 1, plan 1 | Program list with last-used, filters, details | Done |
-| 1, plan 2 | Uninstall queue, leftover scan, quarantine with undo | In progress |
+| 1, plan 2 | Uninstall queue, leftover scan, quarantine with undo | Done |
 | 1, plan 3 | Ghost programs (uninstalled but leftovers remain) | Planned |
 | 2 | Junk finder: temp folders, caches, AppData growth, with plain-language explanations and a "keep" list | Planned |
 | 3 | Microsoft Store apps | Planned |
