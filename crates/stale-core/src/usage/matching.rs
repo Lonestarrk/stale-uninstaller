@@ -422,14 +422,22 @@ fn group_hits(
     let mut exes: Vec<ExeUsage> = groups
         .into_values()
         .filter_map(|group| {
+            let main = is_main(&group.first()?.exe_path);
+            let setup_named = is_installer(&group[0].exe_path);
+            // A main exe with a setup-like name (Visual Studio Installer's `setup.exe`) counts from
+            // execution traces, but a UserAssist entry for it does not.
+            let ua_blocked = setup_named && main;
+            let traces: Vec<&UsageHit> =
+                group.iter().filter(|h| !(ua_blocked && h.source == UsageSource::UserAssist)).collect();
+            let all_blocked = traces.is_empty();
+            let group: Vec<UsageHit> = if all_blocked { group } else { traces.into_iter().cloned().collect() };
             let latest = group.iter().max_by_key(|h| h.last_run)?;
-            let main = is_main(&latest.exe_path);
             // UserAssist records launches by the user, so such an exe counts even when it is not
             // a main exe or has a background-looking name; running an uninstaller never does.
             let user_launched =
                 group.iter().any(|h| h.source == UsageSource::UserAssist) && !is_uninstaller(&latest.exe_path);
             // A setup exe is never use of the program, whatever recorded it.
-            let installer = is_installer(&latest.exe_path) && (!main || user_launched);
+            let installer = setup_named && (!main || all_blocked);
             Some(ExeUsage {
                 exe_path: latest.exe_path.clone(),
                 last_run: latest.last_run,
@@ -1330,6 +1338,44 @@ mod tests {
         let u = usage(&r, "Docker");
         assert_eq!(via_of(u), (Some(days_ago(3)), Some("helper2.exe")));
         assert!(u.exes.iter().any(|e| e.excluded == Some(ExcludeReason::NamePattern)));
+    }
+
+    #[test]
+    fn setup_named_main_exe_counts_from_prefetch() {
+        let vsi = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer";
+        let programs = [prog("VSI", Some(vsi))];
+        let setup = format!(r"{vsi}\setup.exe");
+        let hits = [
+            hit(&setup, 5, UsageSource::Prefetch),
+            hit(&setup, 3, UsageSource::Bam),
+            hit(&setup, 1, UsageSource::UserAssist),
+        ];
+        let shortcuts = targets(&[&setup]);
+        let roots = HashMap::new();
+        let none = HashMap::new();
+        let services = HashSet::new();
+        let r = match_usage(&input(&programs, &hits, &shortcuts, &roots, &none, &services));
+        let u = usage(&r, "VSI");
+        assert!(u.exes[0].is_main);
+        assert_eq!(u.exes[0].excluded, None);
+        // The UserAssist entry is dropped; the newest trace counts.
+        assert_eq!(via_of(u), (Some(days_ago(3)), None));
+        // UserAssist alone does not count.
+        let r = match_usage(&input(&programs, &hits[2..], &shortcuts, &roots, &none, &services));
+        assert_eq!(usage(&r, "VSI").last_used.when, None);
+    }
+
+    #[test]
+    fn cached_setup_display_icon_gives_never() {
+        let mut p = prog("SSMS", None);
+        p.display_icon = Some(PathBuf::from(r"C:\ProgramData\Package Cache\{ABC}\SSMS-Setup-ENU.exe"));
+        p.uninstall_string = Some(r#""C:\ProgramData\Package Cache\{ABC}\SSMS-Setup-ENU.exe" /uninstall"#.into());
+        let hits = [
+            hit(r"C:\ProgramData\Package Cache\{ABC}\SSMS-Setup-ENU.exe", 0, UsageSource::Bam),
+            hit(r"\PROGRAMDATA\PACKAGE CACHE\{ABC}\SSMS-SETUP-ENU.EXE", 0, UsageSource::Prefetch),
+        ];
+        let r = run(&[p], &hits, &HashSet::new());
+        assert_eq!(usage(&r, "SSMS").last_used.when, None);
     }
 
     #[test]
