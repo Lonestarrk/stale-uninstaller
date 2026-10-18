@@ -14,7 +14,11 @@ use stale_core::quarantine::{
 use stale_core::model::{Program, ProgramId};
 use stale_core::scan::{run_scan, ScanEvent, ScanSources};
 use stale_core::uninstall::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::Foundation::RPC_E_TOO_LATE;
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoInitializeSecurity, CoUninitialize, COINIT_APARTMENTTHREADED, EOAC_NONE,
+    RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+};
 
 use crate::strings;
 
@@ -232,8 +236,9 @@ pub fn spawn_leftover_scan(hint: ProgramHint, programs: Vec<Program>) -> Receive
     rx
 }
 
-/// Keeps COM (STA) initialized on the worker thread for the restore point API. If the thread
-/// already uses another apartment model (`RPC_E_CHANGED_MODE`) nothing is undone.
+/// Keeps COM (STA) initialized on the worker thread for the restore point API, with process-wide
+/// impersonate-level COM security. If the thread already uses another apartment model
+/// (`RPC_E_CHANGED_MODE`) nothing is undone.
 struct ComGuard {
     initialized: bool,
 }
@@ -242,6 +247,28 @@ impl ComGuard {
     fn init() -> Self {
         // SAFETY: plain COM initialization; balanced by `CoUninitialize` in `drop` only on success.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // The restore point API calls into a COM server that impersonates the caller; without
+        // explicit process security COM picks identify-level defaults. Once per process: a later
+        // call (or one after COM chose defaults) returns RPC_E_TOO_LATE, which is fine.
+        // SAFETY: plain COM call with no pointers passed; COM is initialized on this thread above.
+        let security = unsafe {
+            CoInitializeSecurity(
+                None,
+                -1,
+                None,
+                None,
+                RPC_C_AUTHN_LEVEL_DEFAULT,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+                None,
+            )
+        };
+        if let Err(e) = security {
+            if e.code() != RPC_E_TOO_LATE {
+                log::warn!("CoInitializeSecurity: {e}");
+            }
+        }
         ComGuard { initialized: hr.is_ok() }
     }
 }
