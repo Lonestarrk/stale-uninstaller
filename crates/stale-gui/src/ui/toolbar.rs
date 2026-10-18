@@ -3,7 +3,7 @@
 use eframe::egui;
 use stale_core::uninstall::UninstallMode;
 
-use crate::app::StaleApp;
+use crate::app::{SearchDialog, StaleApp};
 use crate::strings;
 
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
@@ -15,7 +15,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 app.open_queue_dialog(mode);
             }
         }
-        ui.add_enabled(false, egui::Button::new(strings::FIND_LEFTOVERS)).on_disabled_hover_text(strings::NOT_YET);
+        let can_search = app.search.is_none() && !app.leftover_search_running() && !app.removal_running();
+        if ui.add_enabled(can_search, egui::Button::new(strings::FIND_LEFTOVERS)).clicked() {
+            app.search = Some(SearchDialog::default());
+        }
         // One scan at a time: refreshing waits for the running scan to finish.
         if ui.add_enabled(!app.scanning, egui::Button::new(strings::REFRESH)).clicked() {
             app.refresh();
@@ -31,6 +34,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         if app.scanning {
             ui.spinner();
             ui.label(strings::LOADING);
+        }
+        if app.leftover_search_running() {
+            ui.spinner();
+            ui.label(strings::SEARCHING);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(

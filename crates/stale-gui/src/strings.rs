@@ -14,7 +14,6 @@ pub const FORCE_REMOVE: &str = "Tvingad borttagning";
 pub const FIND_LEFTOVERS: &str = "Sök rester";
 pub const REFRESH: &str = "Uppdatera";
 pub const SEARCH_HINT: &str = "Sök program…";
-pub const NOT_YET: &str = "Kommer i nästa steg";
 
 // Table columns
 pub const COL_NAME: &str = "Namn";
@@ -107,3 +106,50 @@ pub const CLOSE: &str = "Stäng";
 
 // Views
 pub const VIEW_PENDING: &str = "Vyn kommer i nästa steg";
+
+// Leftovers view
+pub const LEFTOVERS_TITLE: &str = "Rester";
+pub const BACK_TO_PROGRAMS: &str = "Till programlistan";
+pub const NO_LEFTOVERS: &str = "Inga rester hittades.";
+pub const SECTION_FILES: &str = "Mappar och filer";
+pub const SECTION_REGISTRY: &str = "Registernycklar";
+pub const SECTION_OTHER: &str = "Övrigt";
+pub const KIND_DIR: &str = "Mapp";
+pub const KIND_FILE: &str = "Fil";
+pub const KIND_REGKEY: &str = "Nyckel";
+pub const KIND_REGVALUE: &str = "Värde";
+pub const KIND_SHORTCUT: &str = "Genväg";
+pub const KIND_SERVICE: &str = "Tjänst";
+pub const KIND_TASK: &str = "Schemalagd uppgift";
+pub const WARNING_ICON: &str = "⚠";
+pub const NOTE_USER_FOLDER: &str = "troligen dina egna filer";
+pub const NOTE_SHARED_PUBLISHER: &str = "delas med andra program från samma utgivare";
+pub const MARK_SAFE: &str = "Markera säkra";
+pub const REMOVE_CHECKED: &str = "Ta bort markerade";
+pub const SERVICE_REBOOT: &str = "Tjänster tas bort helt först efter omstart";
+pub const QUARANTINE_THREAD_FAILED: &str = "Kunde inte starta borttagningen";
+pub const QUARANTINE_ABORTED: &str = "Borttagningen avbröts oväntat – se loggfilen";
+
+/// "(3 träffar, 58 MB)" after a section title.
+pub fn section_counts(hits: usize, size: &str) -> String {
+    format!("({hits} träffar, {size})")
+}
+
+/// The leftovers view's footer: "3 av 5 markerade · 58 MB frigörs".
+pub fn checked_summary(checked: usize, total: usize, size: &str) -> String {
+    format!("{checked} av {total} markerade · {size} frigörs")
+}
+
+/// "4 objekt flyttade till karantän".
+pub fn moved_to_quarantine(count: usize) -> String {
+    format!("{count} objekt flyttade till karantän")
+}
+
+// Standalone leftover search
+pub const SEARCH_TITLE: &str = FIND_LEFTOVERS;
+pub const SEARCH_NAME: &str = "Programnamn";
+pub const SEARCH_DIR: &str = "Mapp (valfri)";
+pub const SEARCH: &str = "Sök";
+pub const SEARCHING: &str = "Söker rester…";
+pub const LEFTOVER_SCAN_THREAD_FAILED: &str = "Kunde inte starta sökningen efter rester";
+pub const LEFTOVER_SCAN_ABORTED: &str = "Sökningen efter rester avbröts oväntat – se loggfilen";

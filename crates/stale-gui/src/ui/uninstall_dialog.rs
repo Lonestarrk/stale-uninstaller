@@ -45,8 +45,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 flag.store(true, Ordering::Relaxed);
             }
         }
-        // Task 11 renders the leftovers from `app.flow`; leaving the program list hides this window.
-        Some(Action::ShowLeftovers) => app.view = View::Leftovers,
+        // Leaving the program list hides this window.
+        Some(Action::ShowLeftovers) => app.open_leftovers_from_flow(),
         Some(Action::Requeue(id, mode)) => app.open_queue_dialog_for(vec![id], mode),
         Some(Action::Close) => app.close_flow(),
         None => {}

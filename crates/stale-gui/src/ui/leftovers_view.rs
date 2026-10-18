@@ -1,0 +1,264 @@
+//! The leftovers view (checkable leftovers per program, removal to quarantine, its summary) and
+//! the "Sök rester" window.
+
+use std::path::PathBuf;
+
+use eframe::egui;
+use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
+use stale_core::quarantine::QuarantineManifest;
+use stale_core::{Hive, RegKeyPath};
+
+use super::STALE_COLOR;
+use crate::app::StaleApp;
+use crate::leftover_sel::LeftoverGroup;
+use crate::{format, strings};
+
+/// What a click in the view asks for, applied after drawing.
+enum Action {
+    Back,
+    MarkSafe,
+    Remove,
+}
+
+pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
+    let removing = app.removal_running();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.heading(strings::LEFTOVERS_TITLE);
+        if ui.add_enabled(!removing, egui::Button::new(strings::BACK_TO_PROGRAMS)).clicked() {
+            action = Some(Action::Back);
+        }
+    });
+    ui.separator();
+    if app.removal_done {
+        removal_summary(ui, &app.last_manifests, &mut action);
+    } else if let Some(sel) = app.leftovers.as_mut() {
+        let (checked, total, bytes) = sel.summary();
+        egui::Panel::bottom("leftovers_footer").show(ui, |ui| {
+            ui.add_space(4.0);
+            if let Some((done, total, what)) = &app.removal_progress {
+                let fraction = if *total == 0 { 0.0 } else { *done as f32 / *total as f32 };
+                ui.add(egui::ProgressBar::new(fraction).text(format!("{done}/{total}")));
+                ui.label(what);
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label(strings::checked_summary(checked, total, &format::human_size(Some(bytes))));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(checked > 0 && !removing, egui::Button::new(strings::REMOVE_CHECKED)).clicked() {
+                        action = Some(Action::Remove);
+                    }
+                    if ui.add_enabled(!removing, egui::Button::new(strings::CANCEL)).clicked() {
+                        action = Some(Action::Back);
+                    }
+                    if ui.add_enabled(!removing, egui::Button::new(strings::MARK_SAFE)).clicked() {
+                        action = Some(Action::MarkSafe);
+                    }
+                });
+            });
+        });
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if total == 0 {
+                ui.label(strings::NO_LEFTOVERS);
+            }
+            for (gi, group) in sel.groups.iter_mut().enumerate() {
+                egui::CollapsingHeader::new(&group.program_name)
+                    .id_salt(("leftover_group", gi))
+                    .default_open(true)
+                    .show(ui, |ui| group_body(ui, group, !removing));
+            }
+        });
+    }
+    match action {
+        Some(Action::Back) => app.leave_leftovers(),
+        Some(Action::MarkSafe) => {
+            if let Some(sel) = app.leftovers.as_mut() {
+                sel.mark_safe();
+            }
+        }
+        Some(Action::Remove) => app.remove_checked_leftovers(),
+        None => {}
+    }
+}
+
+/// One program's leftovers in three sections; check boxes are disabled while a removal runs.
+fn group_body(ui: &mut egui::Ui, group: &mut LeftoverGroup, editable: bool) {
+    for (section, title) in
+        [strings::SECTION_FILES, strings::SECTION_REGISTRY, strings::SECTION_OTHER].into_iter().enumerate()
+    {
+        let indices: Vec<usize> = (0..group.items.len()).filter(|&i| section_of(&group.items[i].kind) == section).collect();
+        if indices.is_empty() {
+            continue;
+        }
+        let bytes = indices.iter().filter_map(|&i| group.items[i].size()).sum();
+        ui.strong(format!("{title} {}", strings::section_counts(indices.len(), &format::human_size(Some(bytes)))));
+        for i in indices {
+            item_row(ui, &group.items[i], &mut group.checked[i], editable);
+        }
+    }
+}
+
+fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bool) {
+    ui.horizontal(|ui| {
+        ui.add_enabled(editable, egui::Checkbox::without_text(checked));
+        ui.weak(kind_label(&item.kind));
+        ui.label(item_text(&item.kind));
+        if item.confidence == Confidence::Low {
+            let warning = match &item.note {
+                Some(note) => format!("{} {}", strings::WARNING_ICON, note_text(note)),
+                None => strings::WARNING_ICON.to_string(),
+            };
+            ui.colored_label(STALE_COLOR, warning);
+        }
+        if let LeftoverKind::Dir { size, .. } | LeftoverKind::File { size, .. } = &item.kind {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format::human_size(*size));
+            });
+        }
+    });
+}
+
+/// After the removal: per program what was moved and what failed, then the way back.
+fn removal_summary(ui: &mut egui::Ui, manifests: &[QuarantineManifest], action: &mut Option<Action>) {
+    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        for m in manifests {
+            ui.strong(&m.program_name);
+            let count = m.moved.len() + m.keys.len() + m.values.len() + m.services.len() + m.tasks.len();
+            ui.label(strings::moved_to_quarantine(count));
+            for f in &m.failures {
+                ui.colored_label(STALE_COLOR, format!("{}: {}", f.what, f.error));
+            }
+            if !m.services.is_empty() {
+                ui.label(strings::SERVICE_REBOOT);
+            }
+            ui.add_space(6.0);
+        }
+        ui.separator();
+        if ui.button(strings::BACK_TO_PROGRAMS).clicked() {
+            *action = Some(Action::Back);
+        }
+    });
+}
+
+/// The "Sök rester" window: program name, optional folder, Avbryt / Sök.
+pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
+    let Some(search) = app.search.as_mut() else { return };
+    let ctx = ui.ctx().clone();
+    let mut close = false;
+    let mut start = false;
+    egui::Window::new(strings::SEARCH_TITLE)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(&ctx, |ui| {
+            egui::Grid::new("leftover_search").num_columns(2).show(ui, |ui| {
+                ui.label(strings::SEARCH_NAME);
+                ui.add(egui::TextEdit::singleline(&mut search.name).desired_width(260.0));
+                ui.end_row();
+                ui.label(strings::SEARCH_DIR);
+                ui.add(egui::TextEdit::singleline(&mut search.dir).desired_width(260.0));
+                ui.end_row();
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(strings::CANCEL).clicked() {
+                    close = true;
+                }
+                if ui.add_enabled(!search.name.trim().is_empty(), egui::Button::new(strings::SEARCH)).clicked() {
+                    start = true;
+                }
+            });
+        });
+    if start {
+        let name = search.name.trim().to_string();
+        let dir = Some(search.dir.trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
+        app.search = None;
+        app.search_leftovers_manual(name, dir);
+    } else if close {
+        app.search = None;
+    }
+}
+
+/// 0: folders and files, 1: registry, 2: everything else.
+fn section_of(kind: &LeftoverKind) -> usize {
+    match kind {
+        LeftoverKind::Dir { .. } | LeftoverKind::File { .. } => 0,
+        LeftoverKind::RegKey { .. } | LeftoverKind::RegValue { .. } => 1,
+        LeftoverKind::Shortcut { .. } | LeftoverKind::Service { .. } | LeftoverKind::ScheduledTask { .. } => 2,
+    }
+}
+
+fn kind_label(kind: &LeftoverKind) -> &'static str {
+    match kind {
+        LeftoverKind::Dir { .. } => strings::KIND_DIR,
+        LeftoverKind::File { .. } => strings::KIND_FILE,
+        LeftoverKind::RegKey { .. } => strings::KIND_REGKEY,
+        LeftoverKind::RegValue { .. } => strings::KIND_REGVALUE,
+        LeftoverKind::Shortcut { .. } => strings::KIND_SHORTCUT,
+        LeftoverKind::Service { .. } => strings::KIND_SERVICE,
+        LeftoverKind::ScheduledTask { .. } => strings::KIND_TASK,
+    }
+}
+
+/// `HKLM\<path>`, `HKCU\<path>` or `HKU\<path>`.
+fn key_text(key: &RegKeyPath) -> String {
+    let hive = match key.hive {
+        Hive::LocalMachine => "HKLM",
+        Hive::CurrentUser => "HKCU",
+        Hive::Users => "HKU",
+    };
+    format!(r"{hive}\{}", key.path)
+}
+
+/// The path, key or name that identifies a leftover.
+fn item_text(kind: &LeftoverKind) -> String {
+    match kind {
+        LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => path.display().to_string(),
+        LeftoverKind::RegKey { key } => key_text(key),
+        LeftoverKind::RegValue { key, name } => format!("{} → {name}", key_text(key)),
+        LeftoverKind::Shortcut { lnk, .. } => lnk.display().to_string(),
+        LeftoverKind::Service { name, .. } | LeftoverKind::ScheduledTask { name, .. } => name.clone(),
+    }
+}
+
+/// The user's text for a core note key; unknown keys are shown as they are.
+fn note_text(note: &str) -> &str {
+    match note {
+        "user-folder" => strings::NOTE_USER_FOLDER,
+        "shared-publisher-key" => strings::NOTE_SHARED_PUBLISHER,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_map_to_swedish_and_unknown_pass_through() {
+        assert_eq!(note_text("user-folder"), strings::NOTE_USER_FOLDER);
+        assert_eq!(note_text("shared-publisher-key"), strings::NOTE_SHARED_PUBLISHER);
+        assert_eq!(note_text("something-new"), "something-new");
+    }
+
+    #[test]
+    fn registry_items_show_hive_abbreviation() {
+        let key = |hive| RegKeyPath { hive, path: r"Software\Foo".into() };
+        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::LocalMachine) }), r"HKLM\Software\Foo");
+        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::CurrentUser) }), r"HKCU\Software\Foo");
+        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::Users) }), r"HKU\Software\Foo");
+        assert_eq!(
+            item_text(&LeftoverKind::RegValue { key: key(Hive::CurrentUser), name: "Foo".into() }),
+            r"HKCU\Software\Foo → Foo"
+        );
+        assert_eq!(kind_label(&LeftoverKind::RegValue { key: key(Hive::Users), name: String::new() }), strings::KIND_REGVALUE);
+    }
+
+    #[test]
+    fn sections_split_files_registry_other() {
+        let path = PathBuf::from(r"C:\x");
+        assert_eq!(section_of(&LeftoverKind::File { path: path.clone(), size: None }), 0);
+        assert_eq!(section_of(&LeftoverKind::RegKey { key: RegKeyPath { hive: Hive::LocalMachine, path: "x".into() } }), 1);
+        assert_eq!(section_of(&LeftoverKind::Service { name: "s".into(), image: path }), 2);
+    }
+}

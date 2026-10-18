@@ -5,6 +5,7 @@ pub mod app;
 pub mod filter;
 pub mod flow;
 pub mod format;
+pub mod leftover_sel;
 pub mod logging;
 pub mod strings;
 pub mod ui;

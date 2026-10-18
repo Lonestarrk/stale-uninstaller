@@ -1,7 +1,7 @@
 //! Application state and the eframe shell.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
+use stale_core::leftovers::ProgramHint;
+use stale_core::quarantine::QuarantineManifest;
 use stale_core::scan::ScanEvent;
 use stale_core::settings::Settings;
 use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
@@ -17,7 +19,9 @@ use stale_core::{Program, ProgramId};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
-use crate::ui::{details, filter_panel, table, toolbar, uninstall_dialog};
+use crate::leftover_sel::LeftoverSelection;
+use crate::ui::{details, filter_panel, leftovers_view, table, toolbar, uninstall_dialog};
+use crate::worker::{LeftoverScanEvent, QuarantineEvent};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -55,6 +59,14 @@ pub struct PendingQueue {
     pub run_vendor: bool,
 }
 
+/// The "Sök rester" window's fields while it is open.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SearchDialog {
+    pub name: String,
+    /// Optional install folder; blank means none.
+    pub dir: String,
+}
+
 pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
@@ -71,6 +83,17 @@ pub struct StaleApp {
     /// Set to stop waiting for the running uninstaller's child processes; `None` when no queue runs.
     pub stop_waiting: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<ScanEvent>>,
+    /// The leftovers view's items and check marks.
+    pub leftovers: Option<LeftoverSelection>,
+    quarantine_rx: Option<Receiver<QuarantineEvent>>,
+    /// `(done, total, what)` while checked leftovers are being moved to quarantine.
+    pub removal_progress: Option<(usize, usize, String)>,
+    /// The removal has finished: the leftovers view shows `last_manifests` instead of the items.
+    pub removal_done: bool,
+    pub last_manifests: Vec<QuarantineManifest>,
+    /// The "Sök rester" window, when open.
+    pub search: Option<SearchDialog>,
+    leftover_scan_rx: Option<Receiver<LeftoverScanEvent>>,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
     /// Usage and sizes received so far, kept for hidden programs too.
@@ -104,6 +127,13 @@ impl StaleApp {
             uninstall_rx: None,
             stop_waiting: None,
             rx: None,
+            leftovers: None,
+            quarantine_rx: None,
+            removal_progress: None,
+            removal_done: false,
+            last_manifests: Vec::new(),
+            search: None,
+            leftover_scan_rx: None,
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
@@ -276,6 +306,125 @@ impl StaleApp {
         self.refresh();
     }
 
+    /// Shows the finished queue's leftover reports, named after their programs.
+    pub fn open_leftovers_from_flow(&mut self) {
+        let Some(flow) = &self.flow else { return };
+        let reports: Vec<_> = flow
+            .reports
+            .iter()
+            .filter_map(|(i, report)| flow.items.get(*i).map(|(_, name, _)| (name.clone(), report.clone())))
+            .collect();
+        self.show_leftovers(LeftoverSelection::from_reports(&reports));
+    }
+
+    /// Switches to the leftovers view with a fresh selection.
+    fn show_leftovers(&mut self, sel: LeftoverSelection) {
+        self.leftovers = Some(sel);
+        self.removal_done = false;
+        self.last_manifests.clear();
+        self.view = View::Leftovers;
+    }
+
+    /// Back to the program list; a finished removal's results are dropped on the way.
+    pub fn leave_leftovers(&mut self) {
+        self.view = View::Programs;
+        if self.removal_done {
+            self.leftovers = None;
+            self.removal_done = false;
+            self.last_manifests.clear();
+            // Its reports name what was just quarantined: "Visa rester" must not offer them again.
+            if !self.queue_running() {
+                self.close_flow();
+            }
+        }
+    }
+
+    /// True while checked leftovers are being moved to quarantine.
+    pub fn removal_running(&self) -> bool {
+        self.quarantine_rx.is_some()
+    }
+
+    /// Moves the checked leftovers to quarantine on a worker thread (nothing checked: no-op).
+    pub fn remove_checked_leftovers(&mut self) {
+        if self.removal_running() {
+            return;
+        }
+        let Some(sel) = &self.leftovers else { return };
+        let batches = sel.checked_items();
+        if batches.is_empty() {
+            return;
+        }
+        let total = batches.iter().map(|(_, items)| items.len()).sum();
+        self.removal_progress = Some((0, total, String::new()));
+        self.quarantine_rx = Some(worker::spawn_quarantine(batches));
+    }
+
+    /// True while a standalone leftover search runs.
+    pub fn leftover_search_running(&self) -> bool {
+        self.leftover_scan_rx.is_some()
+    }
+
+    /// Searches for leftovers of a program named `name` (optionally installed in `dir`) on a worker.
+    pub fn search_leftovers_manual(&mut self, name: String, dir: Option<PathBuf>) {
+        if self.leftover_search_running() {
+            return;
+        }
+        self.leftover_scan_rx = Some(worker::spawn_leftover_scan(ProgramHint::manual(&name, dir)));
+    }
+
+    /// Applies every quarantine event waiting on the channel.
+    fn drain_quarantine_events(&mut self) {
+        let Some(rx) = self.quarantine_rx.take() else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(QuarantineEvent::Progress { done, total, what }) => {
+                    self.removal_progress = Some((done, total, what))
+                }
+                Ok(QuarantineEvent::Finished(manifests)) => {
+                    self.removal_progress = None;
+                    self.removal_done = true;
+                    self.last_manifests = manifests;
+                    return;
+                }
+                Ok(QuarantineEvent::Failed(msg)) => {
+                    log::error!("{msg}");
+                    self.removal_progress = None;
+                    self.warnings.push(msg);
+                    return;
+                }
+                Err(TryRecvError::Empty) => {
+                    self.quarantine_rx = Some(rx);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    log::error!("quarantine worker disconnected before Finished");
+                    self.removal_progress = None;
+                    self.warnings.push(strings::QUARANTINE_ABORTED.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Opens the leftovers view once the standalone search is done.
+    fn drain_leftover_scan(&mut self) {
+        let Some(rx) = self.leftover_scan_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(LeftoverScanEvent::Done(name, report)) => {
+                self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]))
+            }
+            Ok(LeftoverScanEvent::Failed(msg)) => {
+                log::error!("{msg}");
+                self.warnings.push(msg);
+            }
+            Err(TryRecvError::Empty) => self.leftover_scan_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                log::error!("leftover scan worker disconnected before Done");
+                self.warnings.push(strings::LEFTOVER_SCAN_ABORTED.to_string());
+            }
+        }
+    }
+
     /// Applies every event waiting on the channel.
     fn drain_events(&mut self) {
         let Some(rx) = self.rx.take() else { return };
@@ -305,7 +454,9 @@ impl eframe::App for StaleApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_uninstall_events();
-        if self.scanning || self.queue_running() {
+        self.drain_quarantine_events();
+        self.drain_leftover_scan();
+        if self.scanning || self.queue_running() || self.removal_running() || self.leftover_search_running() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -336,10 +487,15 @@ impl eframe::App for StaleApp {
             }
         });
         uninstall_dialog::show(ui, self);
+        leftovers_view::search_window(ui, self);
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.view != View::Programs {
-                ui.label(strings::VIEW_PENDING);
-                return;
+            match self.view {
+                View::Programs => {}
+                View::Leftovers => return leftovers_view::show(ui, self),
+                View::Quarantine => {
+                    ui.label(strings::VIEW_PENDING);
+                    return;
+                }
             }
             if self.rows.is_empty() {
                 if !self.scanning {
@@ -523,5 +679,46 @@ mod tests {
         assert_eq!(app.rows.len(), 1);
         assert!(app.checked.is_empty(), "checked id that disappeared is pruned");
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn open_leftovers_from_flow_pairs_reports_with_names() {
+        use stale_core::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
+        let dir = |p: &str| Leftover {
+            kind: LeftoverKind::Dir { path: p.into(), size: Some(1) },
+            confidence: Confidence::High,
+            note: None,
+        };
+        let mut app = StaleApp::empty(Settings::default());
+        let mut flow = FlowState::new(&[(ProgramId("a".into()), "App A".into()), (ProgramId("b".into()), "App B".into())]);
+        // Reports are keyed by item index and may arrive in any order: pair by index.
+        flow.reports.push((1, LeftoverReport { items: vec![dir(r"C:\B")] }));
+        flow.reports.push((0, LeftoverReport { items: vec![dir(r"C:\A"), dir(r"C:\A2")] }));
+        app.flow = Some(flow);
+
+        app.open_leftovers_from_flow();
+        assert_eq!(app.view, View::Leftovers);
+        let sel = app.leftovers.expect("selection built");
+        let groups: Vec<(&str, usize)> = sel.groups.iter().map(|g| (g.program_name.as_str(), g.items.len())).collect();
+        assert_eq!(groups, vec![("App B", 1), ("App A", 2)]);
+    }
+
+    #[test]
+    fn remove_checked_leftovers_with_nothing_checked_is_noop() {
+        use stale_core::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
+        let low = Leftover {
+            kind: LeftoverKind::Dir { path: r"C:\Users\x\A".into(), size: Some(1) },
+            confidence: Confidence::Low,
+            note: Some("user-folder".into()),
+        };
+        let mut app = StaleApp::empty(Settings::default());
+        app.leftovers = Some(LeftoverSelection::from_reports(&[("A".into(), LeftoverReport { items: vec![low] })]));
+        app.remove_checked_leftovers();
+        assert!(app.quarantine_rx.is_none(), "no worker spawned");
+        assert!(app.removal_progress.is_none() && !app.removal_done);
+
+        app.leftovers = None;
+        app.remove_checked_leftovers();
+        assert!(app.quarantine_rx.is_none());
     }
 }
