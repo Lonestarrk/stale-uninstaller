@@ -298,8 +298,12 @@ fn assess(
     let strong = evidence.iter().any(|e| {
         matches!(e, Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } | Evidence::RegKeyMissingPath { .. })
     });
+    // A vendor key without a path value (RegKeyOrphan) only joins a folder ghost: it does not
+    // make data folders look like more than data.
     let folder_in = |kinds: &[RootKind]| {
-        evidence.iter().all(|e| matches!(e, Evidence::Folder { root_kind, .. } if kinds.contains(root_kind)))
+        let mut rest = evidence.iter().filter(|e| !matches!(e, Evidence::RegKeyOrphan { .. })).peekable();
+        rest.peek().is_some()
+            && rest.all(|e| matches!(e, Evidence::Folder { root_kind, .. } if kinds.contains(root_kind)))
     };
     if folder_in(&[RootKind::AppData]) {
         reasons.push(REASON_APPDATA_ONLY);
@@ -976,6 +980,8 @@ mod tests {
         let ev = vec![
             folder(r"C:\ProgramData\Vendor Cache", 10, RootKind::ProgramData),
             folder(r"C:\Users\A\AppData\Local\Vendor Cache", 10, RootKind::AppData),
+            // A vendor key joining the folders changes nothing.
+            Evidence::RegKeyOrphan { key: key(Hive::CurrentUser, r"Software\Vendor Cache") },
         ];
         let ghosts = group_t(ev, &installed(&[]), &KeepList::default(), &r, None);
         assert_eq!(summary(&ghosts), vec![("Vendor Cache".to_string(), Assessment::Uncertain)]);
