@@ -1,16 +1,14 @@
 # Stale Uninstaller – Plan 2: Uninstall Queue, Leftovers and Quarantine Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** From the program list, queue one or more programs, uninstall them (optionally via their own uninstaller, after an optional restore point), find what they left behind in files, registry, services, tasks and shortcuts, and move the chosen leftovers into a per-volume quarantine that can be undone or emptied.
 
 **Architecture:** `stale-core` gains three modules with injectable OS access: `leftovers` (pure matching rules over a `FsReader` + `RegistryReader` view of the machine), `quarantine` (manifests under `%ProgramData%`, payload moved to `<drive>:\Stale Uninstaller\quarantine\<id>`, registry keys exported with `reg.exe` before deletion through a `RegistryWriter` trait), and `uninstall` (restore point, running the vendor uninstaller and waiting for its process tree, the §6.2 "not uninstalled" check, and an orchestrator that streams `UninstallEvent`s). `stale-gui` gains a view enum (program list / leftovers / quarantine), an uninstall summary + progress dialog, and worker threads for the three long operations.
 
 **Tech Stack:** Rust stable MSVC, eframe/egui 0.37 (+ egui_extras tables), winreg, windows crate (Job objects, srclient), serde_json, chrono. `reg.exe` and `icacls.exe` (both in System32) are invoked as child processes.
 
-**Spec:** `docs/superpowers/specs/2026-10-17-stale-uninstaller-design.md` — §4 toolbar, §6, §6.1, §6.2, §7. §6.3 (ghost programs) and §9 are plan 3.
+**Spec:** `docs/design/2026-10-17-stale-uninstaller-design.md` — §4 toolbar, §6, §6.1, §6.2, §7. §6.3 (ghost programs) and §9 are plan 3.
 
-Plan 1 (`docs/superpowers/plans/2026-10-17-stale-program-list.md`) built everything this plan calls: `Program`, `RegistryReader`/`FakeRegistry`, `pathutil::{norm, expand_env, first_path_in_command, exe_under, is_shared_root}`, `shortcuts::{ShortcutTarget, resolve_lnk, shortcut_targets, start_menu_dirs}`, `services::service_exes`, `size::dir_size`, `paths::{data_dir, logs_dir, user_profiles_root}`, `settings::Settings`, GUI `StaleApp { rows, checked, selected, … }`, `strings.rs`.
+Plan 1 (`docs/plans/2026-10-17-stale-program-list.md`) built everything this plan calls: `Program`, `RegistryReader`/`FakeRegistry`, `pathutil::{norm, expand_env, first_path_in_command, exe_under, is_shared_root}`, `shortcuts::{ShortcutTarget, resolve_lnk, shortcut_targets, start_menu_dirs}`, `services::service_exes`, `size::dir_size`, `paths::{data_dir, logs_dir, user_profiles_root}`, `settings::Settings`, GUI `StaleApp { rows, checked, selected, … }`, `strings.rs`.
 
 ## Global Constraints
 

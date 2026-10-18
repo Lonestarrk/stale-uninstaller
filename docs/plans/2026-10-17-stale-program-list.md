@@ -1,14 +1,12 @@
 # Stale Uninstaller – Plan 1: Program List with Last-Used Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** A working `stale.exe` that lists every classic installed program with drive, size and a trustworthy "senast använd" date, in the layout-B window (filter panel, table, details), sorted oldest-first.
 
 **Architecture:** Cargo workspace with two crates. `stale-core` holds all logic with no egui dependency: registry access behind a `RegistryReader` trait (fake in tests), usage providers (BAM, UserAssist, Prefetch, file times) behind a `UsageProvider` trait, pure matching rules, and a scan orchestrator that streams `ScanEvent`s over a channel. `stale-gui` is an eframe app that spawns the scan on a worker thread and renders rows from the events; its filter/sort/format logic lives in pure modules with unit tests.
 
 **Tech Stack:** Rust stable (MSVC target), eframe/egui, winreg, windows (Win32 API), serde/serde_json, chrono, embed-manifest.
 
-**Spec:** `docs/superpowers/specs/2026-10-17-stale-uninstaller-design.md`
+**Spec:** `docs/design/2026-10-17-stale-uninstaller-design.md`
 
 This is plan 1 of 2 for version 1. Plan 2 (uninstall queue, leftover scan, quarantine, undo) is written after this plan ships, and builds on the `Program`, `ProgramUsage`, `RegistryReader` and `paths` interfaces defined here.
 

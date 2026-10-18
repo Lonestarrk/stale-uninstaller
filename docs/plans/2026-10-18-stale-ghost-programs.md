@@ -1,14 +1,12 @@
 # Stale Uninstaller – Plan 3: Ghost Programs, Account Warning and Plan-2 Follow-ups Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** A "Spökprogram" view that finds programs which are already uninstalled but left folders, registry keys, dangling references and execution traces behind, groups the evidence per program with an assessment, and lets the user quarantine the leftovers or mark them "Behåll"; plus the start-up warning for an elevated run under another account, and the items parked at the end of plan 2.
 
 **Architecture:** `stale-core` gains `ghosts/` (evidence collectors over the existing `FsReader`/`RegistryReader`/shortcut/task/service sources, a pure grouper + assessor, and a converter to `Leftover` items so the existing leftovers view and quarantine are reused unchanged), `keep.rs` (the persistent "viktig/behåll" list that every scanner consults), and `session.rs` (interactive-session user vs token user). `stale-gui` gains `View::Ghosts`, a worker, and a view that hands selected ghosts to the existing `LeftoverSelection`/quarantine flow.
 
 **Tech Stack:** as before (Rust, eframe/egui 0.37, winreg, windows crate, serde_json, chrono).
 
-**Spec:** `docs/superpowers/specs/2026-10-17-stale-uninstaller-design.md` — §6.3 (ghost programs), §5 "Vilka användare omfattas" (start-up warning), §9 only the "viktig-lista" storage (the junk finder itself is a later plan). Plan 2 (`2026-10-18-stale-uninstall-flow.md`) built everything reused here: `leftovers::{Leftover, LeftoverKind, Confidence, ProgramHint, LeftoverReport, names::*, fs_scan::FsScanRoots, reg_scan::RegScanRoots, other_scan::*, scan::LeftoverSources}`, `fsys::FsReader`, `quarantine::*`, `acl::*`, GUI `LeftoverSelection`, `View`, workers.
+**Spec:** `docs/design/2026-10-17-stale-uninstaller-design.md` — §6.3 (ghost programs), §5 "Vilka användare omfattas" (start-up warning), §9 only the "viktig-lista" storage (the junk finder itself is a later plan). Plan 2 (`2026-10-18-stale-uninstall-flow.md`) built everything reused here: `leftovers::{Leftover, LeftoverKind, Confidence, ProgramHint, LeftoverReport, names::*, fs_scan::FsScanRoots, reg_scan::RegScanRoots, other_scan::*, scan::LeftoverSources}`, `fsys::FsReader`, `quarantine::*`, `acl::*`, GUI `LeftoverSelection`, `View`, workers.
 
 ## Global Constraints
 
