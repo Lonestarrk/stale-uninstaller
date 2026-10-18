@@ -1,9 +1,10 @@
 //! Folders a program left behind.
 
 use super::names::{
-    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
+    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, name_matches_suffixed,
+    publisher_matches,
 };
-use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA};
+use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA, NOTE_SUFFIX_MATCH};
 use crate::fsys::FsReader;
 use crate::pathutil::{is_shared_root, norm, normed_under};
 use std::collections::HashSet;
@@ -120,6 +121,10 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
             if name_matches_exact(&name, &hint.name) {
                 if !is_install(&entry.path) {
                     push(&entry.path, Confidence::Medium, None);
+                }
+            } else if name_matches_suffixed(&name, &hint.name) {
+                if !is_install(&entry.path) {
+                    push(&entry.path, Confidence::Medium, Some(NOTE_SUFFIX_MATCH));
                 }
             } else if name_matches_first_word_only(&name, &hint.name)
                 || hint.publisher.as_deref().is_some_and(|p| publisher_matches(&name, p))
@@ -283,6 +288,17 @@ mod tests {
         h.uninstall_string = Some(format!(r#""{dir}\Uninstall Obsidian.exe" /currentuser"#));
         let out = scan_folders(&fs, &roots(), &h);
         assert_eq!(dirs(&out), vec![(dir.to_string(), Confidence::High)]);
+    }
+
+    #[test]
+    fn obsidian_updater_folder_is_medium_suffix_match() {
+        let fs = FakeFs::new()
+            .dir(r"C:\Users\A\AppData\Local\obsidian-updater", 325)
+            .dir(r"C:\Users\A\AppData\Local\obsidian-plugins", 1)
+            .profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Obsidian", None, None));
+        assert_eq!(dirs(&out), vec![(r"C:\Users\A\AppData\Local\obsidian-updater".to_string(), Confidence::Medium)]);
+        assert_eq!(out[0].note.as_deref(), Some("suffix-match"));
     }
 
     #[test]

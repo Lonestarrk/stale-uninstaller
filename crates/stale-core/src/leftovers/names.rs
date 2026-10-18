@@ -91,6 +91,23 @@ pub fn name_matches_exact(candidate: &str, hint_name: &str) -> bool {
     c == h || compact(&c) == compact(&h)
 }
 
+/// Words that, after the program's name and a `-`, `_` or space, name one of its own helper
+/// folders (`obsidian-updater` for `Obsidian`).
+const HELPER_SUFFIXES: [&str; 8] = ["updater", "update", "helper", "installer", "crashpad", "cache", "temp", "data"];
+
+/// `candidate` is the program's name followed by `-`, `_` or a space and one of
+/// [`HELPER_SUFFIXES`], e.g. `obsidian-updater` for `Obsidian`.
+pub fn name_matches_suffixed(candidate: &str, hint_name: &str) -> bool {
+    if !is_matchable(hint_name) {
+        return false;
+    }
+    let c = normalize_name(candidate);
+    let h = normalize_name(hint_name);
+    c.strip_prefix(&h)
+        .and_then(|rest| rest.strip_prefix(['-', '_', ' ']))
+        .is_some_and(|suffix| HELPER_SUFFIXES.contains(&suffix))
+}
+
 /// Matches only through the first-word rule, e.g. `Google` for `Google Chrome`: such a
 /// candidate is a vendor container, not the program itself.
 pub fn name_matches_first_word_only(candidate: &str, hint_name: &str) -> bool {
@@ -151,5 +168,6 @@ mod tests {
     #[test] fn publisher_matches_strips_bv_and_sa() { assert!(publisher_matches("Foo B.V.", "Foo")); assert!(publisher_matches("Bar S.A.", "Bar")); }
     #[test] fn exact_and_first_word_only_split_name_matches() { assert!(name_matches_exact("UnityHub", "Unity Hub")); assert!(!name_matches_exact("Unity", "Unity Hub")); assert!(name_matches_first_word_only("Google", "Google Chrome")); assert!(!name_matches_first_word_only("Google Chrome", "Google Chrome")); assert!(!name_matches_first_word_only("Other", "Google Chrome")); }
     #[test] fn child_in_container_matches_name_without_container_words() { assert!(child_matches_in_container("Chrome", "Google", "Google Chrome")); assert!(child_matches_in_container("Google Chrome", "Google LLC", "Google Chrome")); assert!(!child_matches_in_container("Update", "Google", "Google Chrome")); assert!(!child_matches_in_container("Hub", "Unity", "Unity Hub")); }
+    #[test] fn suffixed_names_match_helper_folders() { assert!(name_matches_suffixed("obsidian-updater", "Obsidian")); assert!(name_matches_suffixed("Foo Studio_Cache", "Foo Studio")); assert!(name_matches_suffixed("Obsidian Crashpad", "Obsidian 1.4")); assert!(!name_matches_suffixed("obsidian", "Obsidian")); assert!(!name_matches_suffixed("obsidian-plugins", "Obsidian")); assert!(!name_matches_suffixed("obsidianupdater", "Obsidian")); assert!(!name_matches_suffixed("app-updater", "App")); }
     #[test] fn normalize_drops_ranges_and_lone_punctuation() { assert_eq!(normalize_name("Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.38.33130"), "microsoft visual c++ redistributable"); assert_eq!(normalize_name("Node.js"), "node.js"); assert_eq!(normalize_name("7-Zip"), "7-zip"); }
 }

@@ -23,6 +23,10 @@ pub const NOTE_OTHER_PROGRAM: &str = "used-by-other-program";
 /// (saves, screenshots, profiles, projects); such a folder is Medium instead of High.
 pub const NOTE_CONTAINS_USER_DATA: &str = "contains-user-data";
 
+/// `Leftover::note` of a folder named like the program plus a helper suffix
+/// (`obsidian-updater`), see [`names::name_matches_suffixed`].
+pub const NOTE_SUFFIX_MATCH: &str = "suffix-match";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Confidence { High, Medium, Low }
 
