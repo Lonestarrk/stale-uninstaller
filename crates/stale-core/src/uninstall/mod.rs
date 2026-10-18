@@ -1,9 +1,11 @@
 //! Steps the uninstall queue runs before the leftover scan: a System Restore point and the
 //! program's own (vendor) uninstaller.
 
+pub mod orchestrator;
 pub mod restore_point;
 pub mod runner;
 
+pub use orchestrator::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
 pub use restore_point::{FakeRestorePoint, RestorePointApi, SrClient};
 pub use runner::{
     run_vendor_uninstaller, still_installed, uninstall_command, FakeProcessRunner, JobObjectRunner, ProcessRunner,
