@@ -120,6 +120,18 @@ pub fn main_exes(
     main_exes_with_rule(p, shortcut_targets, root_exes, arg_exes).0
 }
 
+/// [`main_exes`] that never picks an exe `skip` refuses (services, scheduled-task actions): the
+/// rule that would have picked it falls through to the next candidate or tier.
+pub fn main_exes_skipping(
+    p: &Program,
+    shortcut_targets: &[ShortcutTarget],
+    root_exes: &[(PathBuf, u64)],
+    arg_exes: &[PathBuf],
+    skip: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, skip).0
+}
+
 /// The tier of [`main_exes`] that picked the main exe(s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainRule {
@@ -138,12 +150,23 @@ pub fn main_exes_with_rule(
     root_exes: &[(PathBuf, u64)],
     arg_exes: &[PathBuf],
 ) -> (Vec<PathBuf>, MainRule) {
+    main_exes_rule_skipping(p, shortcut_targets, root_exes, arg_exes, &|_| false)
+}
+
+/// [`main_exes_with_rule`] with a `skip` filter, see [`main_exes_skipping`].
+pub fn main_exes_rule_skipping(
+    p: &Program,
+    shortcut_targets: &[ShortcutTarget],
+    root_exes: &[(PathBuf, u64)],
+    arg_exes: &[PathBuf],
+    skip: &dyn Fn(&Path) -> bool,
+) -> (Vec<PathBuf>, MainRule) {
     let Some(install) = usage_install_dir(p, shortcut_targets) else {
         return (vec![], MainRule::None);
     };
     let install = install.as_path();
     let (excluded, ok): (Vec<&ShortcutTarget>, Vec<&ShortcutTarget>) =
-        shortcut_targets.iter().filter(|t| exe_under(&t.path, install)).partition(|t| is_name_excluded(&t.path));
+        shortcut_targets.iter().filter(|t| exe_under(&t.path, install) && !skip(&t.path)).partition(|t| is_name_excluded(&t.path));
     let from_shortcuts = dedupe(ok.iter().map(|t| t.path.clone()));
     if !from_shortcuts.is_empty() {
         return (from_shortcuts, MainRule::Shortcut);
@@ -153,19 +176,19 @@ pub fn main_exes_with_rule(
         arg_exes
             .iter()
             .filter(|e| exe_under(e, install) && file_name_upper(e).is_some_and(|n| wanted.contains(&n)))
-            .filter(|e| !is_name_excluded(e))
+            .filter(|e| !is_name_excluded(e) && !skip(e))
             .cloned(),
     );
     if !from_args.is_empty() {
         return (from_args, MainRule::ShortcutArguments);
     }
     let icon = p.display_icon.as_deref().map(strip_icon_index);
-    if let Some(icon) = icon.filter(|i| is_exe(i) && exe_under(i, install) && !is_uninstaller(i)) {
+    if let Some(icon) = icon.filter(|i| is_exe(i) && exe_under(i, install) && !is_uninstaller(i) && !skip(i)) {
         return (vec![icon], MainRule::DisplayIcon);
     }
     root_exes
         .iter()
-        .filter(|(exe, _)| !is_name_excluded(exe) && !is_installer(exe))
+        .filter(|(exe, _)| !is_name_excluded(exe) && !is_installer(exe) && !skip(exe))
         .max_by_key(|(_, size)| *size)
         .map_or((vec![], MainRule::None), |(exe, _)| (vec![exe.clone()], MainRule::LargestRootExe))
 }
@@ -268,10 +291,21 @@ fn is_uninstaller(exe: &Path) -> bool {
     exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().contains("unins"))
 }
 
+/// Whether `exe` is in a set of `norm()`ed exe paths. A drive-less path (a volume-stripped
+/// Prefetch hit that was claimed by file name) matches an entry on any drive.
+fn listed(set: &HashSet<String>, exe: &Path) -> bool {
+    let n = norm(exe);
+    if n.starts_with('\\') {
+        set.iter().any(|e| e.get(2..).is_some_and(|rest| rest == n) && e.as_bytes().get(1) == Some(&b':'))
+    } else {
+        set.contains(&n)
+    }
+}
+
 pub fn exclude_reason(exe: &Path, service_exes: &HashSet<String>) -> Option<ExcludeReason> {
     if is_name_excluded(exe) {
         Some(ExcludeReason::NamePattern)
-    } else if service_exes.contains(&norm(exe)) {
+    } else if listed(service_exes, exe) {
         Some(ExcludeReason::Service)
     } else {
         None
@@ -296,7 +330,8 @@ impl<'a> Candidate<'a> {
         let roots = input.root_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
-        let main = main_exes(program, input.shortcut_targets, roots, args)
+        let background = |e: &Path| listed(input.service_exes, e) || listed(input.task_exes, e);
+        let main = main_exes_skipping(program, input.shortcut_targets, roots, args, &background)
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
             .collect();
@@ -305,7 +340,7 @@ impl<'a> Candidate<'a> {
             .display_icon
             .as_deref()
             .map(strip_icon_index)
-            .filter(|i| is_exe(i) && !i.parent().is_none_or(is_rejected_dir))
+            .filter(|i| is_exe(i) && !i.parent().is_none_or(is_rejected_dir) && !background(i))
             .filter(|i| !install.as_deref().is_some_and(|inst| normed_under(&norm(i), inst)))
             .and_then(|i| file_name_upper(&i));
         let uninstaller_name = if install.is_none() {
@@ -393,19 +428,22 @@ fn group_hits(
             // a main exe or has a background-looking name; running an uninstaller never does.
             let user_launched =
                 group.iter().any(|h| h.source == UsageSource::UserAssist) && !is_uninstaller(&latest.exe_path);
+            // A setup exe is never use of the program, whatever recorded it.
+            let installer = is_installer(&latest.exe_path) && (!main || user_launched);
             Some(ExeUsage {
                 exe_path: latest.exe_path.clone(),
                 last_run: latest.last_run,
                 source: latest.source,
                 run_count: group.iter().filter_map(|h| h.run_count).max(),
                 is_main: main,
-                excluded: if user_launched {
+                excluded: if installer {
+                    Some(ExcludeReason::NamePattern)
+                } else if user_launched {
                     None
                 } else {
                     exclude_reason(&latest.exe_path, service_exes)
-                        .or(task_exes.contains(&norm(&latest.exe_path)).then_some(ExcludeReason::ScheduledTask))
+                        .or(listed(task_exes, &latest.exe_path).then_some(ExcludeReason::ScheduledTask))
                         // A cached or bundled setup is never use of the program.
-                        .or((!main && is_installer(&latest.exe_path)).then_some(ExcludeReason::NamePattern))
                         .or((!main && !in_folder(&latest.exe_path)).then_some(ExcludeReason::NotMain))
                 },
             })
@@ -1254,6 +1292,44 @@ mod tests {
         let r = run_with_tasks(&programs, &hits, &HashSet::from([norm(Path::new(&agent))]));
         assert_eq!(usage(&r, "Firefox").last_used.when, None);
         assert_eq!(usage(&r, "Firefox").exes[0].excluded, Some(ExcludeReason::ScheduledTask));
+    }
+
+    #[test]
+    fn service_exe_chosen_as_display_icon_never_counts() {
+        // Office: the display icon is the ClickToRun service binary, outside the install folder.
+        let svc = r"C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe";
+        let mut p = prog("Office", Some(r"C:\Program Files\Microsoft Office"));
+        p.display_icon = Some(PathBuf::from(svc));
+        let services = HashSet::from([norm(Path::new(svc))]);
+        let none = HashMap::new();
+        let hits = [
+            hit(r"\PROGRAM FILES\COMMON FILES\MICROSOFT SHARED\CLICKTORUN\OFFICECLICKTORUN.EXE", 0, UsageSource::Prefetch),
+            hit(r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE", 9, UsageSource::Bam),
+        ];
+        let roots = HashMap::from([(ProgramId("Office".into()), vec![(PathBuf::from(r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"), 5)])]);
+        let r = match_usage(&input(std::slice::from_ref(&p), &hits, &[], &roots, &none, &services));
+        let u = usage(&r, "Office");
+        assert_eq!(u.last_used.when, Some(days_ago(9)));
+        // The service binary no longer claims anything by name, so it does not count at all.
+        assert!(u.exes.iter().all(|e| !e.exe_path.to_string_lossy().contains("CLICKTORUN") || e.excluded.is_some()));
+        // And as a scheduled-task action, with no other exe to fall back on: no date at all.
+        let tasks = HashSet::from([norm(Path::new(svc))]);
+        let r = run_with_tasks(std::slice::from_ref(&p), &hits[..1], &tasks);
+        assert_eq!(usage(&r, "Office").last_used.when, None);
+        assert_eq!(main_exes_skipping(&p, &[], &[], &[], &|e| norm(e) == norm(Path::new(svc))), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn userassist_installer_hit_does_not_count() {
+        let programs = [prog("Docker", Some(r"C:\Program Files\Docker\Docker"))];
+        let hits = [
+            hit(r"C:\Program Files\Docker\Docker\Docker Desktop Installer.exe", 0, UsageSource::UserAssist),
+            hit(r"C:\Program Files\Docker\Docker\tools\helper2.exe", 3, UsageSource::UserAssist),
+        ];
+        let r = run(&programs, &hits, &HashSet::new());
+        let u = usage(&r, "Docker");
+        assert_eq!(via_of(u), (Some(days_ago(3)), Some("helper2.exe")));
+        assert!(u.exes.iter().any(|e| e.excluded == Some(ExcludeReason::NamePattern)));
     }
 
     #[test]
