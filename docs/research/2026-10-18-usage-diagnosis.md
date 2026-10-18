@@ -55,8 +55,8 @@ Not fixed here:
 - Entries whose uninstaller is not named like one and lives in a differently named folder
   (Total Commander `totalcmd\tcunin64.exe`, EA app `EAUninstall.exe`, Rustup
   `.cargo\bin\rustup.exe`, OneDrive's versioned `OneDriveSetup.exe`) still have no folder.
-- A program without a folder whose uninstaller is named `setup.exe` (ASUS Motherboard) claims
-  every unclaimed `setup.exe` hit by name, as not-main (it does not make it look used).
+- (Fixed in the review round below.) A program without a folder whose uninstaller is named
+  `setup.exe` (ASUS Motherboard) claimed every unclaimed `setup.exe` hit by name.
 
 ## Counts
 
@@ -65,6 +65,7 @@ Not fixed here:
 | Before (plan baseline) | 173 | 286 |
 | Before (this run) | 174 | 285 |
 | After the fixes | 157 | 285 |
+| After review fixes | 161 | 285 |
 
 No longer "never": Google Chrome, Steam, Battlefield 6, Toggl Track, Netbird, Bitwarden,
 MEGAsync, JetBrains Toolbox, Paint.NET, Node.js, WireGuard, Meta Quest Remote Desktop, Fraps,
@@ -72,6 +73,18 @@ L-Connect 3, MSI Afterburner, Microsoft SQL Server 2019/2022, RSI Launcher, Syno
 Newly "never": Dota Underlords, which had been dated by Steam's own launches (UserAssist
 `steam.exe`, claimed by its uninstaller's file name; they now go to Steam by location), and the
 Chrome web app WorkoutBuddy (not traced; presumably the same with `chrome.exe`).
+
+Review fixes (same day): a folder derived from a nested uninstaller widens to the display
+icon's folder (`Application\141.x\Installer\setup.exe` under `Application\chrome.exe`); the
+display icon claims its exe by name whenever it lies outside the folder, but never from a
+rejected folder (shared root, `%SystemRoot%`, temp/installer caches, user folders); generic
+setup/uninstaller names (`setup.exe`, `unins000.exe`, ...) never claim by name. Four programs
+became "never" through the last two rules (the first three plus the x64 one checked with
+`dump usage`, the x86 one has the same layout): ASUS Motherboard
+(display icon `InstallShield Installation Information\{…}\Setup.exe`), SQL Server Management
+Studio 18.12.1 (`Package Cache\{…}\SSMS-Setup-ENU.exe`) and the two Visual C++ v14
+Redistributables (`Package Cache\{…}\VC_redist.x64.exe`). Their only hits are runs of their
+own cached setup (an upgrade on 2026-10-17), which is not use.
 
 ## Elevated output before the fixes
 

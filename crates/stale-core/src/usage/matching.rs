@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{UsageHit, UsageSource};
-use crate::leftovers::{system_root_norm, ProgramHint};
+use crate::leftovers::{is_rejected_dir, ProgramHint};
 use crate::model::{Program, ProgramId};
-use crate::pathutil::{drive_letter, exe_under, first_path_in_command, is_shared_root, norm, normed_under};
+use crate::pathutil::{drive_letter, exe_under, first_path_in_command, norm, normed_under};
 use crate::shortcuts::ShortcutTarget;
 
 /// Lowercased file-stem fragments that mark an exe as background machinery, not the program itself.
@@ -159,27 +159,44 @@ pub fn main_exes_with_rule(
 }
 
 /// The folder usage matching treats as the program's own: [`ProgramHint::effective_install_dir`]
-/// (`InstallLocation`, else the uninstaller's or display icon's folder), else the folder of the
+/// (`InstallLocation`, else the uninstaller's or display icon's folder; a folder derived from the
+/// uninstaller widens to the display icon's folder when that holds it), else the folder of the
 /// target of a Start Menu shortcut named exactly like the program. The last rule is only for MSI
 /// entries, which can carry no path at all (Google Chrome's: only `MsiExec.exe /X{…}`); browser
 /// web apps ("YouTube" → `chrome_proxy.exe`) are not MSI and never take the browser's folder. A
-/// target in a shared root or under `%SystemRoot%` gives nothing.
+/// target in a folder [`is_rejected_dir`] refuses (shared root, `%SystemRoot%`, caches, user folders) gives nothing.
 pub fn usage_install_dir(p: &Program, shortcut_targets: &[ShortcutTarget]) -> Option<PathBuf> {
     if let Some(dir) = ProgramHint::from_program(p).effective_install_dir() {
-        return Some(dir);
+        let from_install_location = p.install_location.as_deref().is_some_and(|l| norm(l) == norm(&dir));
+        // A derived folder below the display icon's (`Application\141.0\Installer\setup.exe`
+        // under `Application\chrome.exe`, `App\uninstall\uninstall.exe` under `App\app.exe`)
+        // widens to the display icon's folder.
+        let icon_dir = p.display_icon.as_deref().map(strip_icon_index);
+        let icon_dir = icon_dir.as_deref().and_then(Path::parent).filter(|d| !is_rejected_dir(d));
+        return match icon_dir {
+            Some(icon_dir) if !from_install_location && normed_under(&norm(&dir), &norm(icon_dir)) => Some(icon_dir.to_path_buf()),
+            _ => Some(dir),
+        };
     }
     if !p.is_msi {
         return None;
     }
     let name = p.name.trim();
-    let system_root = system_root_norm();
     shortcut_targets
         .iter()
         .filter(|t| t.lnk.file_stem().is_some_and(|s| s.to_string_lossy().trim().eq_ignore_ascii_case(name)))
-        .filter(|t| is_exe(&t.path) && drive_letter(&t.path).is_some() && !is_uninstaller(&t.path))
+        .filter(|t| is_exe(&t.path) && !is_uninstaller(&t.path))
         .filter_map(|t| t.path.parent())
-        .find(|dir| !is_shared_root(dir) && !normed_under(&norm(dir), &system_root) && norm(dir) != system_root)
+        .find(|dir| !is_rejected_dir(dir))
         .map(Path::to_path_buf)
+}
+
+/// File names of setups and uninstallers that many programs share (`setup.exe`,
+/// `unins000.exe`, ...): they never claim a hit by name.
+fn is_generic_installer_name(exe: &Path) -> bool {
+    let stem = exe.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(stem.as_str(), "setup" | "install" | "installer" | "uninstall" | "uninst" | "uninstaller")
+        || stem.strip_prefix("unins").is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// True when the exe's file stem contains one of `EXCLUDED_NAME_PARTS`.
@@ -273,17 +290,25 @@ impl<'a> Candidate<'a> {
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
             .collect();
-        let (mut icon_name, mut uninstaller_name) = (None, None);
-        if install.is_none() {
-            icon_name = program.display_icon.as_deref().map(strip_icon_index).filter(|i| is_exe(i)).and_then(|i| file_name_upper(&i));
-            uninstaller_name = program
+        // The display icon claims by name whenever it lies outside the folder (or there is none).
+        let icon_name = program
+            .display_icon
+            .as_deref()
+            .map(strip_icon_index)
+            .filter(|i| is_exe(i) && !i.parent().is_none_or(is_rejected_dir))
+            .filter(|i| !install.as_deref().is_some_and(|inst| normed_under(&norm(i), inst)))
+            .and_then(|i| file_name_upper(&i));
+        let uninstaller_name = if install.is_none() {
+            program
                 .uninstall_string
                 .as_deref()
                 .and_then(first_path_in_command)
-                .filter(|u| is_exe(u))
+                .filter(|u| is_exe(u) && !is_generic_installer_name(u))
                 .and_then(|u| file_name_upper(&u))
-                .filter(|n| n != "MSIEXEC.EXE");
-        }
+                .filter(|n| n != "MSIEXEC.EXE")
+        } else {
+            None
+        };
         Candidate { program, install, main, icon_name, uninstaller_name }
     }
 
@@ -925,6 +950,81 @@ mod tests {
     /// Observed live: Google Chrome is an MSI entry with no InstallLocation, DisplayIcon or
     /// uninstaller path (`MsiExec.exe /X{E9AB118B-…}`); the only link to its files is the Start
     /// Menu shortcut `Google Chrome.lnk` -> `C:\Program Files\Google\Chrome\Application\chrome.exe`.
+    /// Review finding: a non-MSI Chrome entry (no InstallLocation) names its uninstaller in a
+    /// versioned `Installer` folder below the display icon's folder; the folder must be the
+    /// display icon's, so `chrome.exe` stays the main exe.
+    #[test]
+    fn nested_uninstaller_folder_widens_to_display_icon_folder() {
+        let mut chrome = prog("Google Chrome", None);
+        chrome.display_icon = Some(PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+        chrome.uninstall_string = Some(
+            r#""C:\Program Files\Google\Chrome\Application\141.0.7390.108\Installer\setup.exe" --uninstall --system-level"#.into(),
+        );
+        assert_eq!(usage_install_dir(&chrome, &[]), Some(PathBuf::from(r"C:\Program Files\Google\Chrome\Application")));
+        let exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        assert_eq!(main_exes_with_rule(&chrome, &[], &[], &[]), (vec![PathBuf::from(exe)], MainRule::DisplayIcon));
+        let hits = [hit(exe, 0, UsageSource::Bam)];
+        let (no_roots, no_args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let r = match_usage(&input(std::slice::from_ref(&chrome), &hits, &[], &no_roots, &no_args, &services));
+        let u = usage(&r, "Google Chrome");
+        assert_eq!(u.last_used.when, Some(days_ago(0)));
+        assert!(u.exes[0].is_main && u.exes[0].excluded.is_none());
+
+        let mut app = prog("App", None);
+        app.display_icon = Some(PathBuf::from(r"C:\Apps\App\app.exe"));
+        app.uninstall_string = Some(r"C:\Apps\App\uninstall\uninstall.exe".into());
+        assert_eq!(usage_install_dir(&app, &[]), Some(PathBuf::from(r"C:\Apps\App")));
+    }
+
+    /// The display icon outside the folder derived from the uninstaller still claims its exe by
+    /// file name (as before the folder rule existed).
+    #[test]
+    fn display_icon_outside_derived_folder_still_claims_by_name() {
+        let mut p = prog("Bar", None);
+        p.display_icon = Some(PathBuf::from(r"C:\Apps\Bar\bar.exe"));
+        p.uninstall_string = Some(r"D:\Vendor\Uninstallers\Bar\uninstall.exe".into());
+        assert_eq!(usage_install_dir(&p, &[]), Some(PathBuf::from(r"D:\Vendor\Uninstallers\Bar")));
+        let hits = [hit(r"C:\Apps\Bar\bar.exe", 3, UsageSource::Bam)];
+        let (no_roots, no_args, services) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let r = match_usage(&input(std::slice::from_ref(&p), &hits, &[], &no_roots, &no_args, &services));
+        let u = usage(&r, "Bar");
+        assert_eq!(u.last_used.when, Some(days_ago(3)));
+        assert!(u.exes[0].is_main);
+    }
+
+    #[test]
+    fn msi_shortcut_into_a_user_folder_gives_no_folder() {
+        let mut p = prog("Tool", None);
+        p.is_msi = true;
+        let shortcuts = [ShortcutTarget {
+            path: env_path("USERPROFILE").join("Downloads").join("x.exe"),
+            arguments: String::new(),
+            lnk: PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Tool.lnk"),
+        }];
+        assert_eq!(usage_install_dir(&p, &shortcuts), None);
+    }
+
+    /// Observed live: "ASUS Motherboard" (no folder, uninstaller `setup.exe`) claimed every
+    /// unclaimed `setup.exe` hit by name.
+    #[test]
+    fn generic_setup_exe_is_not_name_claimed() {
+        let hits = [hit(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer.d454a31ec5884299aebc72b9310115fb\setup.exe", 1, UsageSource::Bam)];
+        for uninstaller in ["setup.exe", "Setup.exe", "install.exe", "uninstall.exe", "unins000.exe", "uninst.exe"] {
+            let mut p = prog("ASUS Motherboard", None);
+            p.uninstall_string = Some(format!(r#""C:\ProgramData\Package Cache\{{5E1B1F9A}}\{uninstaller}" /uninstall"#));
+            assert_eq!(usage_install_dir(&p, &[]), None, "{uninstaller}");
+            let hits = [UsageHit { exe_path: PathBuf::from(format!(r"C:\Elsewhere\{uninstaller}")), ..hits[0].clone() }];
+            let r = run(std::slice::from_ref(&p), &hits, &HashSet::new());
+            assert!(usage(&r, "ASUS Motherboard").exes.is_empty(), "{uninstaller}");
+            assert_eq!(r.unmatched.len(), 1);
+        }
+        // A specific uninstaller name still claims (as not-main).
+        let mut p = prog("Baz", None);
+        p.uninstall_string = Some(r#""C:\ProgramData\Package Cache\{5E1B1F9A}\BazRemover.exe""#.into());
+        let hits = [hit(r"D:\x\BazRemover.exe", 1, UsageSource::Bam)];
+        assert_eq!(usage(&run(&[p], &hits, &HashSet::new()), "Baz").exes.len(), 1);
+    }
+
     #[test]
     fn msi_entry_without_paths_uses_start_menu_shortcut_named_like_it() {
         let mut chrome = prog("Google Chrome", None);

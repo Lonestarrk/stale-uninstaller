@@ -120,13 +120,7 @@ impl ProgramHint {
     fn exe_dir(&self, exe: &Path) -> Option<PathBuf> {
         let stem = exe.file_stem()?.to_string_lossy().to_lowercase();
         let dir = exe.parent()?;
-        if drive_letter(exe).is_none()
-            || stem == "msiexec"
-            || normed_under(&norm(exe), &system_root_norm())
-            || is_shared_root(dir)
-            || in_temp_or_installer_cache(dir)
-            || in_user_folder(dir)
-        {
+        if drive_letter(exe).is_none() || stem == "msiexec" || is_rejected_dir(dir) {
             return None;
         }
         let named_like_uninstaller = UNINSTALLER_STEMS.iter().any(|u| stem.starts_with(u));
@@ -146,6 +140,20 @@ impl ProgramHint {
             other_locations: Vec::new(),
         }
     }
+}
+
+/// True when `dir` can never be a program's own folder: no drive letter, a shared root, at or
+/// under `%SystemRoot%`, a temp or installer-cache folder ([`in_temp_or_installer_cache`]), or
+/// at/under a profile's user folder (Desktop, Documents, ...).
+pub(crate) fn is_rejected_dir(dir: &Path) -> bool {
+    let n = norm(dir);
+    let system_root = system_root_norm();
+    drive_letter(dir).is_none()
+        || is_shared_root(dir)
+        || n == system_root
+        || normed_under(&n, &system_root)
+        || in_temp_or_installer_cache(dir)
+        || in_user_folder(dir)
 }
 
 /// Lowercase file-name prefixes of uninstallers (`unins000`, `Uninstall Obsidian`, `uninst`,
