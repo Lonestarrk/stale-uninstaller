@@ -32,3 +32,7 @@ cargo build -p stale-gui --release
 ```
 
 The release binary is a single statically linked exe. `cargo test --workspace` runs the unit tests without touching the registry or disk.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
