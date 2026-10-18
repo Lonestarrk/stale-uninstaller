@@ -4,7 +4,7 @@ A Windows uninstaller that tells you **when you last used each program**, so you
 
 Think Revo Uninstaller, but sorted by "last used" and showing which drive everything lives on.
 
-> Status: early development. The program list with last-used dates, the uninstall queue, leftover cleanup and quarantine with undo are built but have had limited real-world testing. Ghost-program detection is next (see [Roadmap](#roadmap)). The user interface is in Swedish.
+> Status: early development. The program list with last-used dates, the uninstall queue, leftover cleanup, quarantine with undo and ghost-program detection are built. The uninstall flow has passed a headless end-to-end test against a real per-user program; the GUI has had limited real-world testing. Next up: an installer and a first release (see [Roadmap](#roadmap)). The user interface is in Swedish.
 
 ## What it does
 
@@ -13,12 +13,13 @@ Think Revo Uninstaller, but sorted by "last used" and showing which drive everyt
 - **Filters** for "not used in 6 months", "not used in a year", "never seen", per drive, and "over 1 GB". Sortable table, search, and a details panel that lists every executable with its last run and the source of the date.
 - **Honest about uncertainty.** Each date shows which source it came from, and rows are marked "pending" until the scan has finished rather than showing a wrong value.
 
-Also built (plan 2, limited real-world testing so far):
+Also built (plans 2 and 3):
 
 - Queue several programs and uninstall them in one go, with an optional System Restore point.
 - Find leftovers in the file system, registry, services, scheduled tasks and shortcuts, grouped by confidence. Anything that might be your own data is unchecked by default.
 - **Quarantine instead of delete.** Removed files move to a per-drive quarantine folder and registry keys are exported first, so everything can be undone. Empty the quarantine when you need the space.
-- Find "ghost" programs that are already uninstalled but left files and registry entries behind.
+- **Ghost programs.** Finds programs that are already uninstalled but left folders, registry keys, dangling autostart/file-type/service/task/shortcut references or execution traces behind, groups the evidence per program and rates it "probably uninstalled", "leftovers only" or "uncertain". Uncertain ones (data that may belong to an installed program, another user, or a vendor) are never pre-checked. "Behåll" (keep) marks anything you want left alone, permanently.
+- **Warns when elevated under another account**, since per-user programs and AppData then belong to that account.
 
 ## Requirements
 
@@ -63,7 +64,8 @@ cargo run -p stale-core --example dump   # prints the program list to the consol
 |---|---|---|
 | 1, plan 1 | Program list with last-used, filters, details | Done |
 | 1, plan 2 | Uninstall queue, leftover scan, quarantine with undo | Done |
-| 1, plan 3 | Ghost programs (uninstalled but leftovers remain) | Planned |
+| 1, plan 3 | Ghost programs (uninstalled but leftovers remain), keep list, account warning | In final review |
+| 1, plan 4 | Installer (Inno Setup) and a first GitHub release | Planned |
 | 2 | Junk finder: temp folders, caches, AppData growth, with plain-language explanations and a "keep" list | Planned |
 | 3 | Microsoft Store apps | Planned |
 
