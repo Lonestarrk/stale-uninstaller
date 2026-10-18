@@ -78,3 +78,16 @@ A third run of the same job against the final setup, after the exe manifest and 
 | `--uninstall-cleanup --ask --silent` | Exit code 10 (no manifests); the data folder still existed afterwards. |
 | `unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=…` | Exit code 0. Log: `--ask` exit code 10, then `--apply remove` exit code 0, then the uninstall and the file deletions. Afterwards the program folder, the uninstall key, the Start-menu shortcut and `%ProgramData%\Stale Uninstaller` were gone, and no `C:\Stale Uninstaller` folder existed. |
 | Restore | `robocopy` back with the same flags (exit code 1), SDDL identical, 4 of 4 entries back. The folder held no `settings.json` or `important.json`, so there was nothing of those to restore. |
+
+## Version 0.1.1
+
+Setup `StaleUninstaller-Setup-0.1.1.exe`, 5 859 420 bytes, SHA-256
+`9D71A5F04CCF5A27A32262F856A132C14368C15459E673C887FC388E3AF1B20F`. Same procedure as the final
+0.1.0 build: no quarantine manifests, data folder backed up and restored (4 of 4 entries, SDDL
+identical).
+
+- Silent install: exit 0; uninstall entry shows DisplayVersion 0.1.1; installed exe version 0.1.1.
+- Elevated launch: main window shown, no side-by-side events, new icon in the title bar.
+- `--uninstall-cleanup --ask --silent`: exit 10, data folder untouched.
+- Silent uninstall: exit 0; log shows `--ask` exit 10, `--apply remove` exit 0, then file deletions;
+  program folder, uninstall key, shortcut and `%ProgramData%\Stale Uninstaller` gone.
