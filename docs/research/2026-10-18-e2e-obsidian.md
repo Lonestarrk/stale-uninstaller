@@ -34,6 +34,12 @@ test-only overrides, never set by the application:
 - `STALE_E2E_TRUST_ALL=1` (exactly `1`): `QuarantineOps::live()` trusts every manifest folder and uses
   a mover that creates payload roots and `<id>` folders as plain folders (reparse points still refused).
 
+Both overrides are compiled only with the `stale-core` cargo feature `e2e-overrides` (default
+off; `stale-gui` never enables it). Without the feature the variables are never read, so a
+release build cannot be talked out of its lock-down through the environment. The example
+requires the feature (`required-features` in `Cargo.toml`):
+`cargo run -p stale-core --features e2e-overrides --example e2e -- Obsidian [--vendor-silent]`.
+
 The example pre-creates `<data dir>\quarantine` as a plain folder (else `paths::quarantine_manifest_dir()`
 creates it locked). The runs below use
 `STALE_E2E_DATA_DIR=%LOCALAPPDATA%\Temp\stale-e2e-data STALE_E2E_TRUST_ALL=1`.

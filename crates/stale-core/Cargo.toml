@@ -12,5 +12,14 @@ thiserror = "2.0.21"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Security_Authorization", "Win32_Globalization", "Win32_System_Services"] }
 winreg = "0.56.0"
 
+[features]
+# Test-only environment overrides (STALE_E2E_DATA_DIR, STALE_E2E_TRUST_ALL) for examples/e2e.rs.
+# They remove security checks; stale-gui must never enable this.
+e2e-overrides = []
+
+[[example]]
+name = "e2e"
+required-features = ["e2e-overrides"]
+
 [dev-dependencies]
 tempfile = "3.27.0"

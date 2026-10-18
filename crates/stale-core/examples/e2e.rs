@@ -1,5 +1,5 @@
 //! Headless end-to-end test of the uninstall flow against a real per-user (HKCU) program:
-//! `cargo run -p stale-core --example e2e -- <name substring> [--vendor-silent] [--plan-only]`.
+//! `cargo run -p stale-core --features e2e-overrides --example e2e -- <name substring> [--vendor-silent] [--plan-only]`.
 //!
 //! Steps: pick the program, scan leftovers, run the vendor uninstaller silently (NSIS `/S`, only
 //! with `--vendor-silent`; else Forced mode), scan again, quarantine the default-checked items,
@@ -8,7 +8,8 @@
 //!
 //! THIS REMOVES THE PROGRAM. Unelevated, set the test-only overrides `STALE_E2E_DATA_DIR=<folder>`
 //! and `STALE_E2E_TRUST_ALL=1` (manifests are otherwise kept in the locked
-//! `%ProgramData%\Stale Uninstaller`, which only an elevated process can use).
+//! `%ProgramData%\Stale Uninstaller`, which only an elevated process can use). They exist only
+//! with the `e2e-overrides` feature, which this example requires.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

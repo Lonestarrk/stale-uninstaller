@@ -156,22 +156,45 @@ fn live_create_task(name: &str, xml: &Path) -> Result<(), String> {
     tool("schtasks.exe", &["/create".as_ref(), "/xml".as_ref(), xml.as_os_str(), "/tn".as_ref(), tn.as_ref(), "/f".as_ref()])
 }
 
-/// Test-only: `STALE_E2E_TRUST_ALL=1` makes [`QuarantineOps::live`] trust every manifest folder
-/// and skip the Administrators/SYSTEM lock-down of the manifest and payload folders (they are
-/// created as plain folders), so the headless end-to-end example (`examples/e2e.rs`) can
-/// quarantine, restore and purge unelevated. It removes a security check: the application never
-/// sets it, and it is meant to be combined with `STALE_E2E_DATA_DIR`.
+/// Test-only, compiled only with the `e2e-overrides` feature (which the GUI never enables):
+/// `STALE_E2E_TRUST_ALL=1` makes [`QuarantineOps::live`] trust every manifest folder and skip the
+/// Administrators/SYSTEM lock-down of the manifest and payload folders (they are created as plain
+/// folders), so the headless end-to-end example (`examples/e2e.rs`) can quarantine, restore and
+/// purge unelevated. It removes a security check, and it is meant to be combined with
+/// `STALE_E2E_DATA_DIR`. Without the feature the variable is never read.
+#[cfg(feature = "e2e-overrides")]
 pub const E2E_TRUST_ALL_ENV: &str = "STALE_E2E_TRUST_ALL";
 
 /// Whether the [`E2E_TRUST_ALL_ENV`] value asks for trust-all: exactly `"1"`.
+#[cfg(feature = "e2e-overrides")]
 fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
+/// The live mover and manifest-folder trust check: [`RealFileMover`] and [`owned_by_admins`].
+#[cfg(not(feature = "e2e-overrides"))]
+fn live_mover_and_trust() -> (Arc<dyn FileMover>, TrustCheck) {
+    (Arc::new(RealFileMover), Box::new(owned_by_admins))
+}
+
+/// The live mover and manifest-folder trust check; with [`E2E_TRUST_ALL_ENV`] set to `1`,
+/// [`UnlockedFileMover`] and trust in every folder.
+#[cfg(feature = "e2e-overrides")]
+fn live_mover_and_trust() -> (Arc<dyn FileMover>, TrustCheck) {
+    if trust_all_requested(std::env::var_os(E2E_TRUST_ALL_ENV)) {
+        log::warn!("{E2E_TRUST_ALL_ENV}=1: quarantine folders are not locked down (test only)");
+        (Arc::new(UnlockedFileMover), Box::new(|_| Some(true)))
+    } else {
+        (Arc::new(RealFileMover), Box::new(owned_by_admins))
+    }
+}
+
 /// [`RealFileMover`] without the lock-down, for [`E2E_TRUST_ALL_ENV`] only: payload roots and
 /// locked folders are created as plain folders (a reparse point is still refused).
+#[cfg(feature = "e2e-overrides")]
 struct UnlockedFileMover;
 
+#[cfg(feature = "e2e-overrides")]
 impl FileMover for UnlockedFileMover {
     fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError> {
         RealFileMover.move_path(from, to)
@@ -209,15 +232,11 @@ impl FileMover for UnlockedFileMover {
 }
 
 impl QuarantineOps {
-    /// Production operations. With the test-only [`E2E_TRUST_ALL_ENV`] set to `1`, folders are
-    /// not locked down and every manifest folder is trusted.
+    /// Production operations. With the `e2e-overrides` feature and the test-only
+    /// `STALE_E2E_TRUST_ALL` set to `1`, folders are not locked down and every manifest folder is
+    /// trusted.
     pub fn live() -> QuarantineOps {
-        let trust_all = trust_all_requested(std::env::var_os(E2E_TRUST_ALL_ENV));
-        if trust_all {
-            log::warn!("{E2E_TRUST_ALL_ENV}=1: quarantine folders are not locked down (test only)");
-        }
-        let mover: Arc<dyn FileMover> = if trust_all { Arc::new(UnlockedFileMover) } else { Arc::new(RealFileMover) };
-        let trusted_dir: TrustCheck = if trust_all { Box::new(|_| Some(true)) } else { Box::new(owned_by_admins) };
+        let (mover, trusted_dir) = live_mover_and_trust();
         QuarantineOps {
             mover,
             regw: Arc::new(WinRegistryWriter),
@@ -1124,6 +1143,20 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::Mutex;
 
+    #[cfg(not(feature = "e2e-overrides"))]
+    #[test]
+    fn trust_all_env_is_ignored_without_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("STALE_E2E_TRUST_ALL", "1");
+        let (_, trusted) = live_mover_and_trust();
+        std::env::remove_var("STALE_E2E_TRUST_ALL");
+        // A folder the (unelevated or elevated) test user created is not owned by Administrators
+        // unless the process is elevated; either way the trust check is the real one.
+        assert_eq!(trusted(dir.path()), owned_by_admins(dir.path()));
+        assert_ne!(trusted(Path::new(r"C:\no\such\folder\e2e")), Some(true));
+    }
+
+    #[cfg(feature = "e2e-overrides")]
     #[test]
     fn trust_all_override_is_ignored_unless_exactly_one() {
         assert!(!trust_all_requested(None));

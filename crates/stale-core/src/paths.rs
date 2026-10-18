@@ -6,12 +6,15 @@ fn env_or(var: &str, fallback: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| fallback.to_string())
 }
 
-/// Test-only: when set (and not empty), [`data_dir`] is this folder instead of
-/// `%ProgramData%\Stale Uninstaller`, so the headless end-to-end example (`examples/e2e.rs`) can
-/// run unelevated. The application never sets it.
+/// Test-only, compiled only with the `e2e-overrides` feature (which the GUI never enables): when
+/// set (and not empty), [`data_dir`] is this folder instead of `%ProgramData%\Stale Uninstaller`,
+/// so the headless end-to-end example (`examples/e2e.rs`) can run unelevated. Without the feature
+/// the variable is never read.
+#[cfg(feature = "e2e-overrides")]
 pub const E2E_DATA_DIR_ENV: &str = "STALE_E2E_DATA_DIR";
 
 /// `override_dir` when it is a non-empty value, else `<program_data>\Stale Uninstaller`.
+#[cfg(feature = "e2e-overrides")]
 fn data_dir_from(override_dir: Option<std::ffi::OsString>, program_data: &str) -> PathBuf {
     match override_dir {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -19,11 +22,18 @@ fn data_dir_from(override_dir: Option<std::ffi::OsString>, program_data: &str) -
     }
 }
 
+#[cfg(feature = "e2e-overrides")]
 fn data_dir_path() -> PathBuf {
     data_dir_from(std::env::var_os(E2E_DATA_DIR_ENV), &env_or("ProgramData", r"C:\ProgramData"))
 }
 
-/// `%ProgramData%\Stale Uninstaller` (or the test-only [`E2E_DATA_DIR_ENV`] folder), created on demand (creation errors are ignored).
+#[cfg(not(feature = "e2e-overrides"))]
+fn data_dir_path() -> PathBuf {
+    PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller")
+}
+
+/// `%ProgramData%\Stale Uninstaller` (or, with the `e2e-overrides` feature, the test-only
+/// `STALE_E2E_DATA_DIR` folder), created on demand (creation errors are ignored).
 pub fn data_dir() -> PathBuf {
     let dir = data_dir_path();
     let _ = std::fs::create_dir_all(&dir);
@@ -80,11 +90,22 @@ pub fn quarantine_payload_root(drive: char) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "e2e-overrides"))]
+    #[test]
+    fn data_dir_override_env_is_ignored_without_the_feature() {
+        let expected = PathBuf::from(env_or("ProgramData", r"C:\ProgramData")).join("Stale Uninstaller");
+        std::env::set_var("STALE_E2E_DATA_DIR", r"C:\e2e-should-be-ignored");
+        let got = data_dir_path();
+        std::env::remove_var("STALE_E2E_DATA_DIR");
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(feature = "e2e-overrides")]
     #[test]
     fn data_dir_override_is_ignored_when_unset_or_empty() {
         let expected = PathBuf::from(r"C:\ProgramData\Stale Uninstaller");
         assert_eq!(data_dir_from(None, r"C:\ProgramData"), expected);
         assert_eq!(data_dir_from(Some("".into()), r"C:\ProgramData"), expected);
-        assert_eq!(data_dir_from(Some(r"C:	mp\e2e".into()), r"C:\ProgramData"), PathBuf::from(r"C:	mp\e2e"));
+        assert_eq!(data_dir_from(Some(r"C:\tmp\e2e".into()), r"C:\ProgramData"), PathBuf::from(r"C:\tmp\e2e"));
     }
 }

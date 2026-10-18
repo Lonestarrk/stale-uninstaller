@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build: `cargo build` (release: `cargo build -p stale-gui --release` → `target/release/StaleUninstaller.exe`, statically linked CRT)
 - Run: `target\release\StaleUninstaller.exe` — the manifest requires elevation, so `cargo run -p stale-gui` fails with os error 740 from a non-elevated shell; launch the exe directly and accept the UAC prompt.
 - Core smoke test against the real machine: `cargo run -p stale-core --example dump` (run elevated to get BAM/Prefetch data; prints one line per program sorted oldest-first).
+- Headless end-to-end uninstall test (removes the program!): `cargo run -p stale-core --features e2e-overrides --example e2e -- Obsidian` with `STALE_E2E_DATA_DIR`/`STALE_E2E_TRUST_ALL=1` set; see `docs/research/2026-10-18-e2e-obsidian.md`.
 - Test all: `cargo test --workspace`
 - Single test: `cargo test -p stale-core <name>` / `cargo test -p stale-gui <name>`
 - Live tests that read the real registry/Prefetch/shell are `#[ignore]`; run with `cargo test -p stale-core -- --ignored <name>` (some need elevation).
