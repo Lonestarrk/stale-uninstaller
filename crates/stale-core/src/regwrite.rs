@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::model::{Hive, RegKeyPath};
+use crate::proc::{run_hidden, system32_tool};
 
 pub trait RegistryWriter: Send + Sync {
     /// Exports `key` and its subkeys to a `.reg` file (overwriting it).
@@ -33,22 +34,18 @@ fn reg_exe_key(key: &RegKeyPath) -> String {
     }
 }
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Runs a console tool without a window; spawn failure or a non-zero exit becomes `Err(<its output>)`.
-pub(crate) fn run_hidden(program: &str, args: &[&OsStr]) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new(program)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("{program}: {e}"))?;
-    if out.status.success() {
-        return Ok(());
+/// `(parent, leaf)` of a key that may be deleted. Keys directly under a hive root (`HKLM\SOFTWARE`)
+/// and the root itself are refused.
+fn deletable_split(key: &RegKeyPath) -> Result<(&str, &str), String> {
+    let path = trimmed(key);
+    if path.split('\\').filter(|c| !c.is_empty()).count() < 2 {
+        return Err(format!(r"refusing to delete top-level key {}", short_key(key)));
     }
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-    let msg = [text(&out.stderr), text(&out.stdout)].into_iter().find(|s| !s.is_empty());
-    Err(msg.unwrap_or_else(|| format!("{program} exited with {}", out.status)))
+    Ok(path.rsplit_once('\\').unwrap())
+}
+
+fn reg_exe(args: &[&OsStr]) -> Result<(), String> {
+    run_hidden(&system32_tool("reg.exe"), args)
 }
 
 fn predef(h: Hive) -> winreg::RegKey {
@@ -66,15 +63,12 @@ pub struct WinRegistryWriter;
 impl RegistryWriter for WinRegistryWriter {
     fn export_key(&self, key: &RegKeyPath, to_file: &Path) -> Result<(), String> {
         let k = reg_exe_key(key);
-        run_hidden("reg.exe", &["export".as_ref(), k.as_ref(), to_file.as_os_str(), "/y".as_ref()])
+        reg_exe(&["export".as_ref(), k.as_ref(), to_file.as_os_str(), "/y".as_ref(), "/reg:64".as_ref()])
     }
 
     fn delete_key(&self, key: &RegKeyPath) -> Result<(), String> {
         use winreg::enums::{KEY_ALL_ACCESS, KEY_WOW64_64KEY};
-        let (parent, leaf) = trimmed(key).rsplit_once('\\').unwrap_or(("", trimmed(key)));
-        if leaf.is_empty() {
-            return Err("refusing to delete a hive root".to_string());
-        }
+        let (parent, leaf) = deletable_split(key)?;
         predef(key.hive)
             .open_subkey_with_flags(parent, KEY_ALL_ACCESS | KEY_WOW64_64KEY)
             .and_then(|p| p.delete_subkey_all(leaf))
@@ -90,7 +84,7 @@ impl RegistryWriter for WinRegistryWriter {
     }
 
     fn import_file(&self, file: &Path) -> Result<(), String> {
-        run_hidden("reg.exe", &["import".as_ref(), file.as_os_str()])
+        reg_exe(&["import".as_ref(), file.as_os_str(), "/reg:64".as_ref()])
     }
 }
 
@@ -171,6 +165,15 @@ mod tests {
         assert_eq!(reg_exe_key(&key(Hive::LocalMachine, r"SOFTWARE\Vendor\")), r"HKEY_LOCAL_MACHINE\SOFTWARE\Vendor");
         assert_eq!(reg_exe_key(&key(Hive::CurrentUser, r"Software\X")), r"HKEY_CURRENT_USER\Software\X");
         assert_eq!(reg_exe_key(&key(Hive::Users, r"S-1-5-21-1\Software")), r"HKEY_USERS\S-1-5-21-1\Software");
+    }
+
+    #[test]
+    fn delete_refuses_hive_roots_and_top_level_keys() {
+        for p in ["", r"\", "SOFTWARE", r"SOFTWARE\", r"\SOFTWARE\\"] {
+            assert!(deletable_split(&key(Hive::LocalMachine, p)).is_err(), "{p:?}");
+        }
+        assert_eq!(deletable_split(&key(Hive::LocalMachine, r"SOFTWARE\Vendor\")), Ok(("SOFTWARE", "Vendor")));
+        assert_eq!(deletable_split(&key(Hive::CurrentUser, r"Software\A\B")), Ok((r"Software\A", "B")));
     }
 
     const TEST_KEY: &str = r"Software\StaleUninstallerTest";

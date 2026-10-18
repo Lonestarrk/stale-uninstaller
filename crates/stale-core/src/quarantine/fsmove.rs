@@ -1,16 +1,51 @@
 //! Moving quarantined files: [`RealFileMover`] for production, [`FakeFileMover`] for tests.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::QuarantineId;
 use crate::pathutil::{drive_letter, norm};
+use crate::proc::{run_hidden, system32_tool};
+
+/// Why [`FileMover::move_path`] did not complete.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MoveError {
+    /// The destination already exists; nothing was touched.
+    Exists,
+    /// The path (the source or something below it) is in use; nothing was moved.
+    Locked(PathBuf),
+    /// A symlink/junction was found in the tree of a cross-volume move; nothing was moved.
+    LinkInTree(PathBuf),
+    /// Everything was copied to `stored`, but the source could not be (fully) deleted.
+    /// The copy is kept so it can be recorded and restored.
+    PartialMove { stored: PathBuf, detail: String },
+    Other(String),
+}
+
+impl fmt::Display for MoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MoveError::Exists => write!(f, "destination already exists"),
+            MoveError::Locked(p) => write!(f, "locked: {}", p.display()),
+            MoveError::LinkInTree(p) => write!(f, "link in tree: {}", p.display()),
+            MoveError::PartialMove { stored, detail } => {
+                write!(f, "copied to {} but the source was not fully removed: {detail}", stored.display())
+            }
+            MoveError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for MoveError {}
 
 pub trait FileMover: Send + Sync {
-    /// Moves a file or folder; creates `to`'s parent folders. Across volumes it copies, then deletes.
-    fn move_path(&self, from: &Path, to: &Path) -> Result<(), String>;
-    /// Creates `root` and restricts it to Administrators and SYSTEM (a failed ACL change is only logged).
+    /// Moves a file or folder; creates `to`'s parent folders and never overwrites an existing `to`.
+    /// Across volumes it copies the whole tree, verifies it, then deletes the source.
+    fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError>;
+    /// Creates `root` and restricts it to Administrators and SYSTEM. Refuses a root (or parent)
+    /// that is a reparse point; a failed ACL change is fatal only for a root that already existed.
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String>;
     /// Bytes of a file, or of all files below a folder; 0 when missing.
     fn size_of(&self, p: &Path) -> u64;
@@ -23,36 +58,71 @@ pub trait FileMover: Send + Sync {
 
 /// `root\<id>\<DRIVE>\<original without drive>`, e.g. `D:\Program Files\Unity Hub` →
 /// `D:\Stale Uninstaller\quarantine\<id>\D\Program Files\Unity Hub`. `None` for originals without a
-/// drive letter (UNC, relative) and for a bare drive root.
+/// drive letter (UNC, relative), drive-relative paths (`C:foo`), a bare drive root, or any `..`.
 pub fn stored_path_for(root: &Path, id: &QuarantineId, original: &Path) -> Option<PathBuf> {
     let drive = drive_letter(original)?;
-    let rest = original.to_str()?[2..].trim_matches(['\\', '/']);
-    if rest.is_empty() {
+    let rest = &original.to_str()?[2..];
+    if !rest.starts_with(['\\', '/']) {
+        return None;
+    }
+    let rest = rest.trim_matches(['\\', '/']);
+    if rest.is_empty() || rest.split(['\\', '/']).any(|c| c == "..") {
         return None;
     }
     Some(root.join(&id.0).join(drive.to_string()).join(rest))
 }
 
 const ERROR_NOT_SAME_DEVICE: i32 = 17;
+const ERROR_SHARING_VIOLATION: i32 = 32;
 const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// Moves files on the real file system.
 pub struct RealFileMover;
 
-/// Copies `from` (file or folder tree) to `to`. Symlinks and junctions are skipped with a warning.
-fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
-    let md = std::fs::symlink_metadata(from)?;
-    if md.file_type().is_symlink() {
-        log::warn!("quarantine: skipping link {}", from.display());
-        return Ok(());
+fn is_reparse(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    md.file_type().is_symlink() || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn is_reparse_point(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|md| is_reparse(&md))
+}
+
+fn other(what: &str, p: &Path, e: std::io::Error) -> MoveError {
+    MoveError::Other(format!("{what} {}: {e}", p.display()))
+}
+
+/// Copies `from` (file or folder tree) to `to`; stops at the first symlink/junction.
+fn copy_recursive(from: &Path, to: &Path) -> Result<(), MoveError> {
+    let md = std::fs::symlink_metadata(from).map_err(|e| other("read", from, e))?;
+    if is_reparse(&md) {
+        return Err(MoveError::LinkInTree(from.to_path_buf()));
     }
     if !md.is_dir() {
-        return std::fs::copy(from, to).map(|_| ());
+        return std::fs::copy(from, to).map(|_| ()).map_err(|e| other("copy", from, e));
     }
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
+    std::fs::create_dir_all(to).map_err(|e| other("create", to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| other("list", from, e))? {
+        let entry = entry.map_err(|e| other("list", from, e))?;
         copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Checks that every file below `from` exists below `to` with the same length.
+fn verify_copy(from: &Path, to: &Path) -> Result<(), MoveError> {
+    let failed = |p: &Path| MoveError::Other(format!("copy verification failed for {}", p.display()));
+    let md = std::fs::symlink_metadata(from).map_err(|e| other("read", from, e))?;
+    let copy = std::fs::symlink_metadata(to).map_err(|_| failed(from))?;
+    if md.is_dir() != copy.is_dir() || (!md.is_dir() && md.len() != copy.len()) {
+        return Err(failed(from));
+    }
+    if md.is_dir() {
+        for entry in std::fs::read_dir(from).map_err(|e| other("list", from, e))? {
+            let entry = entry.map_err(|e| other("list", from, e))?;
+            verify_copy(&entry.path(), &to.join(entry.file_name()))?;
+        }
     }
     Ok(())
 }
@@ -62,41 +132,65 @@ fn remove_any(p: &Path) -> std::io::Result<()> {
     if md.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
 }
 
-/// The cross-volume fallback: copy, then delete the source. A failed copy removes the partial
-/// copy; a failed delete leaves the full copy at `to` and returns the error.
-fn move_by_copy(from: &Path, to: &Path) -> Result<(), String> {
-    if let Err(e) = copy_recursive(from, to) {
-        let _ = remove_any(to);
-        return Err(format!("copy {} -> {}: {e}", from.display(), to.display()));
+/// The cross-volume fallback: copy the whole tree, verify it, then delete the source.
+/// A failed copy/verify removes the partial copy (`to` did not exist before) and leaves the source
+/// untouched; a failed delete keeps the full copy and returns [`MoveError::PartialMove`].
+fn move_by_copy(from: &Path, to: &Path) -> Result<(), MoveError> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(MoveError::Exists);
     }
-    remove_any(from).map_err(|e| format!("remove {} after copy: {e}", from.display()))
+    if let Err(e) = copy_recursive(from, to).and_then(|()| verify_copy(from, to)) {
+        let _ = remove_any(to);
+        return Err(e);
+    }
+    remove_any(from).map_err(|e| MoveError::PartialMove {
+        stored: to.to_path_buf(),
+        detail: format!("remove {}: {e}", from.display()),
+    })
 }
 
 impl FileMover for RealFileMover {
-    fn move_path(&self, from: &Path, to: &Path) -> Result<(), String> {
+    fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError> {
+        if std::fs::symlink_metadata(to).is_ok() {
+            return Err(MoveError::Exists);
+        }
+        std::fs::symlink_metadata(from).map_err(|e| other("read", from, e))?;
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| other("create", parent, e))?;
         }
         match std::fs::rename(from, to) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) => move_by_copy(from, to),
-            Err(e) => Err(format!("move {} -> {}: {e}", from.display(), to.display())),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(MoveError::Locked(from.to_path_buf())),
+            Err(e) => Err(MoveError::Other(format!("move {} -> {}: {e}", from.display(), to.display()))),
         }
     }
 
     fn ensure_payload_root(&self, root: &Path) -> Result<(), String> {
+        for p in root.parent().into_iter().chain([root]) {
+            if is_reparse_point(p) {
+                return Err(format!("{} is a link or reparse point", p.display()));
+            }
+        }
+        let existed = std::fs::symlink_metadata(root).is_ok();
         std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
-        let args = [
+        let icacls = system32_tool("icacls.exe");
+        let owner = [root.as_os_str(), "/setowner".as_ref(), "*S-1-5-32-544".as_ref(), "/t".as_ref(), "/c".as_ref(), "/q".as_ref()];
+        let grant = [
             root.as_os_str(),
             "/inheritance:r".as_ref(),
             "/grant:r".as_ref(),
             "*S-1-5-32-544:(OI)(CI)F".as_ref(),
             "*S-1-5-18:(OI)(CI)F".as_ref(),
         ];
-        if let Err(e) = crate::regwrite::run_hidden("icacls", &args) {
-            log::warn!("quarantine: icacls on {} failed: {e}", root.display());
+        match run_hidden(&icacls, &owner).and_then(|()| run_hidden(&icacls, &grant)) {
+            Ok(()) => Ok(()),
+            Err(e) if existed => Err(format!("securing existing {}: {e}", root.display())),
+            Err(e) => {
+                log::warn!("quarantine: icacls on {} failed: {e}", root.display());
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn size_of(&self, p: &Path) -> u64 {
@@ -185,25 +279,24 @@ impl FakeFileMover {
         self.volumes.lock().unwrap().insert(drive.to_ascii_uppercase(), ok);
     }
 
-    fn check_locked(&self, p: &Path) -> Result<(), String> {
+    fn locked_under(&self, p: &Path) -> Option<PathBuf> {
         let base = norm(p);
-        match self.locked.lock().unwrap().iter().find(|(k, _)| under(k, &base)) {
-            Some((_, path)) => Err(format!("locked: {}", path.display())),
-            None => Ok(()),
-        }
+        self.locked.lock().unwrap().iter().find(|(k, _)| under(k, &base)).map(|(_, path)| path.clone())
     }
 }
 
 impl FileMover for FakeFileMover {
-    fn move_path(&self, from: &Path, to: &Path) -> Result<(), String> {
+    fn move_path(&self, from: &Path, to: &Path) -> Result<(), MoveError> {
         self.log.lock().unwrap().push(format!("move {} -> {}", from.display(), to.display()));
-        if !self.exists(from) {
-            return Err(format!("not found: {}", from.display()));
-        }
         if self.exists(to) {
-            return Err(format!("already exists: {}", to.display()));
+            return Err(MoveError::Exists);
         }
-        self.check_locked(from)?;
+        if !self.exists(from) {
+            return Err(MoveError::Other(format!("not found: {}", from.display())));
+        }
+        if let Some(locked) = self.locked_under(from) {
+            return Err(MoveError::Locked(locked));
+        }
         let base = norm(from);
         let depth = from.components().count();
         let mut entries = self.entries.lock().unwrap();
@@ -236,7 +329,9 @@ impl FileMover for FakeFileMover {
 
     fn remove_all(&self, p: &Path) -> Result<(), String> {
         self.log.lock().unwrap().push(format!("remove {}", p.display()));
-        self.check_locked(p)?;
+        if let Some(locked) = self.locked_under(p) {
+            return Err(MoveError::Locked(locked).to_string());
+        }
         let base = norm(p);
         self.entries.lock().unwrap().retain(|k, _| !under(k, &base));
         Ok(())
@@ -266,8 +361,17 @@ mod tests {
             stored_path_for(root, &id(), Path::new(r"c:\Users\A\AppData\Local\Unity\")),
             Some(PathBuf::from(r"D:\Stale Uninstaller\quarantine\20261018-120000-ab12\C\Users\A\AppData\Local\Unity"))
         );
-        assert_eq!(stored_path_for(root, &id(), Path::new(r"\server\share\Unity")), None);
+        assert_eq!(stored_path_for(root, &id(), Path::new(r"\\server\share\Unity")), None);
         assert_eq!(stored_path_for(root, &id(), Path::new(r"D:\")), None);
+    }
+
+    #[test]
+    fn stored_path_rejects_parent_components_and_drive_relative_paths() {
+        let root = Path::new(r"D:\Stale Uninstaller\quarantine");
+        for bad in [r"C:foo", r"C:foo\bar", r"C:\a\..\b", r"C:\a\..", r"C:/a/../../Windows", r"C:\.."] {
+            assert_eq!(stored_path_for(root, &id(), Path::new(bad)), None, "{bad}");
+        }
+        assert!(stored_path_for(root, &id(), Path::new(r"C:\a..b\c")).is_some());
     }
 
     #[test]
@@ -278,6 +382,7 @@ mod tests {
         m.add_file(r"C:\App\sub\b.dll", 5);
         m.add_file(r"C:\Other\c.txt", 3);
         m.add_file(r"C:\Apples.txt", 1);
+        m.add_file(r"D:\Q\x\Taken", 2);
         m.lock(r"C:\Other\c.txt");
         m.set_volume_ok('E', false);
         assert_eq!(m.size_of(Path::new(r"c:\app")), 15);
@@ -292,10 +397,14 @@ mod tests {
 
         assert_eq!(
             m.move_path(Path::new(r"C:\Other"), Path::new(r"D:\Q\x\C\Other")),
-            Err(r"locked: C:\Other\c.txt".to_string())
+            Err(MoveError::Locked(PathBuf::from(r"C:\Other\c.txt")))
         );
         assert!(m.exists(Path::new(r"C:\Other\c.txt")));
         assert!(!m.exists(Path::new(r"D:\Q\x\C\Other")));
+
+        assert_eq!(m.move_path(Path::new(r"C:\Apples.txt"), Path::new(r"d:\q\x\taken")), Err(MoveError::Exists));
+        assert!(m.exists(Path::new(r"C:\Apples.txt")));
+        assert_eq!(m.size_of(Path::new(r"D:\Q\x\Taken")), 2);
 
         m.remove_all(dest).unwrap();
         assert!(!m.exists(dest));
@@ -306,6 +415,7 @@ mod tests {
             vec![
                 r"move C:\App -> D:\Q\x\C\App",
                 r"move C:\Other -> D:\Q\x\C\Other",
+                r"move C:\Apples.txt -> d:\q\x\taken",
                 r"remove D:\Q\x\C\App",
             ]
         );
@@ -317,6 +427,19 @@ mod tests {
         std::fs::write(src.join("a.dll"), b"0123456789").unwrap();
         std::fs::write(src.join("sub").join("b.dll"), b"01234").unwrap();
         src
+    }
+
+    /// Creates a directory junction (no privilege needed); `false` if this machine refuses.
+    fn junction(link: &Path, target: &Path) -> bool {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return true;
+        }
+        std::process::Command::new(system32_tool("cmd.exe"))
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     #[test]
@@ -333,7 +456,30 @@ mod tests {
         m.remove_all(&dest).unwrap();
         assert!(!m.exists(&dest));
         m.remove_all(&dest).unwrap();
-        assert!(m.move_path(&src, &dest).is_err());
+        assert!(matches!(m.move_path(&src, &dest), Err(MoveError::Other(_))));
+    }
+
+    #[test]
+    fn real_move_refuses_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = RealFileMover;
+
+        let (new, old) = (tmp.path().join("new.txt"), tmp.path().join("old.txt"));
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        assert_eq!(m.move_path(&new, &old), Err(MoveError::Exists));
+        assert_eq!(std::fs::read(&new).unwrap(), b"new");
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+
+        let src = tree(tmp.path());
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), b"keep").unwrap();
+        assert_eq!(m.move_path(&src, &dest), Err(MoveError::Exists));
+        assert_eq!(move_by_copy(&src, &dest), Err(MoveError::Exists));
+        assert_eq!(std::fs::read(dest.join("keep.txt")).unwrap(), b"keep");
+        assert!(!dest.join("a.dll").exists());
+        assert_eq!(m.size_of(&src), 15);
     }
 
     #[test]
@@ -350,8 +496,63 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         move_by_copy(&file, &tmp.path().join("two.txt")).unwrap();
         assert!(!file.exists() && tmp.path().join("two.txt").is_file());
-        assert!(move_by_copy(&file, &tmp.path().join("three.txt")).is_err());
+        assert!(matches!(move_by_copy(&file, &tmp.path().join("three.txt")), Err(MoveError::Other(_))));
         assert!(!tmp.path().join("three.txt").exists());
+    }
+
+    #[test]
+    fn move_by_copy_keeps_copy_when_source_delete_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tree(tmp.path());
+        let dest = tmp.path().join("dest");
+        // Readable (so it can be copied) but not deletable while this handle is open.
+        let handle = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(src.join("sub").join("b.dll")).unwrap();
+        let err = move_by_copy(&src, &dest).unwrap_err();
+        assert!(matches!(&err, MoveError::PartialMove { stored, .. } if stored == &dest), "{err:?}");
+        assert_eq!(std::fs::read(dest.join("a.dll")).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(dest.join("sub").join("b.dll")).unwrap(), b"01234");
+        assert!(src.join("sub").join("b.dll").exists());
+        drop(handle);
+    }
+
+    #[test]
+    fn move_by_copy_refuses_links_in_tree_before_deleting_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tree(tmp.path());
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("precious.txt"), b"keep").unwrap();
+        let link = src.join("link");
+        if !junction(&link, &target) {
+            eprintln!("skipped: cannot create a junction here");
+            return;
+        }
+        let dest = tmp.path().join("dest");
+        assert_eq!(move_by_copy(&src, &dest), Err(MoveError::LinkInTree(link.clone())));
+        assert!(!dest.exists(), "partial copy is cleaned up");
+        assert_eq!(RealFileMover.size_of(&src), 15);
+        assert_eq!(std::fs::read(target.join("precious.txt")).unwrap(), b"keep");
+
+        assert_eq!(move_by_copy(&link, &dest), Err(MoveError::LinkInTree(link.clone())));
+        assert!(!dest.exists());
+        assert!(link.exists());
+    }
+
+    #[test]
+    fn ensure_payload_root_refuses_reparse_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("Stale Uninstaller");
+        if !junction(&link, &target) {
+            eprintln!("skipped: cannot create a junction here");
+            return;
+        }
+        assert!(RealFileMover.ensure_payload_root(&link.join("quarantine")).is_err());
+        assert!(RealFileMover.ensure_payload_root(&link).is_err());
+        assert!(!target.join("quarantine").exists(), "nothing created through the link");
     }
 
     #[test]
