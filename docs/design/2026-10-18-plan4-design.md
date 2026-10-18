@@ -168,6 +168,17 @@ Mappförklararen och ögonblicksbilderna mäter många mappar. Mätningen körs 
 
 Nya vyer i verktygsraden: **Mappar** (§4–5), **Skräp** (§6, §9) och **Utrymme** (§7). Samma filtrerings-, tabell- och karantänmönster som de befintliga vyerna. All text på svenska i `strings.rs`.
 
+### 13.1 Språk
+
+Beslutat i samtalet (2026-10-18): programmet går att köra på svenska och engelska.
+- Första start: språket följer Windows visningsspråk. Svenska ger svenska, alla andra språk ger engelska.
+- Valet görs i inställningsmenyn, "Språk / Language", och sparas i `settings.json`. Bytet slår igenom direkt utan omstart.
+- Alla texter som visas för användaren finns på båda språken, även relativa datum ("3 dagar sedan" / "3 days ago"), felmeddelanden, varningar från kärnan och dialogen vid `--uninstall-cleanup`. Kompilatorn ska vägra en text som saknas på något av språken.
+- Kärnan skickar inga färdiga svenska meningar. Varningar och felorsaker är nycklar eller typade värden som gränssnittet översätter.
+- Installern visar svenska eller engelska efter Windows språk. Avinstallationsdialogen följer det språk som är sparat i programmet.
+- Datum visas som i dag (ÅÅÅÅ-MM-DD) på båda språken. Storlekar använder MB/GB på båda.
+- Senare uppgifter i plan 4 och plan 5 lägger in nya texter på båda språken.
+
 ## 14. Överlämnat till byggaren
 
 Katalogens format och innehåll (startar med kategorierna i §6.1 och de vanligaste AppData-mapparna från researchen), exakt heuristik för installationskälla, trådpoolens storlek, hur beroenden upptäcks, exakta verktygskommandon i §6.3, Inno Setup-detaljer, skill-namnet.

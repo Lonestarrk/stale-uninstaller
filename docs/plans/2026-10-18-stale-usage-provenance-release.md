@@ -12,7 +12,7 @@
 
 - Windows 10/11 x64; `stale-core` never depends on egui; OS access behind traits/closures; tests never touch the real registry/disk outside tempdirs.
 - Elevated verification on the developer's machine runs through the scheduled task `StaleDevElevated` (drop a `.ps1` into `.superpowers/elevated/jobs/`, `Start-ScheduledTask -TaskName StaleDevElevated`, read `.superpowers/elevated/log.txt`; `lib.ps1` has `Start-Stale`, `Save-Shot`, `Click-At`, `Stop-Stale`).
-- All UI strings Swedish in `strings.rs`. README Features updated in the same commit as any user-visible change (CLAUDE.md "Conventions").
+- All UI strings live in `strings.rs` in both Swedish and English (Task 7, executed right after Task 2); every task after Task 7 adds new strings in both languages. README Features updated in the same commit as any user-visible change (CLAUDE.md "Conventions").
 - License MIT. Docs tool-neutral (`docs/design`, `docs/plans`, `docs/research`).
 - Commit per task; trailer lines from the session reminder.
 
@@ -134,6 +134,25 @@ One commit per numbered item; each with its test:
 - [ ] **Step 4: Install Inno Setup** via the elevated runner (`winget install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements --disable-interactivity`), build `installer\Output\StaleUninstaller-Setup-0.1.0.exe`, run the elevated smoke test from the skill (install, launch + `Save-Shot`, uninstall with an empty quarantine, verify the program folder and `%ProgramData%\Stale Uninstaller` are gone). Record the log in `docs/research/2026-10-18-installer-smoke.md`.
 - [ ] **Step 5: Commit** — `feat: Inno Setup installer, uninstall cleanup and release routine`
 - [ ] **Step 6 (controller, after the final review and merge):** follow the skill to tag `v0.1.0` and publish the GitHub release with the setup attached.
+
+---
+
+### Task 7: Swedish and English UI (executed after Task 2, before Task 3)
+
+**Spec:** design §13.1.
+
+**Files:** Modify `crates/stale-gui/src/strings.rs` (and every GUI file that uses it), `crates/stale-core/src/settings.rs`, `crates/stale-gui/src/app.rs` (settings menu), core modules that emit Swedish text (`usage/prefetch.rs` warning and any other user-visible core text), `README.md`, `CLAUDE.md`.
+
+**Interfaces:**
+- Produces: `stale_gui::strings::Lang { Sv, En }`; `strings::set_lang(Lang)`, `strings::lang() -> Lang` (process-wide, an atomic); `strings::t() -> &'static Strings`, where `Strings` is a struct of `&'static str` fields with two `static` instances `SV` and `EN` so a missing translation is a compile error. Formatting helpers (`kept_notice`, `other_account_warning`, relative dates, …) stay functions and branch on `lang()`. `Settings` gains `pub language: Option<String>` (`"sv"`/`"en"`, serde default `None`). `strings::detect_lang() -> Lang` from `GetUserDefaultUILanguage` (primary language Swedish → `Sv`, else `En`). Core warnings become typed values (e.g. `ScanWarning::PrefetchUnreadable { skipped, total }`) that the GUI renders.
+
+- [ ] **Step 1: Failing tests** in the gui lib: `both_languages_render_relative_dates` (`"3 dagar sedan"` / `"3 days ago"`, `"Idag"` / `"Today"`, `"Idag (autostart, via link.exe)"` / `"Today (autostart, via link.exe)"`), `detect_lang_maps_swedish_and_falls_back_to_english` (pure helper over a LANGID: 0x041D and 0x081D → `Sv`, 0x0409 → `En`), `settings_language_round_trips_and_defaults_to_none`, `prefetch_warning_renders_in_both_languages`.
+- [ ] **Step 2: Run, expect failure.**
+- [ ] **Step 3: Implement.** Move every existing Swedish string into `SV` unchanged and write the English text in `EN`. On start: `settings.language` if set, else `detect_lang()`. Settings menu entry "Språk / Language" with "Svenska" and "English" (these two labels are the same in both languages); choosing one calls `set_lang`, saves settings, and the next frame redraws. README: replace "The user interface is in Swedish." with "The user interface is available in English and Swedish." and add a Features line "**English and Swedish.** Follows the Windows display language on first start; switch any time in the settings menu." CLAUDE.md: update the strings.rs description to say both languages and that new strings need both.
+- [ ] **Step 4: Run tests, clippy (both variants), and the release build.** Launch the elevated exe through the elevated runner, switch language, capture a screenshot of each language to `.superpowers/elevated/shots/`.
+- [ ] **Step 5: Commit** — `feat: English and Swedish UI with a language setting`
+
+**Task 6 addendum:** `stale.iss` gets `[Languages]` `english` (Default.isl) and `swedish` (Languages\Swedish.isl), `ShowLanguageDialog=auto`; `--uninstall-cleanup` uses the saved language (else `detect_lang()`) for its message box.
 
 ---
 
