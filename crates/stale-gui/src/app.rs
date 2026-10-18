@@ -2,18 +2,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::scan::ScanEvent;
 use stale_core::settings::Settings;
+use stale_core::uninstall::{QueueItem, QueueOptions, UninstallEvent, UninstallMode};
 use stale_core::usage::matching::ProgramUsage;
 use stale_core::{Program, ProgramId};
 
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
-use crate::ui::{details, filter_panel, table, toolbar};
+use crate::flow::FlowState;
+use crate::ui::{details, filter_panel, table, toolbar, uninstall_dialog};
 use crate::{strings, worker};
 
 pub struct Row {
@@ -34,6 +38,23 @@ impl Row {
     }
 }
 
+/// Which list fills the central panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Programs,
+    Leftovers,
+    Quarantine,
+}
+
+/// The summary dialog's state before a queue starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingQueue {
+    pub ids: Vec<ProgramId>,
+    pub mode: UninstallMode,
+    pub restore_point: bool,
+    pub run_vendor: bool,
+}
+
 pub struct StaleApp {
     pub rows: Vec<Row>,
     pub settings: Settings,
@@ -43,6 +64,12 @@ pub struct StaleApp {
     pub sort: Sort,
     pub selected: Option<ProgramId>,
     pub checked: HashSet<ProgramId>,
+    pub view: View,
+    pub pending: Option<PendingQueue>,
+    pub flow: Option<FlowState>,
+    uninstall_rx: Option<Receiver<UninstallEvent>>,
+    /// Set to stop waiting for the running uninstaller's child processes; `None` when no queue runs.
+    pub stop_waiting: Option<Arc<AtomicBool>>,
     rx: Option<Receiver<ScanEvent>>,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
@@ -71,6 +98,11 @@ impl StaleApp {
             sort: Sort::default(),
             selected: None,
             checked: HashSet::new(),
+            view: View::Programs,
+            pending: None,
+            flow: None,
+            uninstall_rx: None,
+            stop_waiting: None,
             rx: None,
             programs: Vec::new(),
             usage: HashMap::new(),
@@ -158,6 +190,92 @@ impl StaleApp {
         }
     }
 
+    /// Opens the summary dialog for the checked rows that are visible under the current filters.
+    pub fn open_queue_dialog(&mut self, mode: UninstallMode) {
+        let visible = visible_rows(&self.rows, &self.filters, self.sort, Utc::now());
+        let ids: Vec<ProgramId> = visible
+            .into_iter()
+            .map(|i| &self.rows[i].program.id)
+            .filter(|id| self.checked.contains(*id))
+            .cloned()
+            .collect();
+        self.open_queue_dialog_for(ids, mode);
+    }
+
+    /// Opens the summary dialog for `ids` (nothing happens when it is empty).
+    pub fn open_queue_dialog_for(&mut self, ids: Vec<ProgramId>, mode: UninstallMode) {
+        if ids.is_empty() {
+            return;
+        }
+        self.pending =
+            Some(PendingQueue { ids, mode, restore_point: true, run_vendor: mode == UninstallMode::Normal });
+    }
+
+    /// True while a queue has been started and has not finished.
+    pub fn queue_running(&self) -> bool {
+        self.flow.as_ref().is_some_and(|f| !f.finished)
+    }
+
+    /// Starts the pending queue on a worker thread and closes the summary dialog.
+    pub fn start_queue(&mut self) {
+        let Some(pending) = self.pending.take() else { return };
+        let programs: Vec<Program> = pending
+            .ids
+            .iter()
+            .filter_map(|id| self.rows.iter().find(|r| &r.program.id == id))
+            .map(|r| r.program.clone())
+            .collect();
+        if programs.is_empty() {
+            return;
+        }
+        let names: Vec<(ProgramId, String)> = programs.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
+        let items = programs.into_iter().map(|program| QueueItem { program }).collect();
+        let opts = QueueOptions { restore_point: pending.restore_point, run_vendor: pending.run_vendor, mode: pending.mode };
+        let (rx, stop_waiting) = worker::spawn_uninstall(items, opts);
+        self.uninstall_rx = Some(rx);
+        self.stop_waiting = Some(stop_waiting);
+        self.flow = Some(FlowState::new(&names));
+    }
+
+    /// Closes the finished queue's results.
+    pub fn close_flow(&mut self) {
+        self.flow = None;
+        self.stop_waiting = None;
+    }
+
+    /// Applies every uninstall event waiting on the channel; rescans once the queue is done.
+    fn drain_uninstall_events(&mut self) {
+        let Some(rx) = self.uninstall_rx.take() else { return };
+        let Some(flow) = self.flow.as_mut() else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    if let UninstallEvent::Warning(w) = &ev {
+                        log::warn!("{w}");
+                    }
+                    flow.apply(ev);
+                    if flow.finished {
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.uninstall_rx = Some(rx);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // Gone without `QueueDone`: the worker panicked (logged by the panic hook).
+                    log::error!("uninstall worker disconnected before QueueDone");
+                    flow.warnings.push(strings::QUEUE_ABORTED.to_string());
+                    flow.finish();
+                    break;
+                }
+            }
+        }
+        self.stop_waiting = None;
+        // The list should drop what was uninstalled. A running scan's results are already stale.
+        self.refresh();
+    }
+
     /// Applies every event waiting on the channel.
     fn drain_events(&mut self) {
         let Some(rx) = self.rx.take() else { return };
@@ -186,7 +304,8 @@ impl StaleApp {
 impl eframe::App for StaleApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
-        if self.scanning {
+        self.drain_uninstall_events();
+        if self.scanning || self.queue_running() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -216,7 +335,12 @@ impl eframe::App for StaleApp {
                 }
             }
         });
+        uninstall_dialog::show(ui, self);
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.view != View::Programs {
+                ui.label(strings::VIEW_PENDING);
+                return;
+            }
             if self.rows.is_empty() {
                 if !self.scanning {
                     ui.label(strings::NO_PROGRAMS);
@@ -359,6 +483,25 @@ mod tests {
         assert_eq!(a.size, Some(7), "re-applying the filter keeps attached data");
         let h = app.rows.iter().find(|r| r.program.id.0 == "h").unwrap();
         assert_eq!(h.size, Some(9), "data received while hidden is kept");
+    }
+
+    #[test]
+    fn open_queue_dialog_uses_only_visible_checked_rows() {
+        let mut app = StaleApp::empty(Settings { show_hidden: false, ..Settings::default() });
+        app.apply_event(ScanEvent::Programs(vec![
+            program("keep", false),
+            program("other", false),
+            program("hidden", true),
+        ]));
+        for id in ["keep", "other", "hidden"] {
+            app.checked.insert(ProgramId(id.into()));
+        }
+        app.filters.search = "keep".into();
+        app.open_queue_dialog(UninstallMode::Normal);
+        let pending = app.pending.expect("dialog opened");
+        assert_eq!(pending.ids, vec![ProgramId("keep".into())]);
+        assert_eq!(pending.mode, UninstallMode::Normal);
+        assert!(pending.restore_point && pending.run_vendor);
     }
 
     #[test]

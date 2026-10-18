@@ -73,3 +73,37 @@ pub const SOURCE_PREFETCH: &str = "Prefetch";
 pub const SOURCE_BAM: &str = "BAM";
 pub const SOURCE_USERASSIST: &str = "UserAssist";
 pub const SOURCE_FILETIME: &str = "filtid";
+
+// Uninstall queue dialog
+pub const UNINSTALL_THREAD_FAILED: &str = "Kunde inte starta avinstallationen";
+pub const QUEUE_ABORTED: &str = "Avinstallationen avbröts oväntat – se loggfilen";
+pub const QUEUE_TITLE: &str = "Avinstallera";
+pub const OPT_RESTORE_POINT: &str = "Skapa återställningspunkt för hela omgången";
+pub const OPT_RUN_VENDOR: &str = "Kör programmens egna avinstallerare";
+pub const CANCEL: &str = "Avbryt";
+pub const START: &str = "Starta";
+pub const STEP_RESTORE_POINT: &str = "Återställningspunkt";
+pub const STEP_VENDOR: &str = "Egen avinstallerare";
+pub const STEP_LEFTOVERS: &str = "Rester";
+pub const STEP_DONE: &str = "Klart";
+pub const STEP_SEPARATOR: &str = "·";
+pub const RESTORE_POINT_LABEL: &str = "Återställningspunkt";
+pub const RP_CREATED: &str = "skapad";
+pub const RP_SKIPPED: &str = "hoppades över (en punkt skapades nyligen)";
+pub const RP_DISABLED: &str = "systemåterställning är avstängd";
+pub const RP_FAILED: &str = "misslyckades";
+pub const STATE_PENDING: &str = "Väntar";
+pub const STATE_RUNNING: &str = "Pågår";
+pub const STATE_UNINSTALLED: &str = "Avinstallerat";
+pub const STATE_NOT_UNINSTALLED: &str = "Inte avinstallerat";
+/// Precedes an exit code: "Inte avinstallerat (kod 1602)".
+pub const EXIT_CODE: &str = "kod";
+pub const STATE_SKIPPED: &str = "Hoppades över";
+pub const STOP_WAITING: &str = "Sluta vänta";
+pub const STOP_WAITING_TIP: &str = "Fortsätter när avinstalleraren avslutats, utan att vänta på dess underprocesser";
+pub const SHOW_LEFTOVERS: &str = "Visa rester";
+pub const RETRY: &str = "Försök igen";
+pub const CLOSE: &str = "Stäng";
+
+// Views
+pub const VIEW_PENDING: &str = "Vyn kommer i nästa steg";

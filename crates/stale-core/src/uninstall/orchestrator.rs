@@ -48,7 +48,12 @@ pub struct UninstallSources {
 
 impl UninstallSources {
     pub fn live() -> UninstallSources {
-        let stop_waiting = Arc::new(AtomicBool::new(false));
+        UninstallSources::live_with_stop_flag(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like `live`, with a `stop_waiting` flag the caller already holds (the GUI creates it
+    /// before the worker thread builds the sources).
+    pub fn live_with_stop_flag(stop_waiting: Arc<AtomicBool>) -> UninstallSources {
         UninstallSources {
             restore: Arc::new(SrClient),
             runner: Arc::new(JobObjectRunner::new(stop_waiting.clone())),

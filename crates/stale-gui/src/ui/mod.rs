@@ -4,3 +4,4 @@ pub mod details;
 pub mod filter_panel;
 pub mod table;
 pub mod toolbar;
+pub mod uninstall_dialog;
