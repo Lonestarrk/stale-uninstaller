@@ -13,6 +13,7 @@ pub mod model;
 pub mod pathutil;
 pub mod paths;
 pub mod proc;
+pub mod provenance;
 pub mod programs;
 pub mod quarantine;
 pub mod registry;

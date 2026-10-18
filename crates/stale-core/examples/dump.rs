@@ -1,5 +1,6 @@
 //! Manual check of the whole core: `cargo run -p stale-core --example dump` (elevated for BAM/Prefetch).
 //! Prints `drive | name | last used (source) | size`, never-seen first, then oldest first.
+//! `dump provenance <name>` prints the signature, version info, install date and source.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,8 @@ use stale_core::programs::enumerate_programs;
 use stale_core::registry::WinRegistry;
 use stale_core::pathutil::exe_under;
 use stale_core::scan::{gather_usage, run_scan, ScanEvent, ScanSources};
-use stale_core::usage::matching::{explain_match, program_main_exes, usage_install_dir};
+use stale_core::provenance::{provenance, WinProbe};
+use stale_core::usage::matching::{explain_match, match_usage, program_main_exes, usage_install_dir};
 
 /// `dump leftovers <name>`: lists what is left of the first visible program whose name contains
 /// `<name>`. Nothing is deleted.
@@ -175,8 +177,40 @@ fn dump_usage(name: &str) {
     }
 }
 
+/// `dump provenance <name>`: for every program whose name contains `<name>`, its main exe and
+/// what the details panel shows about where it came from.
+fn dump_provenance(name: &str) {
+    let needle = name.to_lowercase();
+    let src = ScanSources::live();
+    let programs = enumerate_programs(&*src.reg);
+    let inputs = gather_usage(&src, &programs);
+    let result = match_usage(&inputs.match_input(&programs, &src.shortcut_targets));
+    for p in programs.iter().filter(|p| p.name.to_lowercase().contains(&needle)) {
+        let main_exe = result.by_program.get(&p.id).and_then(|u| u.main_exe.clone());
+        let started = std::time::Instant::now();
+        let prov = provenance(p, main_exe.as_deref(), &WinProbe, &WinRegistry);
+        println!();
+        println!("=== {} [{}]{}", p.name, p.id.0, if p.hidden { " (hidden)" } else { "" });
+        println!("publisher:   {:?}  msi: {}", p.publisher, p.is_msi);
+        println!("main exe:    {main_exe:?}");
+        println!("signature:   {:?}", prov.signature);
+        println!("description: {:?}", prov.description);
+        println!("company:     {:?}", prov.company);
+        println!("installed:   {:?}", prov.install_date);
+        println!("source:      {:?}", prov.source);
+        println!("took:        {} ms", started.elapsed().as_millis());
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("provenance") {
+        match args.get(1) {
+            Some(name) => dump_provenance(name),
+            None => println!("usage: dump provenance <program name>"),
+        }
+        return;
+    }
     if args.first().map(String::as_str) == Some("deps") {
         for p in enumerate_programs(&WinRegistry) {
             if let Some(key) = stale_core::dependencies::is_shared_dependency(&p) {

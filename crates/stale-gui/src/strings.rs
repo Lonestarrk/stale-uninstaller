@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use stale_core::provenance::{InstallSource, Signature};
 use stale_core::quarantine::codes;
 use stale_core::scan::ScanWarning;
 
@@ -153,6 +154,34 @@ pub struct Strings {
     pub other_user_suffix: &'static str,
     pub detail_last_used: &'static str,
     pub uncertain_filetime: &'static str,
+    // Details panel: provenance
+    pub detail_signed_by: &'static str,
+    pub detail_description: &'static str,
+    pub detail_company: &'static str,
+    pub detail_installed: &'static str,
+    pub detail_install_source: &'static str,
+    pub signature_unsigned: &'static str,
+    /// `{reason}` is replaced by the translated reason.
+    pub signature_invalid: &'static str,
+    pub sig_bad_digest: &'static str,
+    pub sig_expired: &'static str,
+    pub sig_untrusted_root: &'static str,
+    pub sig_revoked: &'static str,
+    pub sig_distrusted: &'static str,
+    pub sig_bad_certificate: &'static str,
+    /// `{code}` is replaced by the hex status.
+    pub sig_error_code: &'static str,
+    pub source_winget: &'static str,
+    pub source_store: &'static str,
+    pub source_steam: &'static str,
+    pub source_epic: &'static str,
+    pub source_gog: &'static str,
+    pub source_ea: &'static str,
+    pub source_ubisoft: &'static str,
+    pub source_driver: &'static str,
+    pub source_oem: &'static str,
+    pub source_msi: &'static str,
+    pub source_unknown: &'static str,
     pub col_file: &'static str,
     pub col_last_run: &'static str,
     pub col_source: &'static str,
@@ -406,6 +435,31 @@ pub static SV: Strings = Strings {
     other_user_suffix: " (annan användare)",
     detail_last_used: "Senast använd",
     uncertain_filetime: " – osäker (filtid)",
+    detail_signed_by: "Signerad av",
+    detail_description: "Beskrivning",
+    detail_company: "Tillverkare",
+    detail_installed: "Installerad",
+    detail_install_source: "Källa",
+    signature_unsigned: "osignerad",
+    signature_invalid: "ogiltig signatur: {reason}",
+    sig_bad_digest: "filen har ändrats efter signeringen",
+    sig_expired: "certifikatet har gått ut",
+    sig_untrusted_root: "certifikatet är inte betrott",
+    sig_revoked: "certifikatet är återkallat",
+    sig_distrusted: "utgivaren är spärrad",
+    sig_bad_certificate: "felaktigt certifikat",
+    sig_error_code: "fel {code}",
+    source_winget: "Winget",
+    source_store: "Microsoft Store",
+    source_steam: "Steam",
+    source_epic: "Epic Games",
+    source_gog: "GOG",
+    source_ea: "EA app",
+    source_ubisoft: "Ubisoft Connect",
+    source_driver: "Drivrutin",
+    source_oem: "Förinstallerad (tillverkare)",
+    source_msi: "Windows Installer (MSI)",
+    source_unknown: "Okänd",
     col_file: "Fil",
     col_last_run: "Senast körd",
     col_source: "Källa",
@@ -632,6 +686,31 @@ pub static EN: Strings = Strings {
     other_user_suffix: " (other user)",
     detail_last_used: "Last used",
     uncertain_filetime: " – uncertain (file time)",
+    detail_signed_by: "Signed by",
+    detail_description: "Description",
+    detail_company: "Company",
+    detail_installed: "Installed",
+    detail_install_source: "Source",
+    signature_unsigned: "unsigned",
+    signature_invalid: "invalid signature: {reason}",
+    sig_bad_digest: "the file changed after signing",
+    sig_expired: "the certificate has expired",
+    sig_untrusted_root: "the certificate is not trusted",
+    sig_revoked: "the certificate is revoked",
+    sig_distrusted: "the publisher is blocked",
+    sig_bad_certificate: "bad certificate",
+    sig_error_code: "error {code}",
+    source_winget: "Winget",
+    source_store: "Microsoft Store",
+    source_steam: "Steam",
+    source_epic: "Epic Games",
+    source_gog: "GOG",
+    source_ea: "EA app",
+    source_ubisoft: "Ubisoft Connect",
+    source_driver: "Driver",
+    source_oem: "Preinstalled (manufacturer)",
+    source_msi: "Windows Installer (MSI)",
+    source_unknown: "Unknown",
     col_file: "File",
     col_last_run: "Last run",
     col_source: "Source",
@@ -986,6 +1065,50 @@ pub fn dependency_reason_in(lang: Lang, key: &str) -> &'static str {
         "sdk" => s.dependency_sdk,
         "toolchain" => s.dependency_toolchain,
         _ => s.dependency_runtime,
+    }
+}
+
+/// The text of an invalid-signature reason code from `stale_core::provenance`.
+pub fn signature_reason_in(lang: Lang, code: &str) -> String {
+    let s = texts(lang);
+    match code {
+        "bad-digest" => s.sig_bad_digest.to_string(),
+        "expired" => s.sig_expired.to_string(),
+        "untrusted-root" => s.sig_untrusted_root.to_string(),
+        "revoked" => s.sig_revoked.to_string(),
+        "distrusted" => s.sig_distrusted.to_string(),
+        "bad-certificate" => s.sig_bad_certificate.to_string(),
+        other => s.sig_error_code.replace("{code}", other.strip_prefix("error:").unwrap_or(other)),
+    }
+}
+
+/// "Signerad av" value: `"{signer} ✓"`, `"ogiltig signatur: {reason}"`, `"osignerad"`, or "–"
+/// when the exe is missing or unreadable.
+pub fn signature_text_in(lang: Lang, signature: &Signature) -> String {
+    let s = texts(lang);
+    match signature {
+        Signature::Valid { signer } => format!("{signer} ✓").trim_start().to_string(),
+        Signature::Invalid { reason, .. } => s.signature_invalid.replace("{reason}", &signature_reason_in(lang, reason)),
+        Signature::Unsigned => s.signature_unsigned.to_string(),
+        Signature::Unknown => s.unknown_value.to_string(),
+    }
+}
+
+/// The label of an install source.
+pub fn install_source_in(lang: Lang, source: InstallSource) -> &'static str {
+    let s = texts(lang);
+    match source {
+        InstallSource::Winget => s.source_winget,
+        InstallSource::MicrosoftStore => s.source_store,
+        InstallSource::Steam => s.source_steam,
+        InstallSource::Epic => s.source_epic,
+        InstallSource::Gog => s.source_gog,
+        InstallSource::EaApp => s.source_ea,
+        InstallSource::Ubisoft => s.source_ubisoft,
+        InstallSource::Driver => s.source_driver,
+        InstallSource::Oem => s.source_oem,
+        InstallSource::Msi => s.source_msi,
+        InstallSource::Unknown => s.source_unknown,
     }
 }
 

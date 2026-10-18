@@ -12,6 +12,7 @@ use eframe::egui;
 use stale_core::ghosts::{Evidence, Ghost};
 use stale_core::keep::KeepList;
 use stale_core::leftovers::ProgramHint;
+use stale_core::provenance::{InstallSource, Provenance, Signature};
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
 use stale_core::session;
@@ -185,6 +186,10 @@ pub struct StaleApp {
     /// Usage and sizes received so far, kept for hidden programs too.
     usage: HashMap<ProgramId, ProgramUsage>,
     sizes: HashMap<ProgramId, u64>,
+    /// Provenance read so far, per program (cleared with the scan data).
+    provenance: HashMap<ProgramId, Provenance>,
+    /// Provenance probes still running, at most one per program.
+    provenance_rx: HashMap<ProgramId, Receiver<Provenance>>,
 }
 
 impl StaleApp {
@@ -248,6 +253,8 @@ impl StaleApp {
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
+            provenance: HashMap::new(),
+            provenance_rx: HashMap::new(),
         }
     }
 
@@ -266,6 +273,59 @@ impl StaleApp {
         self.sizes.clear();
         self.unmatched_hits.clear();
         self.warnings.clear();
+        self.provenance.clear();
+        // Dropping the receivers discards results of probes still running.
+        self.provenance_rx.clear();
+    }
+
+    /// The selected program's provenance once read; `None` while it is pending.
+    pub fn provenance_for(&self, id: &ProgramId) -> Option<&Provenance> {
+        self.provenance.get(id)
+    }
+
+    /// Starts reading the selected program's provenance on a worker thread, once its main exe
+    /// is known (usage has arrived) and unless it is cached or already being read.
+    fn request_provenance(&mut self) {
+        self.request_provenance_with(worker::spawn_provenance);
+    }
+
+    fn request_provenance_with(&mut self, spawn: impl FnOnce(Program, Option<PathBuf>) -> Receiver<Provenance>) {
+        let Some(id) = self.selected.as_ref() else { return };
+        if self.provenance.contains_key(id) || self.provenance_rx.contains_key(id) {
+            return;
+        }
+        let Some(row) = self.rows.iter().find(|r| &r.program.id == id) else { return };
+        let Some(usage) = row.usage.as_ref() else { return };
+        let rx = spawn(row.program.clone(), usage.main_exe.clone());
+        self.provenance_rx.insert(id.clone(), rx);
+    }
+
+    /// Caches finished provenance probes. A probe that ended without a result caches what is
+    /// known without the exe, so it is not started again.
+    fn drain_provenance(&mut self) {
+        let mut done = Vec::new();
+        for (id, rx) in &self.provenance_rx {
+            match rx.try_recv() {
+                Ok(p) => done.push((id.clone(), p)),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    log::error!("provenance worker for {} ended without a result", id.0);
+                    let install_date = self.programs.iter().find(|p| &p.id == id).and_then(|p| p.install_date);
+                    let fallback = Provenance {
+                        signature: Signature::Unknown,
+                        description: None,
+                        company: None,
+                        install_date,
+                        source: InstallSource::Unknown,
+                    };
+                    done.push((id.clone(), fallback));
+                }
+            }
+        }
+        for (id, p) in done {
+            self.provenance_rx.remove(&id);
+            self.provenance.insert(id, p);
+        }
     }
 
     /// Folds one scan event into the state (no UI work).
@@ -903,7 +963,10 @@ impl eframe::App for StaleApp {
         self.drain_quarantine_admin();
         self.drain_ghost_scan();
         self.start_waiting_ghost_scan();
+        self.drain_provenance();
+        self.request_provenance();
         if self.scanning
+            || !self.provenance_rx.is_empty()
             || self.ghost_scan_running()
             || self.queue_running()
             || self.removal_running()
@@ -933,7 +996,7 @@ impl eframe::App for StaleApp {
         egui::Panel::bottom("details").resizable(true).default_size(160.0).show(ui, |ui| {
             let row = self.selected.as_ref().and_then(|id| self.rows.iter().find(|r| &r.program.id == id));
             match row {
-                Some(row) => details::details_panel(ui, row),
+                Some(row) => details::details_panel(ui, row, self.provenance.get(&row.program.id)),
                 None => {
                     ui.label(strings::t().no_selection);
                 }
@@ -996,7 +1059,71 @@ mod tests {
     }
 
     fn usage() -> ProgramUsage {
-        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: Vec::new() }
+        ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: Vec::new(), main_exe: None }
+    }
+
+    fn unknown_provenance() -> Provenance {
+        Provenance {
+            signature: Signature::Unknown,
+            description: None,
+            company: None,
+            install_date: None,
+            source: InstallSource::Unknown,
+        }
+    }
+
+    #[test]
+    fn provenance_is_probed_once_per_program_and_cleared_on_refresh() {
+        use std::sync::mpsc::channel;
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
+        app.selected = Some(ProgramId("a".into()));
+        let mut calls: Vec<(ProgramId, Option<PathBuf>)> = Vec::new();
+        let (tx, rx) = channel();
+        let mut rx = Some(rx);
+        let mut spawn = |p: Program, exe: Option<PathBuf>| {
+            calls.push((p.id, exe));
+            rx.take().unwrap_or_else(|| channel().1)
+        };
+        // The main exe is not known before usage arrives: nothing is probed yet.
+        app.request_provenance_with(&mut spawn);
+        let exe = PathBuf::from(r"C:\Apps\A\a.exe");
+        let mut u = usage();
+        u.main_exe = Some(exe.clone());
+        app.apply_event(ScanEvent::Usage(HashMap::from([(ProgramId("a".into()), u)])));
+        app.request_provenance_with(&mut spawn);
+        app.request_provenance_with(&mut spawn);
+        assert!(app.provenance_for(&ProgramId("a".into())).is_none(), "pending");
+        tx.send(unknown_provenance()).unwrap();
+        app.drain_provenance();
+        assert_eq!(app.provenance_for(&ProgramId("a".into())), Some(&unknown_provenance()));
+        app.request_provenance_with(&mut spawn);
+        assert_eq!(calls, vec![(ProgramId("a".into()), Some(exe))], "one probe per program");
+        app.clear_scan_data();
+        assert!(app.provenance_for(&ProgramId("a".into())).is_none());
+        assert!(app.provenance_rx.is_empty());
+    }
+
+    #[test]
+    fn a_lost_provenance_worker_is_not_respawned() {
+        let mut app = StaleApp::empty(Settings::default());
+        let mut p = program("a", false);
+        p.install_date = chrono::NaiveDate::from_ymd_opt(2024, 1, 2);
+        app.apply_event(ScanEvent::Programs(vec![p]));
+        app.apply_event(ScanEvent::Usage(HashMap::from([(ProgramId("a".into()), usage())])));
+        app.selected = Some(ProgramId("a".into()));
+        let mut calls = 0;
+        let mut spawn = |_: Program, _: Option<PathBuf>| {
+            calls += 1;
+            std::sync::mpsc::channel().1
+        };
+        app.request_provenance_with(&mut spawn);
+        app.drain_provenance();
+        app.request_provenance_with(&mut spawn);
+        assert_eq!(calls, 1);
+        let shown = app.provenance_for(&ProgramId("a".into())).expect("a fallback is cached");
+        assert_eq!(shown.signature, Signature::Unknown);
+        assert_eq!(shown.install_date, chrono::NaiveDate::from_ymd_opt(2024, 1, 2));
     }
 
     #[test]

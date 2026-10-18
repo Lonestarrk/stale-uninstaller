@@ -3,6 +3,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,6 +14,8 @@ use stale_core::quarantine::{
     QuarantineProgress, RestoreOutcome,
 };
 use stale_core::model::{Program, ProgramId};
+use stale_core::provenance::{provenance, InstallSource, Provenance, Signature, WinProbe};
+use stale_core::registry::WinRegistry;
 use stale_core::scan::{run_scan, ScanEvent, ScanSources, ScanWarning};
 use stale_core::uninstall::{run_queue, QueueItem, QueueOptions, UninstallEvent, UninstallSources};
 use stale_core::usage::UsageHit;
@@ -264,6 +267,34 @@ pub fn spawn_ghost_scan(programs: Vec<Program>, unmatched: Vec<UsageHit>) -> Rec
     if let Err(e) = spawned {
         log::error!("could not spawn ghost scan thread: {e}");
         let _ = fallback.send(GhostEvent::Failed(Warning::Detail(Msg::GhostScanThreadFailed, e.to_string())));
+    }
+    rx
+}
+
+/// Reads `program`'s provenance (signature and version info of `main_exe`, install source) on
+/// a "stale-provenance" thread: `WinVerifyTrust` can take a second. Sends exactly one result;
+/// a panic sends what is known without the exe.
+pub fn spawn_provenance(program: Program, main_exe: Option<PathBuf>) -> Receiver<Provenance> {
+    let (tx, rx) = channel();
+    let fallback = Provenance {
+        signature: Signature::Unknown,
+        description: None,
+        company: None,
+        install_date: program.install_date,
+        source: InstallSource::Unknown,
+    };
+    let spawned = std::thread::Builder::new().name("stale-provenance".into()).spawn({
+        let fallback = fallback.clone();
+        move || {
+            let run = catch_unwind(AssertUnwindSafe(|| provenance(&program, main_exe.as_deref(), &WinProbe, &WinRegistry)));
+            let _ = tx.send(run.unwrap_or(fallback));
+        }
+    });
+    if let Err(e) = spawned {
+        log::error!("could not spawn provenance thread: {e}");
+        let (tx, rx) = channel();
+        let _ = tx.send(fallback);
+        return rx;
     }
     rx
 }

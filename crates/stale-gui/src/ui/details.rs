@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use stale_core::provenance::Provenance;
 use stale_core::usage::matching::{ExcludeReason, ExeUsage, ProgramUsage};
 use stale_core::{Hive, Scope};
 
@@ -70,8 +71,28 @@ fn last_run_text(exe: &ExeUsage) -> String {
     }
 }
 
-/// Details of the selected program: where it lives, how it uninstalls and per-exe usage.
-pub fn details_panel(ui: &mut egui::Ui, row: &Row) {
+/// The provenance rows (signed by, description, company, installed, source); every value is
+/// "…" while the probe runs (`None`).
+pub fn provenance_rows_in(lang: Lang, provenance: Option<&Provenance>) -> Vec<(&'static str, String)> {
+    let s = strings::texts(lang);
+    let labels = [s.detail_signed_by, s.detail_description, s.detail_company, s.detail_installed, s.detail_install_source];
+    let Some(p) = provenance else {
+        return labels.into_iter().map(|l| (l, s.pending.to_string())).collect();
+    };
+    let or_dash = |v: &Option<String>| v.clone().unwrap_or_else(|| s.unknown_value.to_string());
+    let values = [
+        strings::signature_text_in(lang, &p.signature),
+        or_dash(&p.description),
+        or_dash(&p.company),
+        p.install_date.map_or_else(|| s.unknown_value.to_string(), |d| format::ymd(Some(d))),
+        strings::install_source_in(lang, p.source).to_string(),
+    ];
+    labels.into_iter().zip(values).collect()
+}
+
+/// Details of the selected program: where it lives, how it uninstalls, where it came from
+/// (`provenance`, `None` while it is being read) and per-exe usage.
+pub fn details_panel(ui: &mut egui::Ui, row: &Row, provenance: Option<&Provenance>) {
     let p = &row.program;
     let or_dash = |s: Option<String>| s.unwrap_or_else(|| strings::t().unknown_value.to_string());
     egui::Grid::new("details_grid").num_columns(2).show(ui, |ui| {
@@ -85,7 +106,10 @@ pub fn details_panel(ui: &mut egui::Ui, row: &Row) {
             (strings::t().detail_uninstaller, or_dash(p.uninstall_string.clone())),
             (strings::t().detail_registry_key, key),
             (strings::t().detail_last_used, last_used_text_in(strings::lang(), row.usage.as_ref())),
-        ] {
+        ]
+        .into_iter()
+        .chain(provenance_rows_in(strings::lang(), provenance))
+        {
             ui.label(egui::RichText::new(label).strong());
             ui.add(egui::Label::new(value).truncate());
             ui.end_row();
@@ -128,6 +152,7 @@ pub fn details_panel(ui: &mut egui::Ui, row: &Row) {
 
 #[cfg(test)]
 mod tests {
+    use stale_core::provenance::{InstallSource, Signature};
     use stale_core::usage::matching::ExcludeReason;
 
     use super::*;
@@ -159,7 +184,7 @@ mod tests {
         let when = Local.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).single().unwrap().with_timezone(&chrono::Utc);
         let last_used =
             LastUsed { when: Some(when), source: Some(UsageSource::Bam), confident: true, via: Some("x.exe".into()), autostart: true };
-        let usage = ProgramUsage { last_used, exes: Vec::new() };
+        let usage = ProgramUsage { last_used, exes: Vec::new(), main_exe: None };
         assert_eq!(last_used_text_in(Lang::Sv, Some(&usage)), "2026-10-18 (BAM) (autostart, via x.exe)");
         assert_eq!(last_used_text_in(Lang::En, Some(&usage)), "2026-10-18 (BAM) (autostart, via x.exe)");
         let mut plain = usage.clone();
@@ -173,6 +198,61 @@ mod tests {
         assert_eq!(last_used_text_in(Lang::En, None), "…");
         plain.last_used.when = None;
         assert_eq!(last_used_text_in(Lang::En, Some(&plain)), "Never seen");
+    }
+
+    fn provenance_with(signature: Signature) -> Provenance {
+        Provenance {
+            signature,
+            description: Some("Foo App".into()),
+            company: Some("Foo Corp".into()),
+            install_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 6),
+            source: InstallSource::Steam,
+        }
+    }
+
+    #[test]
+    fn invalid_signature_never_shows_as_valid() {
+        let invalid = Signature::Invalid { signer: Some("X".into()), reason: "bad-digest".into() };
+        let text = strings::signature_text_in(Lang::Sv, &invalid);
+        assert!(text.contains("ogiltig"), "{text}");
+        assert!(!text.contains("X ✓"), "{text}");
+        let rows = provenance_rows_in(Lang::Sv, Some(&provenance_with(invalid.clone())));
+        let all: String = rows.iter().map(|(l, v)| format!("{l}: {v}\n")).collect();
+        assert!(all.contains("ogiltig") && !all.contains("X ✓"), "{all}");
+        assert!(strings::signature_text_in(Lang::En, &invalid).starts_with("invalid signature: "));
+        let unknown_code = Signature::Invalid { signer: None, reason: "error:0x80099999".into() };
+        assert_eq!(strings::signature_text_in(Lang::Sv, &unknown_code), "ogiltig signatur: fel 0x80099999");
+    }
+
+    #[test]
+    fn provenance_rows_in_both_languages() {
+        let valid = provenance_with(Signature::Valid { signer: "Foo Corp".into() });
+        assert_eq!(
+            provenance_rows_in(Lang::Sv, Some(&valid)),
+            vec![
+                ("Signerad av", "Foo Corp ✓".to_string()),
+                ("Beskrivning", "Foo App".to_string()),
+                ("Tillverkare", "Foo Corp".to_string()),
+                ("Installerad", "2024-05-06".to_string()),
+                ("Källa", "Steam".to_string()),
+            ]
+        );
+        let none = Provenance {
+            signature: Signature::Unknown,
+            description: None,
+            company: None,
+            install_date: None,
+            source: InstallSource::Oem,
+        };
+        let en: Vec<String> = provenance_rows_in(Lang::En, Some(&none)).into_iter().map(|(_, v)| v).collect();
+        assert_eq!(en, ["–", "–", "–", "–", "Preinstalled (manufacturer)"]);
+        let unsigned = provenance_with(Signature::Unsigned);
+        assert_eq!(provenance_rows_in(Lang::Sv, Some(&unsigned))[0].1, "osignerad");
+        // While the probe runs every row waits.
+        let pending: Vec<String> = provenance_rows_in(Lang::Sv, None).into_iter().map(|(_, v)| v).collect();
+        assert_eq!(pending, ["…"; 5]);
+        assert_eq!(strings::install_source_in(Lang::Sv, InstallSource::Driver), "Drivrutin");
+        assert_eq!(strings::install_source_in(Lang::En, InstallSource::Unknown), "Unknown");
     }
 
     #[test]

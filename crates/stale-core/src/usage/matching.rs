@@ -64,6 +64,10 @@ pub struct ProgramUsage {
     pub last_used: LastUsed,
     /// Sorted by `last_run`, newest first.
     pub exes: Vec<ExeUsage>,
+    /// The first of the program's main exes ([`program_main_exes`]), whether or not it ran:
+    /// the exe the details panel reads the signature and version info from.
+    #[serde(default)]
+    pub main_exe: Option<PathBuf>,
 }
 
 pub struct MatchInput<'a> {
@@ -343,6 +347,8 @@ struct Candidate<'a> {
     install: Option<String>,
     /// `norm()`ed main exes, Squirrel `app-<version>` folders removed ([`squirrel_neutral`]).
     main: HashSet<String>,
+    /// The first main exe as found on disk (see [`ProgramUsage::main_exe`]).
+    first_main: Option<PathBuf>,
     /// Without an install folder: uppercased display-icon exe name (counts as main).
     icon_name: Option<String>,
     /// Without an install folder: uppercased uninstaller exe name (never MsiExec).
@@ -354,8 +360,9 @@ impl<'a> Candidate<'a> {
         let roots = input.root_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let args = input.arg_exes.get(&program.id).map(Vec::as_slice).unwrap_or_default();
         let install = usage_install_dir(program, input.shortcut_targets).map(|d| norm(&d));
-        let main = program_main_exes(program, input.shortcut_targets, roots, args, input.service_exes)
-            .0
+        let mains = program_main_exes(program, input.shortcut_targets, roots, args, input.service_exes).0;
+        let first_main = mains.first().cloned();
+        let main = mains
             .iter()
             .map(|e| squirrel_neutral(&norm(e), install.as_deref().unwrap_or_default()))
             .collect();
@@ -378,7 +385,7 @@ impl<'a> Candidate<'a> {
         } else {
             None
         };
-        Candidate { program, install, main, icon_name, uninstaller_name }
+        Candidate { program, install, main, first_main, icon_name, uninstaller_name }
     }
 
     fn is_main(&self, exe: &Path) -> bool {
@@ -531,7 +538,7 @@ fn summarize(
     let mut exes = real;
     exes.extend(file_times);
     exes.sort_by_key(|e| std::cmp::Reverse(e.last_run));
-    ProgramUsage { last_used, exes }
+    ProgramUsage { last_used, exes, main_exe: None }
 }
 
 /// Assigns hits to programs (see `assign_hit`) and summarizes each program's usage.
@@ -552,7 +559,10 @@ pub fn match_usage(input: &MatchInput) -> MatchResult {
     let by_program = candidates
         .iter()
         .zip(assigned)
-        .map(|(c, hits)| (c.program.id.clone(), summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes, input.autostart_exes)))
+        .map(|(c, hits)| {
+            let usage = summarize(hits, |e| c.is_main(e), |e| c.owns_by_folder(e), input.service_exes, input.task_exes, input.autostart_exes);
+            (c.program.id.clone(), ProgramUsage { main_exe: c.first_main.clone(), ..usage })
+        })
         .collect();
     MatchResult { by_program, unmatched }
 }
@@ -933,7 +943,29 @@ mod tests {
         let hits = [hit(r"C:\Nowhere\x.exe", 1, UsageSource::Bam)];
         let r = run(&programs, &hits, &HashSet::new());
         assert_eq!(r.unmatched, hits.to_vec());
-        assert_eq!(usage(&r, "Foo"), &ProgramUsage { last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false }, exes: vec![] });
+        assert_eq!(
+            usage(&r, "Foo"),
+            &ProgramUsage {
+                last_used: LastUsed { when: None, source: None, confident: true, via: None, autostart: false },
+                exes: vec![],
+                main_exe: Some(PathBuf::from(r"C:\Apps\Foo\foo.exe")),
+            }
+        );
+    }
+
+    #[test]
+    fn every_program_carries_its_first_main_exe() {
+        let mut bar = prog("Bar", Some(r"C:\Apps\Bar"));
+        bar.display_icon = Some(PathBuf::from(r"C:\Apps\Bar\bar.exe,0"));
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo")), bar, prog("Baz", None)];
+        let r = run(&programs, &[], &HashSet::new());
+        assert_eq!(usage(&r, "Foo").main_exe, Some(PathBuf::from(r"C:\Apps\Foo\foo.exe")));
+        assert_eq!(usage(&r, "Bar").main_exe, Some(PathBuf::from(r"C:\Apps\Bar\bar.exe")));
+        assert_eq!(usage(&r, "Baz").main_exe, None);
+        // A service is never the main exe.
+        let services: HashSet<String> = [norm(Path::new(r"C:\Apps\Foo\foo.exe"))].into();
+        let r = run(&programs[..1], &[], &services);
+        assert_eq!(usage(&r, "Foo").main_exe, None);
     }
 
     #[test]
