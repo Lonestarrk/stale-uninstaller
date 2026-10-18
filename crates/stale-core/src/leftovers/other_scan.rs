@@ -36,16 +36,21 @@ pub fn scan_services(reg: &dyn RegistryReader, hint: &ProgramHint) -> Vec<Leftov
         .collect()
 }
 
+fn unescape_xml(s: &str) -> String {
+    // `&amp;` last so `&amp;lt;` becomes `&lt;`, not `<`.
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 /// Every `<Command>` text in a task definition, trimmed, env-expanded and unquoted.
 fn task_commands(xml: &str) -> Vec<PathBuf> {
     const OPEN: &str = "<Command>";
     const CLOSE: &str = "</Command>";
     let mut out = Vec::new();
-    let mut rest = xml;
+    let mut rest = xml.trim_start_matches('\u{feff}');
     while let Some(start) = rest.find(OPEN) {
         let after = &rest[start + OPEN.len()..];
         let Some(end) = after.find(CLOSE) else { break };
-        let text = expand_env(after[..end].trim());
+        let text = expand_env(&unescape_xml(after[..end].trim()));
         let text = text.trim().trim_matches('"').trim();
         if !text.is_empty() {
             out.push(PathBuf::from(text));
@@ -153,6 +158,15 @@ mod tests {
             }]
         );
         assert!(scan_tasks(&fs, Path::new(root), &hint(None)).is_empty());
+    }
+
+    #[test]
+    fn task_command_with_xml_entities() {
+        let root = r"C:\Windows\System32\Tasks";
+        let xml = "\u{feff}<Command>&quot;C:\\Apps\\Foo &amp; Co\\x.exe&quot;</Command>";
+        let fs = FakeFs::new().text(&format!(r"{root}\T"), xml);
+        let out = scan_tasks(&fs, Path::new(root), &hint(Some(r"C:\Apps\Foo & Co")));
+        assert!(matches!(&out[0].kind, LeftoverKind::ScheduledTask { command, .. } if command == Path::new(r"C:\Apps\Foo & Co\x.exe")), "{out:?}");
     }
 
     #[test]

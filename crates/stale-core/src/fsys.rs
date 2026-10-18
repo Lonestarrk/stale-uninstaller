@@ -24,6 +24,23 @@ pub trait FsReader: Send + Sync {
     fn env(&self, var: &str) -> Option<String>;
 }
 
+/// Decodes file bytes as text: UTF-8 (BOM stripped), UTF-16 with a BOM, or BOM-less UTF-16LE
+/// (detected by a NUL second byte); anything else is lossy UTF-8. Task Scheduler writes UTF-16LE.
+pub fn decode_text(bytes: &[u8]) -> String {
+    let utf16 = |b: &[u8], le: bool| {
+        let units: Vec<u16> =
+            b.as_chunks::<2>().0.iter().map(|&c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) }).collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [a, 0, ..] if *a != 0 => utf16(bytes, true),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 const SKIPPED_PROFILES: [&str; 4] = ["public", "default", "default user", "all users"];
 
 pub struct RealFs;
@@ -53,7 +70,7 @@ impl FsReader for RealFs {
     }
 
     fn read_text(&self, p: &Path) -> Option<String> {
-        std::fs::read_to_string(p).ok()
+        std::fs::read(p).ok().map(|b| decode_text(&b))
     }
 
     fn profile_dirs(&self) -> Vec<PathBuf> {
@@ -223,5 +240,33 @@ mod tests {
     fn real_fs_lists_program_files() {
         let pf = RealFs.env("ProgramFiles").unwrap();
         assert!(!RealFs.list_dir(Path::new(&pf)).is_empty());
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn decode_text_handles_utf16le_bom() {
+        let mut b = vec![0xFF, 0xFE];
+        b.extend(utf16le("<Task>é</Task>"));
+        assert_eq!(decode_text(&b), "<Task>é</Task>");
+    }
+
+    #[test]
+    fn decode_text_handles_utf8_bom() {
+        let mut b = vec![0xEF, 0xBB, 0xBF];
+        b.extend("<Task>é</Task>".as_bytes());
+        assert_eq!(decode_text(&b), "<Task>é</Task>");
+    }
+
+    #[test]
+    fn decode_text_heuristic_without_bom() {
+        assert_eq!(decode_text(&utf16le("<Task>")), "<Task>");
+    }
+
+    #[test]
+    fn decode_text_plain_utf8() {
+        assert_eq!(decode_text("<Task>é</Task>".as_bytes()), "<Task>é</Task>");
     }
 }
