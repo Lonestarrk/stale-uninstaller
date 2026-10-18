@@ -98,6 +98,9 @@ pub const SKIP_FOLDERS: &[&str] = &[
     // Covered by `choco*`.
     "chocolatey",
     "Downloaded Installations",
+    "Hyper-V",
+    "PCHealthCheck",
+    "RUXIM",
     "USOShared",
     "Programs",
     "CEF",
@@ -293,7 +296,7 @@ mod tests {
 
     #[test]
     fn skip_and_container_names() {
-        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad", "updater", "Mozilla Maintenance Service", "Microsoft SDKs", "Microsoft VS Code", "SquirrelMachineInstalls", "Chocolatey", "usoshared", "chocoportable", "Downloaded Installations", "Package Cache"] {
+        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad", "updater", "Mozilla Maintenance Service", "Microsoft SDKs", "Microsoft VS Code", "SquirrelMachineInstalls", "Chocolatey", "usoshared", "chocoportable", "Downloaded Installations", "Package Cache", "hyper-v", "PCHealthCheck", "RUXIM"] {
             assert!(is_skipped_folder(n), "{n}");
         }
         for n in ["Google", "Old Tool", "Macrosoft"] {

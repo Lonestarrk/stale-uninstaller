@@ -350,17 +350,18 @@ fn shell_command_key(location: &str, ghost_name: &str) -> Option<RegKeyPath> {
 
 fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
     let item = |kind, confidence| Leftover { kind, confidence, note: None };
-    Some(match e {
-        Evidence::Folder { path, size, .. } => {
-            let kind = LeftoverKind::Dir { path: path.clone(), size: *size };
-            if g.assessment == Assessment::Uncertain {
-                Leftover { kind, confidence: Confidence::Low, note: g.reasons.first().cloned() }
-            } else {
-                item(kind, Confidence::Medium)
-            }
+    // Folders and vendor keys are only as certain as the ghost; Low with its first reason.
+    let owned = |kind| {
+        if g.assessment == Assessment::Uncertain {
+            Leftover { kind, confidence: Confidence::Low, note: g.reasons.first().cloned() }
+        } else {
+            item(kind, Confidence::Medium)
         }
+    };
+    Some(match e {
+        Evidence::Folder { path, size, .. } => owned(LeftoverKind::Dir { path: path.clone(), size: *size }),
         Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => {
-            item(LeftoverKind::RegKey { key: key.clone() }, Confidence::Medium)
+            owned(LeftoverKind::RegKey { key: key.clone() })
         }
         Evidence::DanglingRef { kind, location, target, value_name } => {
             let kind = match kind {
@@ -381,9 +382,9 @@ fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
     })
 }
 
-/// What removing `g` would remove, as leftover items: folders Medium (Low with
-/// the first reason as note when the ghost is uncertain), vendor keys Medium, dangling references
-/// High; execution traces are evidence only. Duplicates are merged (higher confidence wins) and
+/// What removing `g` would remove, as leftover items: folders and vendor keys Medium (Low with
+/// the first reason as note when the ghost is uncertain), dangling references High (their
+/// targets are verifiably gone); execution traces are evidence only. Duplicates are merged (higher confidence wins) and
 /// the items sorted like [`scan_leftovers`](crate::leftovers::scan_leftovers).
 pub fn to_leftovers(g: &Ghost, tasks_root: &Path) -> LeftoverReport {
     let mut items: Vec<Leftover> = Vec::new();
@@ -730,8 +731,36 @@ mod tests {
         );
         g.assessment = Assessment::Uncertain;
         g.reasons = vec![REASON_SIBLING_OWNED.into(), REASON_OTHER_PROFILE.into()];
-        let dir = to_leftovers(&g, tasks).items.into_iter().find(|l| matches!(l.kind, LeftoverKind::Dir { .. })).unwrap();
+        let uncertain = to_leftovers(&g, tasks).items;
+        let dir = uncertain.iter().find(|l| matches!(l.kind, LeftoverKind::Dir { .. })).unwrap();
         assert_eq!((dir.confidence, dir.note.as_deref()), (Confidence::Low, Some(REASON_SIBLING_OWNED)));
+        // Folder and vendor keys drop to Low; the seven dangling references stay High.
+        let count = |c: Confidence| uncertain.iter().filter(|l| l.confidence == c).count();
+        assert_eq!((count(Confidence::High), count(Confidence::Medium), count(Confidence::Low)), (7, 0, 3));
+    }
+
+    #[test]
+    fn uncertain_ghost_registry_keys_are_low() {
+        let vendor = key(Hive::CurrentUser, r"Software\Binary Fortress Software");
+        let mut g = ghost_with(
+            "Binary Fortress Software",
+            vec![
+                Evidence::RegKeyOrphan { key: vendor.clone() },
+                Evidence::RegKeyMissingPath { key: vendor.clone(), value_name: "InstallDir".into(), path: r"C:\Gone".into() },
+                run(r"C:\Program Files\Binary Fortress Software\gone.exe", "BFS"),
+            ],
+        );
+        g.assessment = Assessment::Uncertain;
+        g.reasons = vec![REASON_PUBLISHER_OF_INSTALLED.into()];
+        let items: Vec<(LeftoverKind, Confidence, Option<String>)> =
+            to_leftovers(&g, Path::new(r"C:\T")).items.into_iter().map(|l| (l.kind, l.confidence, l.note)).collect();
+        assert_eq!(
+            items,
+            vec![
+                (LeftoverKind::RegValue { key: key(Hive::CurrentUser, RUN), name: "BFS".into() }, Confidence::High, None),
+                (LeftoverKind::RegKey { key: vendor }, Confidence::Low, Some(REASON_PUBLISHER_OF_INSTALLED.into())),
+            ]
+        );
     }
 
     fn ghost_with(name: &str, evidence: Vec<Evidence>) -> Ghost {
