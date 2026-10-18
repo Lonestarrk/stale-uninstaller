@@ -7,7 +7,7 @@ use crate::keep::KeepList;
 use crate::leftovers::fs_scan::FsScanRoots;
 use crate::leftovers::names::{is_matchable, name_matches_exact, normalize_name, publisher_matches};
 use crate::leftovers::scan::{dedupe_key, kind_group, rank};
-use crate::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport};
+use crate::leftovers::{Confidence, Leftover, LeftoverKind, LeftoverReport, USER_FOLDERS};
 use crate::model::{Hive, Program, RegKeyPath};
 use crate::pathutil::{drive_letter, norm, normed_under};
 use chrono::{DateTime, Utc};
@@ -76,6 +76,8 @@ pub struct NameRoots {
     /// Folder names of the user profiles (`Jobb` for `C:\Users\Jobb`): a folder named like one is
     /// another user's deploy root, never a ghost.
     pub profile_names: Vec<String>,
+    /// [`norm`]ed user folders (Documents, Pictures, Desktop, Downloads) of every profile.
+    pub user_folders: Vec<String>,
 }
 
 impl NameRoots {
@@ -98,7 +100,15 @@ impl NameRoots {
             }
         }
         let profile_names = profiles.iter().filter_map(|p| file_name(p)).collect();
-        NameRoots { roots, publishers, profile_names }
+        let user_folders =
+            profiles.iter().flat_map(|p| USER_FOLDERS.iter().map(move |f| norm(&p.join(f)))).collect();
+        NameRoots { roots, publishers, profile_names, user_folders }
+    }
+
+    /// True when `p` is or lies in a profile's user folder (Documents, Desktop, ...).
+    fn in_user_folder(&self, p: &Path) -> bool {
+        let n = norm(p);
+        self.user_folders.iter().any(|f| *f == n || normed_under(&n, f))
     }
 
     fn is_profile_name(&self, name: &str) -> bool {
@@ -195,6 +205,18 @@ pub fn ghost_name_of(e: &Evidence, roots: &NameRoots) -> Option<String> {
         Evidence::DanglingRef { target, .. } => program_folder(target, roots).map(|(_, name)| name),
         Evidence::UsageTrace { exe, .. } => program_folder(exe, roots).map(|(_, name)| name),
     }
+}
+
+/// Value names too generic to say "install folder" on their own.
+const GENERIC_PATH_VALUES: [&str; 2] = ["Path", "AppPath"];
+
+/// A [`Evidence::RegKeyMissingPath`] from a generic value name (`Path`, `AppPath`) whose dead
+/// path does not name a program folder below a program root, or lies in a user folder: a
+/// document or project path, not an install folder. Such evidence is dropped.
+fn is_weak_path_value(e: &Evidence, roots: &NameRoots) -> bool {
+    let Evidence::RegKeyMissingPath { value_name, path, .. } = e else { return false };
+    GENERIC_PATH_VALUES.iter().any(|n| n.eq_ignore_ascii_case(value_name))
+        && (program_folder(&path.join("_"), roots).is_none() || roots.in_user_folder(path))
 }
 
 /// A dangling reference into a folder an installed program still occupies: that program's own
@@ -315,7 +337,7 @@ pub fn group(
 ) -> Vec<Ghost> {
     let mut groups: BTreeMap<String, (Vec<String>, Vec<Evidence>)> = BTreeMap::new();
     for e in evidence {
-        if is_installed_programs_own(&e, installed, roots) {
+        if is_installed_programs_own(&e, installed, roots) || is_weak_path_value(&e, roots) {
             continue;
         }
         let Some(name) = ghost_name_of(&e, roots) else { continue };
@@ -721,6 +743,41 @@ mod tests {
             assert_eq!(reasons(g), vec![REASON_OTHER_PROFILE]);
             assert_eq!(g.note.as_deref(), Some(NOTE_OTHER_PROFILE));
         }
+    }
+
+    fn path_value(key_path: &str, value_name: &str, path: &str) -> Evidence {
+        Evidence::RegKeyMissingPath { key: key(Hive::CurrentUser, key_path), value_name: value_name.into(), path: path.into() }
+    }
+
+    #[test]
+    fn dead_documents_path_value_is_not_evidence() {
+        let r = roots(&[]);
+        let ev = vec![
+            path_value(r"Software\Some Editor", "Path", r"C:\Users\A\Documents\Projects\Old"),
+            path_value(r"Software\Other Editor", "AppPath", r"D:\Work\Stuff"),
+            path_value(r"Software\Root Tool", "path", r"C:\Program Files"),
+        ];
+        assert_eq!(summary(&group_t(ev, &installed(&[]), &KeepList::default(), &r, None)), vec![]);
+    }
+
+    #[test]
+    fn dead_program_files_installpath_is_evidence() {
+        let r = roots(&[]);
+        let ev = vec![
+            path_value(r"Software\Gone Suite", "InstallPath", r"C:\Program Files\Gone Suite"),
+            path_value(r"Software\Gone Viewer", "Path", r"C:\Program Files (x86)\Gone Viewer\bin"),
+            // Non-generic value names stay evidence wherever they point.
+            path_value(r"Software\Gone Elsewhere", "InstallDir", r"D:\Apps\Gone Elsewhere"),
+        ];
+        let ghosts = group_t(ev, &installed(&[]), &KeepList::default(), &r, None);
+        assert_eq!(
+            summary(&ghosts),
+            vec![
+                ("Gone Elsewhere".to_string(), Assessment::ProbablyUninstalled),
+                ("Gone Suite".to_string(), Assessment::ProbablyUninstalled),
+                ("Gone Viewer".to_string(), Assessment::ProbablyUninstalled),
+            ]
+        );
     }
 
     #[test]
