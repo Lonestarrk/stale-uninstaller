@@ -81,6 +81,35 @@ pub fn name_matches(candidate: &str, hint_name: &str) -> bool {
     words.next().is_some() && is_matchable(first) && c == first
 }
 
+/// Normalised-equal or spaces-removed-equal; unlike [`name_matches`], no first-word rule.
+pub fn name_matches_exact(candidate: &str, hint_name: &str) -> bool {
+    if !is_matchable(candidate) || !is_matchable(hint_name) {
+        return false;
+    }
+    let c = normalize_name(candidate);
+    let h = normalize_name(hint_name);
+    c == h || compact(&c) == compact(&h)
+}
+
+/// Matches only through the first-word rule, e.g. `Google` for `Google Chrome`: such a
+/// candidate is a vendor container, not the program itself.
+pub fn name_matches_first_word_only(candidate: &str, hint_name: &str) -> bool {
+    name_matches(candidate, hint_name) && !name_matches_exact(candidate, hint_name)
+}
+
+/// Whether `child` inside the vendor container `container` is the program: an exact match on
+/// the full name, or on the name with the container's words removed from its start
+/// (`Google\Chrome` for `Google Chrome`).
+pub fn child_matches_in_container(child: &str, container: &str, hint_name: &str) -> bool {
+    if name_matches_exact(child, hint_name) {
+        return true;
+    }
+    let h = normalize_name(hint_name);
+    let c = normalize_name(container);
+    !c.is_empty()
+        && h.strip_prefix(&c).and_then(|r| r.strip_prefix(' ')).is_some_and(|rest| name_matches_exact(child, rest))
+}
+
 fn strip_legal_suffix(s: &str) -> String {
     let mut words: Vec<&str> = s.split(' ').collect();
     while words.len() > 1 {
@@ -120,5 +149,7 @@ mod tests {
     #[test] fn publisher_matches_ignores_legal_suffix() { assert!(publisher_matches("Unity Technologies", "Unity Technologies ApS")); assert!(publisher_matches("DiscordInc", "Discord Inc.")); assert!(!publisher_matches("Microsoft", "Microsoft Corporation Edge Team")); }
     #[test] fn normalize_strips_v_tokens_bitness_and_installer() { assert_eq!(normalize_name("Tool v2 64-bit Installer"), "tool"); assert_eq!(normalize_name("Game 2024"), "game"); assert_eq!(normalize_name("  Foo   Bar  "), "foo bar"); }
     #[test] fn publisher_matches_strips_bv_and_sa() { assert!(publisher_matches("Foo B.V.", "Foo")); assert!(publisher_matches("Bar S.A.", "Bar")); }
+    #[test] fn exact_and_first_word_only_split_name_matches() { assert!(name_matches_exact("UnityHub", "Unity Hub")); assert!(!name_matches_exact("Unity", "Unity Hub")); assert!(name_matches_first_word_only("Google", "Google Chrome")); assert!(!name_matches_first_word_only("Google Chrome", "Google Chrome")); assert!(!name_matches_first_word_only("Other", "Google Chrome")); }
+    #[test] fn child_in_container_matches_name_without_container_words() { assert!(child_matches_in_container("Chrome", "Google", "Google Chrome")); assert!(child_matches_in_container("Google Chrome", "Google LLC", "Google Chrome")); assert!(!child_matches_in_container("Update", "Google", "Google Chrome")); assert!(!child_matches_in_container("Hub", "Unity", "Unity Hub")); }
     #[test] fn normalize_drops_ranges_and_lone_punctuation() { assert_eq!(normalize_name("Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.38.33130"), "microsoft visual c++ redistributable"); assert_eq!(normalize_name("Node.js"), "node.js"); assert_eq!(normalize_name("7-Zip"), "7-zip"); }
 }

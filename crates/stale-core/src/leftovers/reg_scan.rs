@@ -1,6 +1,8 @@
 //! Registry keys and values a program left behind.
 
-use super::names::{name_matches, publisher_matches};
+use super::names::{
+    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
+};
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::model::{Hive, RegKeyPath};
 use crate::pathutil::{exe_under, expand_env, first_path_in_command, is_shared_root};
@@ -48,9 +50,14 @@ impl RegScanRoots {
 enum Target {
     /// Any file inside the (non-shared) install folder.
     Install(PathBuf),
-    /// Lowercased exe file names from the display icon and uninstall command.
-    ExeNames(Vec<String>),
+    /// Lowercased, non-generic exe file names from the display icon and uninstall command; a
+    /// referenced exe must also sit in a folder (parent or grandparent) named like `program`.
+    ExeNames { names: Vec<String>, program: String },
 }
+
+/// Stem fragments of uninstallers, installers and updaters (`unins000`, Squirrel's `Update`),
+/// which many unrelated programs share.
+const GENERIC_EXE_STEMS: [&str; 6] = ["unins", "uninstall", "setup", "install", "update", "msiexec"];
 
 impl Target {
     /// `None` when there is nothing to match on.
@@ -63,16 +70,24 @@ impl Target {
             .into_iter()
             .flatten()
             .filter_map(lower_file_name)
-            .filter(|n| n.ends_with(".exe") && n != "msiexec.exe")
+            .filter(|n| n.strip_suffix(".exe").is_some_and(|stem| !GENERIC_EXE_STEMS.iter().any(|g| stem.contains(g))))
             .collect();
         names.dedup();
-        (!names.is_empty()).then_some(Target::ExeNames(names))
+        (!names.is_empty()).then(|| Target::ExeNames { names, program: hint.name.clone() })
     }
 
     fn refers_to(&self, path: &Path) -> bool {
         match self {
             Target::Install(dir) => exe_under(path, dir),
-            Target::ExeNames(names) => lower_file_name(path).is_some_and(|n| names.contains(&n)),
+            Target::ExeNames { names, program } => {
+                lower_file_name(path).is_some_and(|n| names.contains(&n))
+                    && path
+                        .ancestors()
+                        .skip(1)
+                        .take(2)
+                        .filter_map(|dir| dir.file_name())
+                        .any(|dir| name_matches(&dir.to_string_lossy(), program))
+            }
         }
     }
 
@@ -166,21 +181,27 @@ fn uninstall_key(reg: &dyn RegistryReader, hint: &ProgramHint, found: &mut Found
     }
 }
 
-/// (b) `<root>\<Name>` and `<root>\<Publisher>\<Name>`. A publisher key holding nothing but
-/// the program's key (and no values) is listed in its place.
+/// (b) `<root>\<Name>` (exact name match) and `<container>\<Name>`, where a container is a
+/// publisher key or a first-word vendor key (`Google` for `Google Chrome`). A container holding
+/// nothing but the program's key (and no values) is listed in its place; otherwise it never is.
 fn software_keys(reg: &dyn RegistryReader, root: &RegKeyPath, hint: &ProgramHint, found: &mut Found) {
     let Ok(subkeys) = reg.subkeys(root) else { return };
     for sub in subkeys {
         let k = child(root, &sub);
-        if name_matches(&sub, &hint.name) {
+        if name_matches_exact(&sub, &hint.name) {
             found.key(k, Confidence::Medium, None);
             continue;
         }
-        if !hint.publisher.as_deref().is_some_and(|p| publisher_matches(&sub, p)) {
+        let is_container = name_matches_first_word_only(&sub, &hint.name)
+            || hint.publisher.as_deref().is_some_and(|p| publisher_matches(&sub, p));
+        if !is_container {
             continue;
         }
-        let (matched, others): (Vec<String>, Vec<String>) =
-            reg.subkeys(&k).unwrap_or_default().into_iter().partition(|c| name_matches(c, &hint.name));
+        let (matched, others): (Vec<String>, Vec<String>) = reg
+            .subkeys(&k)
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|c| child_matches_in_container(c, &sub, &hint.name));
         if matched.is_empty() {
             continue;
         }
@@ -404,6 +425,40 @@ mod tests {
                 (format!(r"LocalMachine\{APP_PATHS}\foo.exe"), Confidence::High, None),
             ]
         );
+    }
+
+    #[test]
+    fn first_word_vendor_key_is_not_listed_but_its_matching_child_is() {
+        let mut reg = FakeRegistry::new();
+        reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Google\Chrome"));
+        reg.add_key(key(Hive::LocalMachine, r"SOFTWARE\Google\Update"));
+        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &hint("Google Chrome", None, None));
+        assert_eq!(
+            found(&out),
+            vec![(r"LocalMachine\SOFTWARE\Google\Chrome".to_string(), Confidence::Medium, Some("shared-publisher-key".to_string()))]
+        );
+    }
+
+    #[test]
+    fn rule_f_ignores_generic_uninstaller_names() {
+        let mut reg = FakeRegistry::new();
+        reg.set(key(Hive::CurrentUser, RUN), "Discord", s(r"C:\Users\A\AppData\Local\discord\Update.exe --processStart Discord.exe"));
+        let mut h = hint("Slack", None, None);
+        h.uninstall_string = Some(r#""C:\Users\A\AppData\Local\slack\Update.exe" --uninstall"#.into());
+        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn rule_f_matches_when_parent_folder_matches() {
+        let mut reg = FakeRegistry::new();
+        reg.set(key(Hive::CurrentUser, RUN), "Foo", s(r#""C:\Apps\Foo Studio\foo.exe" /tray"#));
+        // Same exe name, but no folder above it names the program.
+        reg.set(key(Hive::CurrentUser, RUN), "OtherFoo", s(r#""C:\Apps\Other\bin\foo.exe" /tray"#));
+        let mut h = hint("Foo Studio", None, None);
+        h.display_icon = Some(PathBuf::from(r"C:\Apps\Foo Studio\foo.exe"));
+        let out = scan_registry(&reg, &RegScanRoots::standard(&reg), &h);
+        assert_eq!(found(&out), vec![(format!(r"CurrentUser\{HKCU_RUN}:Foo"), Confidence::High, None)]);
     }
 
     #[test]

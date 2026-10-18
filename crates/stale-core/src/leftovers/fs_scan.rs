@@ -1,6 +1,8 @@
 //! Folders a program left behind.
 
-use super::names::{name_matches, publisher_matches};
+use super::names::{
+    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
+};
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::fsys::FsReader;
 use crate::pathutil::{is_shared_root, norm, normed_under};
@@ -99,13 +101,18 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
     }
     for root in &name_roots {
         for entry in fs.list_dir(root).into_iter().filter(|e| e.is_dir) {
-            if name_matches(&file_name(&entry.path), &hint.name) {
+            let name = file_name(&entry.path);
+            if name_matches_exact(&name, &hint.name) {
                 if !is_install(&entry.path) {
                     push(&entry.path, Confidence::Medium, None);
                 }
-            } else if hint.publisher.as_deref().is_some_and(|p| publisher_matches(&file_name(&entry.path), p)) {
+            } else if name_matches_first_word_only(&name, &hint.name)
+                || hint.publisher.as_deref().is_some_and(|p| publisher_matches(&name, p))
+            {
+                // A vendor container (publisher or first-word match such as `Google` for
+                // `Google Chrome`): only the program's own child is listed, never the container.
                 for child in fs.list_dir(&entry.path).into_iter().filter(|e| e.is_dir) {
-                    if name_matches(&file_name(&child.path), &hint.name) && !is_install(&child.path) {
+                    if child_matches_in_container(&file_name(&child.path), &name, &hint.name) && !is_install(&child.path) {
                         push(&child.path, Confidence::Medium, None);
                     }
                 }
@@ -198,6 +205,20 @@ mod tests {
             .dir(r"C:\Program Files\Unity Technologies\Editor", 3);
         let out = scan_folders(&fs, &roots(), &hint("Unity Hub", Some("Unity Technologies"), None));
         assert_eq!(dirs(&out), vec![(r"C:\Program Files\Unity Technologies\Unity Hub".to_string(), Confidence::Medium)]);
+    }
+
+    #[test]
+    fn first_word_vendor_folder_lists_only_matching_child() {
+        let fs = FakeFs::new()
+            .dir(r"C:\Program Files\Google\Chrome", 10)
+            .dir(r"C:\Program Files\Google\Update", 3);
+        let out = scan_folders(&fs, &roots(), &hint("Google Chrome", None, None));
+        assert_eq!(dirs(&out), vec![(r"C:\Program Files\Google\Chrome".to_string(), Confidence::Medium)]);
+
+        // A container holding only the program's folder: the child is listed, never the container.
+        let fs = FakeFs::new().dir(r"C:\Program Files\Google\Chrome", 10);
+        let out = scan_folders(&fs, &roots(), &hint("Google Chrome", None, None));
+        assert_eq!(dirs(&out), vec![(r"C:\Program Files\Google\Chrome".to_string(), Confidence::Medium)]);
     }
 
     #[test]
