@@ -265,16 +265,17 @@ fn class_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
                 let c = child(&k, &clsid);
                 let kept = !cx.examines(&c);
                 // Every server is checked, so each existing one is recorded as live. A class
-                // with a live server is still in use: never evidence.
-                let (mut target, mut any_live) = (None, false);
+                // with any server that is not verifiably gone (live, a bare name such as
+                // `mscoree.dll`, on a missing drive, kept or installed) is never evidence.
+                let (mut target, mut other_alive) = (None, false);
                 for p in SERVER_KEYS.iter().filter_map(|s| default_string(cx.reg, &child(&c, s)).as_deref().and_then(path_in_value)) {
-                    if cx.note_live(&p) {
-                        any_live = true;
-                    } else if target.is_none() && cx.is_dead(&p) {
+                    if !cx.is_dead_ref(&p) {
+                        other_alive = true;
+                    } else if target.is_none() {
                         target = Some(p);
                     }
                 }
-                if let Some(target) = target.filter(|_| !kept && !any_live) {
+                if let Some(target) = target.filter(|_| !kept && !other_alive) {
                     out.push(dangling(RefKind::ClassesServer, &c, target, None));
                 }
             }
@@ -538,6 +539,16 @@ mod tests {
         let location = format!(r"HKLM\{CLSID}\{{Dead}}");
         assert_eq!(got.evidence, vec![dangling(RefKind::ClassesServer, &location, r"C:\Apps\Gone\other.exe", None)]);
         assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Apps\Live\ext.dll")]);
+    }
+
+    #[test]
+    fn clsid_with_bare_server_not_listed() {
+        let mut reg = FakeRegistry::new();
+        let hklm = |p: &str| key(Hive::LocalMachine, p);
+        reg.set(hklm(&format!(r"{CLSID}\{{Net}}\InprocServer32")), "", s("mscoree.dll"));
+        reg.set(hklm(&format!(r"{CLSID}\{{Net}}\LocalServer32")), "", s(r"C:\Apps\Gone\server.exe"));
+        let got = registry_collect(&reg, &FakeFs::new(), &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
+        assert_eq!(got.evidence, vec![], "a server that is not verifiably gone keeps the class");
     }
 
     #[test]

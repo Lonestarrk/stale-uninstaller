@@ -113,6 +113,15 @@ pub fn service_collect(
     out
 }
 
+/// The actions of a task definition: `<Exec>`, `<ComHandler>`, `<SendEmail>`, `<ShowMessage>`
+/// elements (`<ExecutionTimeLimit>` is not one).
+fn action_count(xml: &str) -> usize {
+    ["Exec", "ComHandler", "SendEmail", "ShowMessage"]
+        .iter()
+        .map(|tag| xml.matches(&format!("<{tag}>")).count() + xml.matches(&format!("<{tag} ")).count())
+        .sum()
+}
+
 /// `Services\<name>\Parameters\ServiceDll`, expanded and unquoted.
 fn service_dll(reg: &dyn RegistryReader, name: &str) -> Option<PathBuf> {
     let values = reg.values(&key(Hive::LocalMachine, &format!(r"{SERVICES_ROOT}\{name}\Parameters"))).ok()?;
@@ -151,15 +160,23 @@ pub fn task_collect(
     let mut out = Collected::default();
     for file in files {
         let Some(xml) = fs.read_text(&file) else { continue };
-        let (mut dead, mut partly_live) = (None, false);
-        for command in task_commands(&xml) {
+        let commands = task_commands(&xml);
+        let actions = action_count(&xml).max(commands.len());
+        // Any action not verifiably dead (a live or bare command, one on a missing drive, a kept
+        // or installed path, a COM handler): removing the task takes it too.
+        let mut other_alive = actions > commands.len();
+        let mut dead = None;
+        for command in commands {
             if g.is_live(&command) {
                 out.live_targets.push(command);
-                partly_live = true;
-            } else if dead.is_none() && g.is_dead(&command) {
+                other_alive = true;
+            } else if !g.is_dead(&command) {
+                other_alive = true;
+            } else if dead.is_none() {
                 dead = Some(command);
             }
         }
+        let partly_live = actions > 1 && other_alive;
         let (Some(target), Ok(rel)) = (dead, file.strip_prefix(tasks_root)) else { continue };
         let name = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join(r"\");
         out.evidence.push(Evidence::DanglingRef {
@@ -312,6 +329,35 @@ mod tests {
             ]
         );
         assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Program Files\ldplayer9box\Ld9BoxSup.sys")]);
+    }
+
+    #[test]
+    fn task_with_bare_or_non_exec_action_is_partly_live() {
+        let root = r"C:\Windows\System32\Tasks";
+        let fs = FakeFs::new()
+            .text(&format!(r"{root}\Bare"), r"<Exec><Command>powershell.exe</Command></Exec><Exec><Command>C:\Gone\b.exe</Command></Exec>")
+            .text(
+                &format!(r"{root}\Com"),
+                r"<Settings><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings><Actions><ComHandler><ClassId>{1}</ClassId></ComHandler><Exec><Command>C:\Gone\c.exe</Command></Exec></Actions>",
+            )
+            .text(&format!(r"{root}\Usb"), r"<Exec><Command>E:\Usb\u.exe</Command></Exec><Exec><Command>C:\Gone\d.exe</Command></Exec>")
+            .text(
+                &format!(r"{root}\Alone"),
+                r"<Settings><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings><Exec><Command>C:\Gone\e.exe</Command></Exec>",
+            );
+        let (i, k) = none();
+        let no_e = |c: char| c != 'E';
+        let mut got: Vec<(String, bool)> = task_collect(&fs, Path::new(root), &i, &k, &no_e)
+            .evidence
+            .into_iter()
+            .map(|e| match e {
+                Evidence::DanglingRef { location, partly_live, .. } => (location, partly_live),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        got.sort();
+        let want = [("Alone", false), ("Bare", true), ("Com", true), ("Usb", true)].map(|(l, p)| (l.to_string(), p));
+        assert_eq!(got, want);
     }
 
     #[test]
