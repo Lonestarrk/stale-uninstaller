@@ -18,6 +18,9 @@ pub enum ItemState {
     Pending,
     Running,
     Uninstalled,
+    /// Removed without its own uninstaller (forced mode, or none was found): only the leftover
+    /// scan ran.
+    Forced,
     NotUninstalled { exit_code: Option<i32> },
     /// The queue ended before reaching this item.
     Skipped,
@@ -66,6 +69,10 @@ impl FlowState {
                 VendorResult::NoUninstaller => {}
             },
             UninstallEvent::Leftovers { index, report } => {
+                // Still running here means no vendor uninstaller ran: a forced removal.
+                if self.items.get(index).is_some_and(|(_, _, s)| *s == ItemState::Running) {
+                    self.set_state(index, ItemState::Forced);
+                }
                 self.reports.push((index, report));
                 self.step = Step::Leftovers;
             }
@@ -141,6 +148,7 @@ mod tests {
         assert_eq!(f.items[2].2, ItemState::Running, "no uninstaller: leftovers still to come");
         f.apply(UninstallEvent::Warning("w".into()));
         f.apply(UninstallEvent::Leftovers { index: 2, report: LeftoverReport::default() });
+        assert_eq!(f.items[2].2, ItemState::Forced, "removed without its uninstaller");
         assert!(!f.finished);
 
         f.apply(UninstallEvent::QueueDone);

@@ -167,6 +167,7 @@ fn state_text(state: &ItemState) -> String {
         ItemState::Pending => strings::STATE_PENDING.to_string(),
         ItemState::Running => strings::STATE_RUNNING.to_string(),
         ItemState::Uninstalled => strings::STATE_UNINSTALLED.to_string(),
+        ItemState::Forced => strings::STATE_FORCED.to_string(),
         ItemState::NotUninstalled { exit_code: Some(code) } => {
             format!("{} ({} {code})", strings::STATE_NOT_UNINSTALLED, strings::EXIT_CODE)
         }
@@ -184,6 +185,7 @@ mod tests {
         assert_eq!(state_text(&ItemState::NotUninstalled { exit_code: Some(1602) }), "Inte avinstallerat (kod 1602)");
         assert_eq!(state_text(&ItemState::NotUninstalled { exit_code: None }), "Inte avinstallerat");
         assert_eq!(state_text(&ItemState::Skipped), "Hoppades över");
+        assert_eq!(state_text(&ItemState::Forced), "Tvingad");
         assert_eq!(restore_point_text(&RestorePointStatus::Failed("x".into())), "misslyckades: x");
         assert_eq!(restore_point_text(&RestorePointStatus::SkippedFrequency), "hoppades över (en punkt skapades nyligen)");
     }

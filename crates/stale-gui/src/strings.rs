@@ -99,6 +99,8 @@ pub const RP_FAILED: &str = "misslyckades";
 pub const STATE_PENDING: &str = "Väntar";
 pub const STATE_RUNNING: &str = "Pågår";
 pub const STATE_UNINSTALLED: &str = "Avinstallerat";
+/// Removed without the program's own uninstaller.
+pub const STATE_FORCED: &str = "Tvingad";
 pub const STATE_NOT_UNINSTALLED: &str = "Inte avinstallerat";
 /// Precedes an exit code: "Inte avinstallerat (kod 1602)".
 pub const EXIT_CODE: &str = "kod";
