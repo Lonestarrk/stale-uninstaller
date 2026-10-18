@@ -163,12 +163,21 @@ const UNINSTALLER_STEMS: [&str; 5] = ["unins", "uninstall", "uninst", "setup", "
 /// Folder names that hold installer caches, never a program's install folder.
 const INSTALLER_CACHE_NAMES: [&str; 3] = ["package cache", "downloaded installations", "installshield installation information"];
 
-/// `dir` is at or under `%TEMP%`, `%LOCALAPPDATA%\Temp`, `%ProgramData%\Package Cache`,
-/// `%LOCALAPPDATA%\Package Cache`, or has a `Package Cache`, `Downloaded Installations` or
-/// `InstallShield Installation Information` folder in its path: an uninstaller there is a cached
-/// setup, and its folder is not the install folder.
+/// `dir` is at or under `%TEMP%`, `%LOCALAPPDATA%\Temp`, any profile's `AppData\Local\Temp`,
+/// `%ProgramData%\Package Cache`, `%LOCALAPPDATA%\Package Cache`, or has a `Package Cache`,
+/// `Downloaded Installations` or `InstallShield Installation Information` folder in its path: an
+/// uninstaller there is a cached setup, and its folder is not the install folder.
 fn in_temp_or_installer_cache(dir: &Path) -> bool {
     let n = norm(dir);
+    let users = norm(&crate::paths::user_profiles_root());
+    // `<Users>\<name>\AppData\Local\Temp`, whoever's profile it is.
+    let profile_temp = n
+        .strip_prefix(&users)
+        .and_then(|r| r.strip_prefix('\\'))
+        .is_some_and(|r| r.split('\\').skip(1).take(3).eq(["APPDATA", "LOCAL", "TEMP"]));
+    if profile_temp {
+        return true;
+    }
     let roots = ["%TEMP%", r"%LOCALAPPDATA%\Temp", r"%LOCALAPPDATA%\Package Cache"];
     // ProgramData from the system, never from the environment.
     let package_cache = norm(&crate::paths::program_data_dir().join("Package Cache"));
@@ -417,6 +426,20 @@ mod tests {
         let mut h = hint_with(None, None, Some(r"D:\Apps\Obsidian\Obsidian.exe"));
         h.name = "Obsidian Publisher".into();
         assert_eq!(h.effective_install_dir(), None);
+    }
+
+    #[test]
+    fn other_profile_temp_is_rejected() {
+        let users = crate::paths::user_profiles_root();
+        let temp = users.join("SomeoneElse").join(r"AppData\Local\Temp");
+        assert!(in_temp_or_installer_cache(&temp));
+        assert!(in_temp_or_installer_cache(&temp.join(r"{GUID}\Obsidian")));
+        let setup = format!(r#""{}\{{GUID}}\Uninstall Obsidian.exe" /S"#, temp.display());
+        assert_eq!(hint_with(None, Some(&setup), None).effective_install_dir(), None);
+        // The same profile's own programs are fine.
+        assert!(!in_temp_or_installer_cache(&users.join("SomeoneElse").join(r"AppData\Local\Programs\Obsidian")));
+        assert!(!in_temp_or_installer_cache(&users.join(r"SomeoneElse\Temp")));
+        assert!(!in_temp_or_installer_cache(Path::new(r"D:\Apps\AppData\Local\Temp")));
     }
 
     #[test]
