@@ -42,7 +42,7 @@ fn unescape_xml(s: &str) -> String {
 }
 
 /// Every `<Command>` text in a task definition, trimmed, env-expanded and unquoted.
-fn task_commands(xml: &str) -> Vec<PathBuf> {
+pub(crate) fn task_commands(xml: &str) -> Vec<PathBuf> {
     const OPEN: &str = "<Command>";
     const CLOSE: &str = "</Command>";
     let mut out = Vec::new();
@@ -60,7 +60,7 @@ fn task_commands(xml: &str) -> Vec<PathBuf> {
     out
 }
 
-fn task_files(fs: &dyn FsReader, dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn task_files(fs: &dyn FsReader, dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs.list_dir(dir) {
         if entry.is_dir {
             task_files(fs, &entry.path, out);
