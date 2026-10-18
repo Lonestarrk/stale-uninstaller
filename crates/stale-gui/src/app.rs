@@ -1047,6 +1047,11 @@ mod tests {
 
     use super::*;
 
+    /// Test files in a temp folder belong to whoever runs the tests: trust them.
+    fn trust_all(_: &std::fs::File) -> Option<bool> {
+        Some(true)
+    }
+
     fn program(id: &str, hidden: bool) -> Program {
         Program {
             account: None,
@@ -1334,7 +1339,7 @@ mod tests {
         app.toggle_show_hidden_at(&path);
         assert_eq!(app.rows.len(), 2);
         assert!(app.settings.show_hidden);
-        assert!(Settings::load_from(&path).show_hidden, "setting is saved");
+        assert!(Settings::load_from_with(&path, &trust_all).show_hidden, "setting is saved");
         app.checked.insert(ProgramId("h".into()));
         app.selected = Some(ProgramId("h".into()));
 
@@ -1470,7 +1475,7 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.set_quarantine_days_at(7, &path);
         assert_eq!(app.settings.quarantine_days, 7);
-        assert_eq!(Settings::load_from(&path).quarantine_days, 7);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).quarantine_days, 7);
     }
 
     /// Swedish only: the language is process-wide and other tests running in parallel expect
@@ -1482,7 +1487,7 @@ mod tests {
         let mut app = StaleApp::empty(Settings::default());
         app.set_language_at(strings::Lang::Sv, &path);
         assert_eq!(app.settings.language.as_deref(), Some("sv"));
-        assert_eq!(Settings::load_from(&path).language.as_deref(), Some("sv"));
+        assert_eq!(Settings::load_from_with(&path, &trust_all).language.as_deref(), Some("sv"));
         assert_eq!(strings::lang(), strings::Lang::Sv);
     }
 
@@ -1548,7 +1553,7 @@ mod tests {
         assert_eq!(sel.checked, vec![false, true, false], "back in its row, checked as before");
         assert_eq!(app.keep.names, vec!["Earlier".to_string()], "the keep entries are reverted");
         assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
-        assert_eq!(KeepList::load_from(&path), app.keep, "and saved");
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), app.keep, "and saved");
         assert!(app.last_kept.is_none());
         app.undo_keep_at(&path);
         assert_eq!(app.ghosts.as_ref().unwrap().ghosts.len(), 3, "a second undo does nothing");
@@ -1568,9 +1573,9 @@ mod tests {
         app.remove_keep_entry_at(&KeepEntry::Key(key), &path);
         assert_eq!(app.keep.names, vec!["Alpha".to_string()]);
         assert!(app.keep.paths.is_empty() && app.keep.keys.is_empty());
-        assert_eq!(KeepList::load_from(&path), app.keep);
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), app.keep);
         app.remove_keep_entry_at(&KeepEntry::Name("alpha".into()), &path);
-        assert_eq!(KeepList::load_from(&path), KeepList::default());
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), KeepList::default());
         assert!(app.ghost_rx.is_none() && !app.ghost_scan_busy(), "nothing is rescanned");
     }
 
@@ -1594,7 +1599,7 @@ mod tests {
         app.ghosts = Some(GhostSelection::new(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));
 
         app.keep_ghost_at("alpha", &path);
-        let saved = KeepList::load_from(&path);
+        let saved = KeepList::load_from_with(&path, &trust_all);
         assert_eq!(saved, app.keep);
         assert_eq!(saved.names, vec!["Alpha".to_string()]);
         assert_eq!(saved.paths, vec![PathBuf::from(r"C:\Program Files\Alpha")]);
@@ -1603,7 +1608,7 @@ mod tests {
         assert_eq!(names, vec!["Beta"]);
 
         app.keep_ghost_at("missing", &path);
-        assert_eq!(KeepList::load_from(&path), saved, "an unknown key changes nothing");
+        assert_eq!(KeepList::load_from_with(&path, &trust_all), saved, "an unknown key changes nothing");
     }
 
     #[test]

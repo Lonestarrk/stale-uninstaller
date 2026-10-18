@@ -198,8 +198,7 @@ pub fn create_locked(path: &Path) -> Result<(), String> {
 /// FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES: data access, so the missing delete sharing is enforced
 /// (an open with attribute access only takes no part in sharing checks).
 const PIN_ACCESS: u32 = 0x1 | 0x80;
-const FILE_SHARE_READ: u32 = 0x1;
-const FILE_SHARE_READ_WRITE: u32 = FILE_SHARE_READ | 0x2;
+const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -233,8 +232,9 @@ struct DirOps<'a> {
     is_reparse: &'a dyn Fn(&Path) -> bool,
     owned_by_admins: &'a dyn Fn(&Path) -> Option<bool>,
     apply: &'a dyn Fn(&Path) -> Result<(), String>,
-    /// Makes Administrators the owner of a plain file and resets its DACL to inherited.
-    take_over: &'a dyn Fn(&Path) -> Result<(), String>,
+    /// Replaces a plain file with a copy this process creates (same content, a new file object
+    /// renamed over the name, see [`crate::trusted::replace_with_own_copy`]).
+    replace: &'a dyn Fn(&Path) -> Result<(), String>,
 }
 
 /// Locks `path` down to Administrators and SYSTEM, replacing the whole DACL and the owner.
@@ -250,11 +250,13 @@ struct DirOps<'a> {
 /// Then each direct child folder or reparse point that is a reparse point or not owned by
 /// Administrators/SYSTEM is renamed aside to `<name>.untrusted-<timestamp>` (one warning each in
 /// the returned list) — re-checked against a fresh listing of `path` just before; names already
-/// holding `.untrusted-` are left alone. A plain file not owned by Administrators/SYSTEM (a
-/// planted `settings.json`) is taken over instead: owner Administrators, DACL reset to the
-/// inherited one ([`take_over_file`]); when that fails it is moved aside too. Admin-owned files
-/// are left alone. Trusted child folders get the same descriptor (one level: the DACL is
-/// inheritable below).
+/// holding `.untrusted-` are left alone; links and reparse points are never followed. A plain
+/// file not owned by Administrators/SYSTEM (a planted `settings.json`) is replaced instead: its
+/// content goes into a new file of ours renamed over it, so no handle anyone holds on the old file
+/// reaches the new one ([`crate::trusted::replace_with_own_copy`]); when that fails it is moved
+/// aside, and when that fails too it stays, and loading ignores it (its owner is not trusted, see
+/// [`crate::trusted::read_trusted`]). Admin-owned files are left alone. Trusted child folders get
+/// the same descriptor (one level: the DACL is inheritable below).
 pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, String> {
     use crate::quarantine::fsmove::is_reparse_point;
     use crate::quarantine::store::owned_by_admins;
@@ -262,7 +264,7 @@ pub fn secure_dir(path: &Path, created_by_us: bool) -> Result<Vec<String>, Strin
         is_reparse: &is_reparse_point,
         owned_by_admins: &owned_by_admins,
         apply: &apply_locked,
-        take_over: &take_over_file,
+        replace: &crate::trusted::replace_with_own_copy,
     };
     secure_dir_with(path, created_by_us, &ops)
 }
@@ -304,16 +306,16 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
         let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
         if !is_dir && !is_link && !(ops.is_reparse)(&child) {
             // A plain file (settings.json, important.json, logs): an admin-owned one is ours; any
-            // other is taken over, and moved aside below only when that fails.
+            // other is replaced by a copy of ours, and moved aside below only when that fails.
             if (ops.owned_by_admins)(&child) == Some(true) {
                 continue;
             }
-            match (ops.take_over)(&child) {
+            match (ops.replace)(&child) {
                 Ok(()) => {
-                    warnings.push(format!("{} (not owned by Administrators or SYSTEM) taken over", child.display()));
+                    warnings.push(format!("{} (not owned by Administrators or SYSTEM) replaced by a copy of ours", child.display()));
                     continue;
                 }
-                Err(e) => warnings.push(format!("{} could not be taken over: {e}", child.display())),
+                Err(e) => warnings.push(format!("{} could not be replaced: {e}", child.display())),
             }
         }
         if untrusted(&child) {
@@ -329,13 +331,8 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
             let why = if reparse { "link or reparse point" } else { "not owned by Administrators or SYSTEM" };
             match std::fs::rename(&child, &aside) {
                 Ok(()) => warnings.push(format!("{} ({why}) moved aside to {}", child.display(), aside.display())),
-                Err(e) if !is_dir && !is_link => {
-                    // Neither taken over nor moved aside: never read (settings and keep list
-                    // fall back to their defaults).
-                    ignore_file(&child);
-                    warnings.push(format!("{} ({why}) could not be moved aside, ignored: {e}", child.display()));
-                }
-                Err(e) => warnings.push(format!("{} ({why}) could not be moved aside: {e}", child.display())),
+                // Left in place: loading never trusts it (owner or reparse check on its handle).
+                Err(e) => warnings.push(format!("{} ({why}) could not be moved aside, ignored: {e}", child.display())),
             }
         } else if is_dir {
             if let Err(e) = (ops.apply)(&child) {
@@ -346,70 +343,8 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
     Ok(warnings)
 }
 
-/// Plain files in a locked folder that could be neither taken over nor moved aside ([`norm`]ed).
-static IGNORED_FILES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn ignore_file(path: &Path) {
-    let mut ignored = IGNORED_FILES.lock().unwrap_or_else(|e| e.into_inner());
-    ignored.push(crate::pathutil::norm(path));
-}
-
-/// True when [`secure_dir`] could neither take over nor move aside the file `path`: someone else
-/// controls it, so its content is never trusted (the settings and the keep list use defaults).
-pub fn is_ignored_file(path: &Path) -> bool {
-    let n = crate::pathutil::norm(path);
-    IGNORED_FILES.lock().unwrap_or_else(|e| e.into_inner()).contains(&n)
-}
-
 /// FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC.
 const REINHERIT_ACCESS: u32 = 0x80 | 0x2_0000 | 0x4_0000;
-/// [`REINHERIT_ACCESS`] | WRITE_OWNER.
-const TAKE_OVER_ACCESS: u32 = REINHERIT_ACCESS | 0x8_0000;
-
-/// Makes Administrators the owner of the plain file `path` and resets its DACL to the inherited
-/// one (an empty, unprotected DACL: explicit ACEs go, the parent's inheritable ACEs apply). The
-/// file itself (never a link's target) is opened without delete sharing and changed through that
-/// handle; a link, reparse point or folder is refused. Only read sharing is allowed, so nobody
-/// writes to the file while it changes hands.
-fn take_over_file(path: &Path) -> Result<(), String> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
-    let _privileges = OwnerPrivileges::enable();
-    let file = std::fs::OpenOptions::new()
-        .access_mode(TAKE_OVER_ACCESS)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let md = file.metadata().map_err(|e| format!("read {}: {e}", path.display()))?;
-    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !md.is_file() {
-        return Err(format!("{} is not a plain file", path.display()));
-    }
-    let sd = Sd::from_sddl("O:BA")?;
-    let (owner, _) = sd.parts()?;
-    let mut empty = ACL::default();
-    // SAFETY: `empty` is an ACL header of exactly the size passed; an ACL with no ACEs fits in it.
-    unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
-        .map_err(|e| format!("initialize ACL: {}", e.message()))?;
-    // SAFETY: `file` is open with WRITE_OWNER, WRITE_DAC and READ_CONTROL and lives for the call;
-    // `owner` points into `sd`, alive for the call; `empty` is an initialized ACL.
-    let err = unsafe {
-        SetSecurityInfo(
-            HANDLE(file.as_raw_handle()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            Some(owner),
-            None,
-            Some(&empty),
-            None,
-        )
-    };
-    if err == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(format!("take over {}: {}", path.display(), windows::core::Error::from(err.to_hresult()).message()))
-    }
-}
 
 /// `Err` of [`reinherit`] when `path` cannot be opened or is a link or reparse point.
 pub const REPARSE_OR_OPEN_FAILED: &str = "reparse-or-open-failed";
@@ -581,7 +516,7 @@ mod tests {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply, take_over: &|_| Ok(()) };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(false), apply: &apply, replace: &|_| Ok(()) };
         assert_eq!(secure_dir_with(&dir, false, &ops), Err(REPARSE_AFTER_LOCK.to_string()));
         assert!(dir.join("planted").is_dir(), "nothing renamed");
         assert_eq!(*applied.borrow(), vec![dir.clone()], "no child touched");
@@ -603,7 +538,7 @@ mod tests {
             applied.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply, take_over: &|p| Err(format!("unexpected {}", p.display())) };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply, replace: &|p| Err(format!("unexpected {}", p.display())) };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let mut names: Vec<String> =
@@ -620,14 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn take_over_file_refuses_folders_and_missing_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(take_over_file(tmp.path()).unwrap_err().contains("not a plain file"));
-        assert!(take_over_file(&tmp.path().join("missing.json")).is_err());
-    }
-
-    #[test]
-    fn untrusted_file_is_taken_over() {
+    fn untrusted_file_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("root");
         std::fs::create_dir_all(dir.join("planted")).unwrap();
@@ -637,29 +565,29 @@ mod tests {
         let admin = dir.join("admin.json");
         let important = dir.join("important.json");
         let owned = |p: &Path| Some(p == admin);
-        let taken = std::cell::RefCell::new(Vec::new());
-        let take_over = |p: &Path| {
-            taken.borrow_mut().push(p.file_name().unwrap().to_string_lossy().into_owned());
+        let replaced = std::cell::RefCell::new(Vec::new());
+        let replace = |p: &Path| {
+            replaced.borrow_mut().push(p.file_name().unwrap().to_string_lossy().into_owned());
             if p == important {
                 Err("access denied".to_string())
             } else {
                 Ok(())
             }
         };
-        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &|_| Ok(()), take_over: &take_over };
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &|_| Ok(()), replace: &replace };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
-        let mut taken = taken.into_inner();
-        taken.sort();
-        assert_eq!(taken, vec!["important.json", "settings.json"], "admin-owned files are left alone");
-        assert!(dir.join("settings.json").is_file() && admin.is_file(), "taken over in place");
-        assert!(!important.exists(), "a file that cannot be taken over is moved aside");
+        let mut replaced = replaced.into_inner();
+        replaced.sort();
+        assert_eq!(replaced, vec!["important.json", "settings.json"], "admin-owned files are left alone");
+        assert!(dir.join("settings.json").is_file() && admin.is_file(), "replaced in place");
+        assert!(!important.exists(), "a file that cannot be replaced is moved aside");
         assert!(!dir.join("planted").exists(), "the untrusted folder is moved aside");
-        // settings.json taken over; important.json failed and moved aside; planted moved aside.
+        // settings.json replaced; important.json failed and moved aside; planted moved aside.
         assert_eq!(warnings.len(), 4, "{warnings:?}");
     }
 
     #[test]
-    fn untakeable_settings_file_is_ignored() {
+    fn unreplaceable_settings_file_is_ignored() {
         use std::os::windows::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("root");
@@ -675,15 +603,54 @@ mod tests {
             is_reparse: &|_| false,
             owned_by_admins: &|_| Some(false),
             apply: &|_| Ok(()),
-            take_over: &|_| Err("access denied".to_string()),
+            replace: &|_| Err("access denied".to_string()),
         };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert!(warnings.iter().any(|w| w.contains("settings.json") && w.contains("ignored")), "{warnings:?}");
         assert!(settings.is_file() && keep.is_file(), "still in place");
-        assert!(is_ignored_file(&settings) && is_ignored_file(&keep));
-        assert_eq!(crate::settings::Settings::load_from(&settings), crate::settings::Settings::default());
-        assert_eq!(crate::keep::KeepList::load_from(&keep), crate::keep::KeepList::default());
-        assert!(!is_ignored_file(&dir.join("other.json")));
+        // Every later load judges the owner itself (the same answer the sweep got): defaults.
+        let untrusted = crate::trusted::tests::trust_none;
+        assert_eq!(crate::settings::Settings::load_from_with(&settings, &untrusted), crate::settings::Settings::default());
+        assert_eq!(crate::keep::KeepList::load_from_with(&keep, &untrusted), crate::keep::KeepList::default());
+        assert_eq!(crate::keep::KeepList::load_from_with(&keep, &untrusted), crate::keep::KeepList::default(), "and again");
+    }
+
+    /// The owner part (`O:…`) of `path`'s security descriptor.
+    fn owner_of(path: &Path) -> String {
+        let sddl = sddl_of(path).unwrap();
+        sddl.split(['G', 'D']).next().unwrap().to_string()
+    }
+
+    #[test]
+    fn replaced_file_keeps_its_content_and_cuts_off_old_handles() {
+        use std::io::{Seek, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, br#"{"show_hidden":true}"#).unwrap();
+        // The planter keeps a write handle that shares everything.
+        let mut attacker = std::fs::OpenOptions::new().read(true).write(true).share_mode(0x7).open(&settings).unwrap();
+        let ops = DirOps {
+            is_reparse: &|_| false,
+            owned_by_admins: &|_| Some(false),
+            apply: &|_| Ok(()),
+            replace: &crate::trusted::replace_with_own_copy,
+        };
+        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("replaced")), "{warnings:?}");
+        assert_eq!(std::fs::read(&settings).unwrap(), br#"{"show_hidden":true}"#, "the content is kept");
+        // Writes through the old handle no longer reach the file the name opens.
+        attacker.seek(std::io::SeekFrom::Start(0)).unwrap();
+        attacker.write_all(br#"{"show_hidden":false,"quarantine_days":1}"#).unwrap();
+        attacker.flush().unwrap();
+        let loaded = crate::settings::Settings::load_from_with(&settings, &crate::trusted::tests::trust_all);
+        assert!(loaded.show_hidden && loaded.quarantine_days == 30, "{loaded:?}");
+        // The file is now ours: the owner of anything this process creates there.
+        let fresh = dir.join("fresh.json");
+        std::fs::write(&fresh, b"{}").unwrap();
+        assert_eq!(owner_of(&settings), owner_of(&fresh));
     }
 
     #[test]
@@ -695,7 +662,7 @@ mod tests {
         std::fs::write(dir.join("plain.dll"), b"x").unwrap();
         let link = dir.join("link.dll");
         let is_reparse = |p: &Path| p == link;
-        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()), take_over: &|_| Ok(()) };
+        let ops = DirOps { is_reparse: &is_reparse, owned_by_admins: &|_| Some(true), apply: &|_| Ok(()), replace: &|_| Ok(()) };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(!link.exists(), "the link-looking file is moved aside");
