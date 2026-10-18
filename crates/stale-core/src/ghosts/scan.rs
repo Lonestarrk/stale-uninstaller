@@ -142,9 +142,9 @@ mod tests {
     /// Regression: a running kernel driver's folder (`\??\` ImagePath, `Type` 1) was a ghost.
     #[test]
     fn kernel_driver_folder_is_in_use_like_ldplayer9box() {
-        let fs = base_fs().file(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 144);
+        let fs = base_fs().file(r"C:\Program Files\ldplayer9box\Ld9BoxSup.sys", 144);
         let mut reg = FakeRegistry::new();
-        service(&mut reg, "Ld9BoxSup", r"\??\C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
+        service(&mut reg, "Ld9BoxSup", r"\??\C:\Program Files\ldplayer9box\Ld9BoxSup.sys", 1);
         // A kernel driver whose file is gone is not evidence either.
         service(&mut reg, "GoneDrv", r"\??\C:\Program Files\Gone Driver Co\gone.sys", 1);
         let ghosts = scan_ghosts(&sources(fs, reg));

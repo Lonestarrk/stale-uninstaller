@@ -50,6 +50,39 @@ pub fn first_path_in_command(cmd: &str) -> Option<PathBuf> {
     }
 }
 
+/// The executable of a command line by the CreateProcess rule, for paths that may hold unquoted
+/// spaces (`\??\C:\ProgramData\Vendor\Some Dir\x.sys`): a quoted path is taken as is; otherwise
+/// the longest space-separated prefix that `exists`, else the whole string when it ends in a file
+/// extension, else [`first_path_in_command`]. Environment variables are expanded.
+pub fn resolve_unquoted_path(cmd: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let cmd = expand_env(cmd.trim());
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    if cmd.starts_with('"') {
+        return first_path_in_command(cmd);
+    }
+    let ends = cmd.match_indices(' ').map(|(i, _)| i).chain(std::iter::once(cmd.len())).collect::<Vec<_>>();
+    for &end in ends.iter().rev() {
+        let candidate = cmd[..end].trim_end();
+        if !candidate.is_empty() && exists(Path::new(candidate)) {
+            return Some(PathBuf::from(candidate));
+        }
+    }
+    if has_file_extension(Path::new(cmd)) {
+        return Some(PathBuf::from(cmd));
+    }
+    first_path_in_command(cmd)
+}
+
+/// A 1-4 character alphanumeric extension with a letter (`.exe`, `.sys`); `exe -k run` is none.
+fn has_file_extension(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        (1..=4).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()) && e.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
 /// Uppercase drive letter of a path; `None` for UNC or relative paths.
 pub fn drive_letter(p: &Path) -> Option<char> {
     let s = p.to_str()?;
@@ -241,6 +274,23 @@ mod tests {
         );
         assert_eq!(first_path_in_command("   "), None);
         assert_eq!(first_path_in_command(""), None);
+    }
+
+    #[test]
+    fn resolve_unquoted_path_follows_the_createprocess_rule() {
+        let on_disk = [r"C:\ProgramData\Vendor\Some Dir\x.sys", r"C:\Program Files\Foo\svc.exe"];
+        let exists = |p: &Path| on_disk.iter().any(|d| Path::new(d) == p);
+        let r = |cmd: &str| resolve_unquoted_path(cmd, &exists);
+        // The longest existing prefix wins over the first token.
+        assert_eq!(r(r"C:\ProgramData\Vendor\Some Dir\x.sys"), Some(PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\x.sys")));
+        assert_eq!(r(r"C:\Program Files\Foo\svc.exe -k run"), Some(PathBuf::from(r"C:\Program Files\Foo\svc.exe")));
+        // Missing: the whole string when it ends in an extension, else the first-token rule.
+        assert_eq!(r(r"C:\Gone Vendor\Sub Dir\gone.sys"), Some(PathBuf::from(r"C:\Gone Vendor\Sub Dir\gone.sys")));
+        assert_eq!(r(r"C:\Gone Vendor\gone.exe -k run"), Some(PathBuf::from(r"C:\Gone Vendor\gone.exe")));
+        assert_eq!(r(r"C:\Gone\tool --flag"), Some(PathBuf::from(r"C:\Gone\tool")));
+        // Quoted paths are taken as they are.
+        assert_eq!(r(r#""C:\Gone Vendor\q.exe" /S"#), Some(PathBuf::from(r"C:\Gone Vendor\q.exe")));
+        assert_eq!(r("  "), None);
     }
 
     #[test]

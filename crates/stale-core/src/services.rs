@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::model::Hive;
-use crate::pathutil::{drive_letter, expand_env, first_path_in_command, norm};
+use crate::pathutil::{drive_letter, expand_env, norm, resolve_unquoted_path};
 use crate::registry::{key, RegValue, RegistryReader};
 
 pub const SERVICES_ROOT: &str = r"SYSTEM\CurrentControlSet\Services";
@@ -30,9 +30,15 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.get(..prefix.len()).filter(|head| head.eq_ignore_ascii_case(prefix)).map(|_| &s[prefix.len()..])
 }
 
-/// `ImagePath` -> exe path. Handles `%VAR%`, NT `\??\` paths, `\SystemRoot\…`
-/// and paths relative to the Windows folder (`System32\drivers\x.sys`).
+/// `ImagePath` -> exe path, judged against the real disk ([`normalize_image_path_with`]).
 pub fn normalize_image_path(raw: &str) -> Option<PathBuf> {
+    normalize_image_path_with(raw, &|p: &Path| p.exists())
+}
+
+/// `ImagePath` -> exe path. Handles `%VAR%`, NT `\??\` paths, `\SystemRoot\…`, paths relative
+/// to the Windows folder (`System32\drivers\x.sys`) and unquoted paths with spaces, which are
+/// resolved by the CreateProcess rule against `exists` ([`resolve_unquoted_path`]).
+pub fn normalize_image_path_with(raw: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let expanded = expand_env(raw.trim());
     let mut cmd = expanded.as_str();
@@ -43,12 +49,15 @@ pub fn normalize_image_path(raw: &str) -> Option<PathBuf> {
         Some(rest) => format!(r"{system_root}\{rest}"),
         None => cmd.to_string(),
     };
-    let exe = first_path_in_command(&cmd)?;
-    Some(if drive_letter(&exe).is_none() && !exe.to_string_lossy().starts_with('\\') {
-        Path::new(&system_root).join(exe)
-    } else {
-        exe
-    })
+    let absolute = |p: &Path| {
+        if drive_letter(p).is_none() && !p.to_string_lossy().starts_with('\\') {
+            Path::new(&system_root).join(p)
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let exe = resolve_unquoted_path(&cmd, &|p: &Path| exists(&absolute(p)))?;
+    Some(absolute(&exe))
 }
 
 #[cfg(test)]
@@ -82,6 +91,25 @@ mod tests {
         ]
         .into();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn unquoted_image_path_with_spaces_resolves_to_existing_file() {
+        let exists = |p: &Path| p == Path::new(r"C:\ProgramData\Vendor\Some Dir\x.sys");
+        assert_eq!(
+            normalize_image_path_with(r"\??\C:\ProgramData\Vendor\Some Dir\x.sys", &exists),
+            Some(PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\x.sys"))
+        );
+        // Missing, it is still the whole path (it ends in an extension), never the `Some` prefix.
+        assert_eq!(
+            normalize_image_path_with(r"\??\C:\ProgramData\Vendor\Other Dir\y.sys", &exists),
+            Some(PathBuf::from(r"C:\ProgramData\Vendor\Other Dir\y.sys"))
+        );
+        // Relative paths are checked below the Windows folder.
+        let sr = std::env::var("SystemRoot").unwrap();
+        let rel = PathBuf::from(&sr).join(r"System32\drivers\My Drv\d.sys");
+        let exists_rel = |p: &Path| p == rel.as_path();
+        assert_eq!(normalize_image_path_with(r"System32\drivers\My Drv\d.sys --x", &exists_rel), Some(rel.clone()));
     }
 
     #[test]

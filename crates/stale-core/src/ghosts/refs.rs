@@ -7,9 +7,9 @@ use crate::keep::KeepList;
 use crate::leftovers::other_scan::{task_commands, task_files};
 use crate::leftovers::system_root_norm;
 use crate::model::Hive;
-use crate::pathutil::{drive_letter, first_path_in_command, norm, normed_under};
+use crate::pathutil::{drive_letter, norm, normed_under};
 use crate::registry::{key, RegValue, RegistryReader};
-use crate::services::{normalize_image_path, SERVICES_ROOT};
+use crate::services::{normalize_image_path_with, SERVICES_ROOT};
 use crate::shortcuts::ShortcutTarget;
 use crate::usage::{UsageHit, UsageSource};
 use chrono::{DateTime, Utc};
@@ -96,8 +96,10 @@ pub fn service_collect(
                 _ => {}
             }
         }
-        let image = raw.as_deref().and_then(normalize_image_path);
-        let Some(target) = image.and_then(|image| first_path_in_command(&image.to_string_lossy())) else { continue };
+        // Unquoted paths with spaces are resolved against the disk, never cut at the first space.
+        let Some(target) = raw.as_deref().and_then(|r| normalize_image_path_with(r, &|p: &Path| fs.exists(p))) else {
+            continue;
+        };
         if g.is_live(&target) {
             out.live_targets.push(target);
         } else if service_type & SERVICE_WIN32 != 0 && g.is_dead(&target) {
@@ -273,8 +275,8 @@ mod tests {
         svc_typed(&mut reg, "GoneShared", r"C:\GoneVendor\shared.exe -k x", 32);
         svc_typed(&mut reg, "UserTemplate", r"C:\GoneVendor\user.exe", 0x50);
         // An existing driver payload is a live target, never evidence.
-        svc_typed(&mut reg, "Ld9BoxSup", r"\??\C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
-        let fs = FakeFs::new().file(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys", 1);
+        svc_typed(&mut reg, "Ld9BoxSup", r"\??\C:\Program Files\ldplayer9box\Ld9BoxSup.sys", 1);
+        let fs = FakeFs::new().file(r"C:\Program Files\ldplayer9box\Ld9BoxSup.sys", 1);
         let (i, k) = none();
         let got = service_collect(&reg, &fs, &i, &k, &all);
         let mut evidence = got.evidence.clone();
@@ -286,7 +288,24 @@ mod tests {
                 dang(RefKind::Service, "UserTemplate", r"C:\GoneVendor\user.exe"),
             ]
         );
-        assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\ProgramData\ldplayer9box\Ld9BoxSup.sys")]);
+        assert_eq!(got.live_targets, vec![PathBuf::from(r"C:\Program Files\ldplayer9box\Ld9BoxSup.sys")]);
+    }
+
+    #[test]
+    fn truncated_prefix_is_not_reported_dead() {
+        let mut reg = FakeRegistry::new();
+        svc(&mut reg, "VendorAgent", r"C:\ProgramData\Vendor\Some Dir\agent.bin --run");
+        svc(&mut reg, "VendorNt", r"\??\C:\ProgramData\Vendor\Some Dir\x.sys");
+        let fs = FakeFs::new().file(r"C:\ProgramData\Vendor\Some Dir\agent.bin", 1).file(r"C:\ProgramData\Vendor\Some Dir\x.sys", 1);
+        let (i, k) = none();
+        let got = service_collect(&reg, &fs, &i, &k, &all);
+        assert_eq!(got.evidence, vec![], "C:\\ProgramData\\Vendor\\Some is not the image");
+        let mut live = got.live_targets.clone();
+        live.sort();
+        assert_eq!(
+            live,
+            vec![PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\agent.bin"), PathBuf::from(r"C:\ProgramData\Vendor\Some Dir\x.sys")]
+        );
     }
 
     #[test]
