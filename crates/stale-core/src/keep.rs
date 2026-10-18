@@ -5,7 +5,7 @@ use crate::model::RegKeyPath;
 use crate::pathutil::norm;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -69,7 +69,7 @@ impl KeepList {
         self.keys.iter().any(|kept| {
             kept.hive == k.hive && {
                 let kp = key_str(kept);
-                kp.is_empty() || under(&kp, &p)
+                !kp.is_empty() && under(&kp, &p)
             }
         })
     }
@@ -79,14 +79,18 @@ impl KeepList {
         self.names.iter().any(|k| normalize_name(k) == n)
     }
 
+    /// Adds `p` unless already kept; a drive root or a path without a real component (`C:\`, `C:`,
+    /// empty) is ignored, since it would hide every leftover on the drive.
     pub fn keep_path(&mut self, p: PathBuf) {
-        if !self.paths.iter().any(|k| norm(k) == norm(&p)) {
+        let has_component = p.components().any(|c| matches!(c, Component::Normal(_)));
+        if has_component && !self.paths.iter().any(|k| norm(k) == norm(&p)) {
             self.paths.push(p);
         }
     }
 
+    /// Adds `k` unless already kept; an empty key path (the whole hive) is ignored.
     pub fn keep_key(&mut self, k: RegKeyPath) {
-        if !self.keys.iter().any(|x| same_key(x, &k)) {
+        if !key_str(&k).is_empty() && !self.keys.iter().any(|x| same_key(x, &k)) {
             self.keys.push(k);
         }
     }
@@ -189,6 +193,29 @@ mod tests {
         let items = drop.into_iter().chain(stay.clone()).map(item).collect();
         let out = filter_kept(LeftoverReport { items }, &k);
         assert_eq!(out.items.into_iter().map(|l| l.kind).collect::<Vec<_>>(), stay);
+    }
+
+    #[test]
+    fn keep_path_rejects_drive_root() {
+        let mut k = KeepList::default();
+        for p in [r"C:\", "C:", "", r"\", "c:/"] {
+            k.keep_path(PathBuf::from(p));
+        }
+        assert!(k.paths.is_empty(), "{:?}", k.paths);
+        assert!(!k.is_path_kept(Path::new(r"C:\Apps\Foo")));
+        k.keep_path(PathBuf::from(r"C:\Apps"));
+        assert_eq!(k.paths.len(), 1);
+    }
+
+    #[test]
+    fn keep_key_rejects_empty_path() {
+        let mut k = KeepList::default();
+        k.keep_key(key(Hive::CurrentUser, ""));
+        k.keep_key(key(Hive::CurrentUser, r"\"));
+        assert!(k.keys.is_empty(), "{:?}", k.keys);
+        // A hand-edited empty entry no longer keeps the whole hive.
+        k.keys.push(key(Hive::CurrentUser, ""));
+        assert!(!k.is_key_kept(&key(Hive::CurrentUser, r"Software\Foo")));
     }
 
     #[test]
