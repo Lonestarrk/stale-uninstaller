@@ -49,6 +49,9 @@ pub enum RefKind { Run, AppPaths, ClassesServer, ShellCommand, Service, Schedule
 /// Vendor containers such as `Google` are in [`CONTAINER_FOLDERS`] instead: their children are
 /// examined.
 pub const SKIP_FOLDERS: &[&str] = &[
+    // Microsoft products are out of scope; false negatives on them are accepted.
+    "Microsoft*",
+    // Covered by `Microsoft*`; listed so the brief's names stay searchable.
     "Microsoft",
     "Microsoft Shared",
     "Microsoft OneDrive",
@@ -87,7 +90,12 @@ pub const SKIP_FOLDERS: &[&str] = &[
     "ConnectedDevicesPlatform",
     "Comms",
     "Publishers",
+    "Squirrel*",
+    // Covered by `Squirrel*`.
     "SquirrelTemp",
+    "SquirrelMachineInstalls",
+    "chocolatey",
+    "USOShared",
     "Programs",
     "CEF",
     "pip",
@@ -282,10 +290,10 @@ mod tests {
 
     #[test]
     fn skip_and_container_names() {
-        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad", "updater", "Mozilla Maintenance Service"] {
+        for n in ["microsoft", "Windows Kits", "WINDOWSAPPS", ".config", "NuGet", "Crashpad", "updater", "Mozilla Maintenance Service", "Microsoft SDKs", "Microsoft VS Code", "SquirrelMachineInstalls", "Chocolatey", "usoshared"] {
             assert!(is_skipped_folder(n), "{n}");
         }
-        for n in ["Google", "Old Tool", "Microsoftish"] {
+        for n in ["Google", "Old Tool", "Macrosoft"] {
             assert!(!is_skipped_folder(n), "{n}");
         }
         assert!(is_container_folder("epic games") && !is_container_folder("Epic"));

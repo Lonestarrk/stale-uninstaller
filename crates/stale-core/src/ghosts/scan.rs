@@ -8,7 +8,7 @@ use crate::leftovers::LeftoverSources;
 use crate::model::Program;
 use crate::shortcuts::ShortcutTarget;
 use crate::usage::UsageHit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Everything the ghost collectors read from, so tests can substitute fakes.
 pub struct GhostSources {
@@ -53,7 +53,8 @@ pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
         .chain(usage_evidence(fs, &src.unmatched_hits, &installed, keep, drive_present))
         .collect();
     let roots = NameRoots::new(&l.fs_roots, &fs.profile_dirs(), &src.programs);
-    group(evidence, &installed, keep, &roots)
+    let current_profile = fs.env("USERPROFILE").map(PathBuf::from);
+    group(evidence, &installed, keep, &roots, current_profile.as_deref())
 }
 
 #[cfg(test)]
@@ -78,6 +79,7 @@ mod tests {
         let fs = FakeFs::new()
             .env("ProgramFiles", r"C:\Program Files")
             .env("ProgramData", r"C:\ProgramData")
+            .env("USERPROFILE", r"C:\Users\A")
             .file(r"C:\Program Files\Old Tool\data.bin", 30)
             .profile(r"C:\Users\A");
         let mut reg = FakeRegistry::new();

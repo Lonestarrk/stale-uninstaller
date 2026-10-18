@@ -33,7 +33,27 @@ pub struct Ghost {
     pub total_size: u64,
     /// Newest execution trace.
     pub last_used: Option<DateTime<Utc>>,
+    /// Why the ghost is [`Assessment::Uncertain`]: [`REASON_FIRST_WORD`], [`REASON_WORD_OF_NAME`],
+    /// [`REASON_SIBLING_OWNED`], [`REASON_OTHER_PROFILE`] or [`REASON_APPDATA_ONLY`]; empty otherwise.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Language-free key such as [`NOTE_OTHER_PROFILE`]; the GUI maps it to text.
+    #[serde(default)]
+    pub note: Option<String>,
 }
+
+/// The name is only the first word of an installed name (`Google` for `Google Chrome`).
+pub const REASON_FIRST_WORD: &str = "first-word-match";
+/// The name is a run of whole words of an installed name (`Code` in `Microsoft Visual Studio Code`).
+pub const REASON_WORD_OF_NAME: &str = "word-of-installed-name";
+/// A folder sits in a publisher folder that also holds an installed program.
+pub const REASON_SIBLING_OWNED: &str = "sibling-owned";
+/// A folder lies in another user's profile, whose per-user installs are invisible to us.
+pub const REASON_OTHER_PROFILE: &str = "other-profile";
+/// The only evidence is AppData folders.
+pub const REASON_APPDATA_ONLY: &str = "appdata-only";
+/// `Ghost::note` of a ghost with a folder in another user's profile.
+pub const NOTE_OTHER_PROFILE: &str = "other-profile";
 
 /// The program roots names are taken below, and the installed publishers whose folders hold one
 /// folder per product.
@@ -89,6 +109,34 @@ fn file_name(p: &Path) -> Option<String> {
     p.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
+/// A GUID-like `{…-…-…}` group, or a run of 8+ hex digits with at least one decimal digit
+/// (`1de4eec8`): an install id, not a program name.
+fn has_id_token(name: &str) -> bool {
+    let guid = name.find('{').is_some_and(|open| {
+        name[open..].find('}').is_some_and(|close| name[open..open + close].matches('-').count() >= 2)
+    });
+    let mut run = 0;
+    let mut digit = false;
+    for c in name.chars() {
+        if c.is_ascii_hexdigit() {
+            run += 1;
+            digit |= c.is_ascii_digit();
+            if run >= 8 && digit {
+                return true;
+            }
+        } else {
+            run = 0;
+            digit = false;
+        }
+    }
+    guid
+}
+
+/// A name that can name a ghost: [`is_matchable`] and free of install ids.
+fn usable(name: &str) -> bool {
+    is_matchable(name) && !has_id_token(name)
+}
+
 /// The program folder of `file`: the first folder below a known root, or the second when the
 /// first is a publisher folder. `None` when that folder is skipped or not matchable.
 fn name_below_root(file: &Path, roots: &NameRoots) -> Option<String> {
@@ -108,21 +156,21 @@ fn name_below_root(file: &Path, roots: &NameRoots) -> Option<String> {
         return None;
     }
     let name = if roots.is_publisher_folder(first) { below.get(1)? } else { first };
-    (is_matchable(name) && !is_skipped_folder(name)).then(|| name.clone())
+    (usable(name) && !is_skipped_folder(name)).then(|| name.clone())
 }
 
 /// The key leaf, or its parent's when the leaf is a version or a generic name.
 fn key_name(k: &RegKeyPath) -> Option<String> {
     let mut parts = k.path.rsplit('\\').filter(|c| !c.is_empty());
     let leaf = parts.next()?;
-    let name = if is_matchable(leaf) { leaf } else { parts.next().filter(|p| is_matchable(p))? };
+    let name = if usable(leaf) { leaf } else { parts.next().filter(|p| usable(p))? };
     Some(name.to_string())
 }
 
 /// The program name a piece of evidence points at; `None` when nothing matchable names it.
 pub fn ghost_name_of(e: &Evidence, roots: &NameRoots) -> Option<String> {
     match e {
-        Evidence::Folder { path, .. } => file_name(path).filter(|n| is_matchable(n)),
+        Evidence::Folder { path, .. } => file_name(path).filter(|n| usable(n)),
         Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => key_name(key),
         Evidence::DanglingRef { target, .. } => name_below_root(target, roots),
         Evidence::UsageTrace { exe, .. } => name_below_root(exe, roots),
@@ -135,23 +183,52 @@ fn container_of(e: &Evidence, roots: &NameRoots) -> Option<PathBuf> {
     path.parent().filter(|p| !roots.is_root(&norm(p))).map(Path::to_path_buf)
 }
 
-fn assess(name: &str, evidence: &[Evidence], installed: &InstalledIndex, roots: &NameRoots) -> Assessment {
-    let shares_name = installed.matches_first_word(name) || installed.is_word_of_name(name);
-    let shares_container =
-        evidence.iter().filter_map(|e| container_of(e, roots)).any(|c| installed.owns_sibling_in(&c));
+/// True for a per-profile folder (AppData, `AppData\Local\Programs`) outside `current_profile`.
+fn in_other_profile(e: &Evidence, current_profile: Option<&Path>) -> bool {
+    let (Evidence::Folder { path, root_kind: RootKind::AppData | RootKind::LocalPrograms, .. }, Some(current)) =
+        (e, current_profile)
+    else {
+        return false;
+    };
+    !normed_under(&norm(path), &norm(current))
+}
+
+/// The assessment and, for [`Assessment::Uncertain`], the reasons. The name and folder reasons
+/// override strong evidence; [`REASON_APPDATA_ONLY`] can only hold without it.
+fn assess(
+    name: &str,
+    evidence: &[Evidence],
+    installed: &InstalledIndex,
+    roots: &NameRoots,
+    current_profile: Option<&Path>,
+) -> (Assessment, Vec<String>) {
+    let mut reasons: Vec<&str> = Vec::new();
+    if installed.matches_first_word(name) {
+        reasons.push(REASON_FIRST_WORD);
+    } else if installed.is_word_of_name(name) {
+        reasons.push(REASON_WORD_OF_NAME);
+    }
+    if evidence.iter().filter_map(|e| container_of(e, roots)).any(|c| installed.owns_sibling_in(&c)) {
+        reasons.push(REASON_SIBLING_OWNED);
+    }
+    if evidence.iter().any(|e| in_other_profile(e, current_profile)) {
+        reasons.push(REASON_OTHER_PROFILE);
+    }
     let strong = evidence.iter().any(|e| {
         matches!(e, Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } | Evidence::RegKeyMissingPath { .. })
     });
     let appdata_only = evidence.iter().all(|e| matches!(e, Evidence::Folder { root_kind: RootKind::AppData, .. }));
-    if shares_name || shares_container {
+    if appdata_only {
+        reasons.push(REASON_APPDATA_ONLY);
+    }
+    let assessment = if !reasons.is_empty() {
         Assessment::Uncertain
     } else if strong {
         Assessment::ProbablyUninstalled
-    } else if appdata_only {
-        Assessment::Uncertain
     } else {
         Assessment::LeftoversOnly
-    }
+    };
+    (assessment, reasons.into_iter().map(str::to_string).collect())
 }
 
 fn assessment_rank(a: Assessment) -> u8 {
@@ -166,7 +243,15 @@ fn assessment_rank(a: Assessment) -> u8 {
 /// `OldTool` joins `Old Tool`); evidence without a name is dropped. Groups whose name is kept, or
 /// is exactly an installed program's name, are dropped. Sorted by assessment
 /// (ProbablyUninstalled, LeftoversOnly, Uncertain), then by size, largest first.
-pub fn group(evidence: Vec<Evidence>, installed: &InstalledIndex, keep: &KeepList, roots: &NameRoots) -> Vec<Ghost> {
+/// `current_profile` is the running user's profile folder; per-profile folders outside it make a
+/// ghost Uncertain with [`NOTE_OTHER_PROFILE`].
+pub fn group(
+    evidence: Vec<Evidence>,
+    installed: &InstalledIndex,
+    keep: &KeepList,
+    roots: &NameRoots,
+    current_profile: Option<&Path>,
+) -> Vec<Ghost> {
     let mut groups: BTreeMap<String, (Vec<String>, Vec<Evidence>)> = BTreeMap::new();
     for e in evidence {
         let Some(name) = ghost_name_of(&e, roots) else { continue };
@@ -196,14 +281,18 @@ pub fn group(evidence: Vec<Evidence>, installed: &InstalledIndex, keep: &KeepLis
                     _ => None,
                 })
                 .max();
+            let (assessment, reasons) = assess(&name, &evidence, installed, roots, current_profile);
+            let note = reasons.iter().any(|r| r == REASON_OTHER_PROFILE).then(|| NOTE_OTHER_PROFILE.to_string());
             Some(Ghost {
                 key: normalize_name(&name),
-                assessment: assess(&name, &evidence, installed, roots),
+                assessment,
                 name,
                 publisher,
                 evidence,
                 total_size,
                 last_used,
+                reasons,
+                note,
             })
         })
         .collect();
@@ -349,6 +438,10 @@ mod tests {
         InstalledIndex::from_programs(programs)
     }
 
+    fn reasons(g: &Ghost) -> Vec<&str> {
+        g.reasons.iter().map(String::as_str).collect()
+    }
+
     /// `(name, assessment)` per ghost, in order.
     fn summary(ghosts: &[Ghost]) -> Vec<(String, Assessment)> {
         ghosts.iter().map(|g| (g.name.clone(), g.assessment)).collect()
@@ -377,6 +470,15 @@ mod tests {
         assert_eq!(name(orphan_key(r"SOFTWARE\Vendorly\Product\2.1")).as_deref(), Some("Product"));
         assert_eq!(name(orphan_key(r"SOFTWARE\Gadgetry\Tools")).as_deref(), Some("Gadgetry"));
         assert_eq!(name(orphan_key(r"SOFTWARE\Tools")), None);
+        // Install ids name nothing; a GUID key leaf falls back to its parent.
+        assert_eq!(name(folder(r"C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38", 1, RootKind::ProgramData)), None);
+        assert_eq!(name(folder(r"C:\ProgramData\Cache 0123abcd99", 1, RootKind::ProgramData)), None);
+        assert_eq!(name(trace(r"C:\Program Files\{ab-cd-ef} Tool\t.exe", 1)), None);
+        assert_eq!(
+            name(orphan_key(r"SOFTWARE\Vendorly\{0F1E2D3C-1111-2222-3333-444455556666}")).as_deref(),
+            Some("Vendorly")
+        );
+        assert_eq!(name(pf(r"C:\Program Files\Deadbeef Facade", 1)).as_deref(), Some("Deadbeef Facade"));
     }
 
     #[test]
@@ -389,7 +491,7 @@ mod tests {
             pf(r"C:\Program Files\Other Thing", 5),
             trace(r"C:\Program Files\Unnamed.exe", 1),
         ];
-        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r, None);
         assert_eq!(ghosts.len(), 2, "{ghosts:?}");
         let old = ghosts.iter().find(|g| g.key == "old tool").expect("old tool");
         assert_eq!(old.name, "Old Tool");
@@ -411,7 +513,7 @@ mod tests {
             trace(r"C:\Program Files\Was Used\bin\w2.exe", 7),
             missing_path(r"SOFTWARE\Key Gone"),
         ];
-        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r, None);
         assert_eq!(
             summary(&ghosts),
             vec![
@@ -437,7 +539,7 @@ mod tests {
             folder(r"C:\Users\A\AppData\Local\Both Places", 5, RootKind::AppData),
             pf(r"C:\Program Files\Both Places", 1),
         ];
-        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, None);
         assert_eq!(
             summary(&ghosts),
             vec![
@@ -446,6 +548,9 @@ mod tests {
                 ("Settings Only".to_string(), Assessment::Uncertain),
             ]
         );
+        assert_eq!(reasons(&ghosts[1]), vec![REASON_FIRST_WORD]);
+        assert_eq!(reasons(&ghosts[2]), vec![REASON_APPDATA_ONLY]);
+        assert!(ghosts[0].reasons.is_empty() && ghosts.iter().all(|g| g.note.is_none()));
     }
 
     #[test]
@@ -453,8 +558,9 @@ mod tests {
         let programs = [program("Microsoft Visual Studio Code", None, None)];
         let r = roots(&programs);
         let ev = vec![pf(r"C:\Program Files\Code", 10), trace(r"C:\Program Files\Code\code.exe", 1)];
-        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, None);
         assert_eq!(summary(&ghosts), vec![("Code".to_string(), Assessment::Uncertain)]);
+        assert_eq!(reasons(&ghosts[0]), vec![REASON_WORD_OF_NAME]);
     }
 
     #[test]
@@ -467,7 +573,7 @@ mod tests {
             pf(r"C:\Program Files\Lonely Corp\Old Gizmo", 10),
             run(r"C:\Program Files\Old Gizmo\g.exe", "Gizmo"),
         ];
-        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, None);
         assert_eq!(
             summary(&ghosts),
             vec![
@@ -477,6 +583,25 @@ mod tests {
         );
         assert_eq!(ghosts[0].publisher.as_deref(), Some("Lonely Corp"));
         assert_eq!(ghosts[1].publisher.as_deref(), Some("Vendorz"));
+        assert_eq!(reasons(&ghosts[1]), vec![REASON_SIBLING_OWNED]);
+    }
+
+    #[test]
+    fn folder_in_other_profile_is_uncertain_with_note() {
+        let r = roots(&[]);
+        let ev = vec![
+            folder(r"C:\Users\B\AppData\Local\Programs\Their App", 50, RootKind::LocalPrograms),
+            trace(r"C:\Program Files\Their App\t.exe", 1),
+            folder(r"C:\Users\A\AppData\Local\Programs\My App", 10, RootKind::LocalPrograms),
+        ];
+        let ghosts = group(ev, &installed(&[]), &KeepList::default(), &r, Some(Path::new(r"C:\Users\A")));
+        assert_eq!(
+            summary(&ghosts),
+            vec![("My App".to_string(), Assessment::LeftoversOnly), ("Their App".to_string(), Assessment::Uncertain)]
+        );
+        assert_eq!(reasons(&ghosts[1]), vec![REASON_OTHER_PROFILE]);
+        assert_eq!(ghosts[1].note.as_deref(), Some(NOTE_OTHER_PROFILE));
+        assert_eq!(ghosts[0].note, None);
     }
 
     #[test]
@@ -484,7 +609,7 @@ mod tests {
         let programs = [program("Old Tool", None, None)];
         let r = roots(&programs);
         let ev = vec![pf(r"C:\Program Files\OldTool", 1), orphan_key(r"SOFTWARE\Old Tool"), pf(r"C:\Program Files\Other Thing", 1)];
-        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r);
+        let ghosts = group(ev, &installed(&programs), &KeepList::default(), &r, None);
         assert_eq!(summary(&ghosts), vec![("Other Thing".to_string(), Assessment::LeftoversOnly)]);
     }
 
@@ -493,7 +618,7 @@ mod tests {
         let r = roots(&[]);
         let keep = KeepList { names: vec!["old tool".into()], ..KeepList::default() };
         let ev = vec![pf(r"C:\Program Files\Old Tool", 1), trace(r"C:\Program Files\Old Tool\o.exe", 1), pf(r"C:\Program Files\Other Thing", 1)];
-        let ghosts = group(ev, &installed(&[]), &keep, &r);
+        let ghosts = group(ev, &installed(&[]), &keep, &r, None);
         assert_eq!(summary(&ghosts), vec![("Other Thing".to_string(), Assessment::LeftoversOnly)]);
     }
 
@@ -526,6 +651,8 @@ mod tests {
             assessment: Assessment::ProbablyUninstalled,
             total_size: 7,
             last_used: None,
+            reasons: Vec::new(),
+            note: None,
         };
         let items: Vec<(LeftoverKind, Confidence, Option<String>)> =
             to_leftovers(&g, tasks).items.into_iter().map(|l| (l.kind, l.confidence, l.note)).collect();

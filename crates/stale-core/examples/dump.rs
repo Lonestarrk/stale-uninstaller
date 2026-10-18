@@ -67,7 +67,8 @@ fn dump_ghosts() {
     for g in &ghosts {
         let last = g.last_used.map_or("never".to_string(), |w| w.format("%Y-%m-%d").to_string());
         let publisher = g.publisher.as_deref().map_or(String::new(), |p| format!(" [{p}]"));
-        println!("{}{publisher} | {:?} | {} | {last}", g.name, g.assessment, mb(g.total_size));
+        let reasons = if g.reasons.is_empty() { String::new() } else { format!(" ({})", g.reasons.join(", ")) };
+        println!("{}{publisher} | {:?}{reasons} | {} | {last}", g.name, g.assessment, mb(g.total_size));
         for e in &g.evidence {
             let line = match e {
                 Evidence::Folder { path, size, root_kind, .. } => {
