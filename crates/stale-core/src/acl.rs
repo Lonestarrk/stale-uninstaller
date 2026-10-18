@@ -346,6 +346,25 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
 /// FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC.
 const REINHERIT_ACCESS: u32 = 0x80 | 0x2_0000 | 0x4_0000;
 
+/// Makes BUILTIN\Administrators the owner of the open `file` (which needs WRITE_OWNER), through
+/// that handle. Works elevated; unelevated the owner change is refused.
+pub(crate) fn set_owner_admins(file: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    let _privileges = OwnerPrivileges::enable();
+    let sd = Sd::from_sddl("O:BA")?;
+    let (owner, _) = sd.parts()?;
+    // SAFETY: `file` is open with WRITE_OWNER and lives for the call; `owner` points into `sd`,
+    // alive for the call.
+    let err = unsafe {
+        SetSecurityInfo(HANDLE(file.as_raw_handle()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, Some(owner), None, None, None)
+    };
+    if err == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from(err.to_hresult()).message())
+    }
+}
+
 /// `Err` of [`reinherit`] when `path` cannot be opened or is a link or reparse point.
 pub const REPARSE_OR_OPEN_FAILED: &str = "reparse-or-open-failed";
 

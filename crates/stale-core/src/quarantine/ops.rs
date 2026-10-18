@@ -165,7 +165,7 @@ pub const E2E_TRUST_ALL_ENV: &str = "STALE_E2E_TRUST_ALL";
 
 /// Whether the [`E2E_TRUST_ALL_ENV`] value asks for trust-all: exactly `"1"`.
 #[cfg(feature = "e2e-overrides")]
-fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
+pub(crate) fn trust_all_requested(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
@@ -1140,6 +1140,7 @@ mod tests {
     #[cfg(not(feature = "e2e-overrides"))]
     #[test]
     fn trust_all_env_is_ignored_without_the_feature() {
+        let _env = crate::env_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("STALE_E2E_TRUST_ALL", "1");
         let (_, trusted) = live_mover_and_trust();

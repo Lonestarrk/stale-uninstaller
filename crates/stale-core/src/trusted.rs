@@ -80,6 +80,17 @@ pub fn owner_is_admin(file: &File) -> Option<bool> {
     }
 }
 
+/// The owner check loads use: [`owner_is_admin`]. Only in a debug build with the test-only
+/// `e2e-overrides` feature, `STALE_E2E_TRUST_ALL=1` accepts any owner (the unelevated e2e run
+/// cannot make Administrators the owner of what it writes).
+pub fn live_owner_trusted(file: &File) -> Option<bool> {
+    #[cfg(feature = "e2e-overrides")]
+    if crate::quarantine::ops::trust_all_requested(std::env::var_os(crate::quarantine::ops::E2E_TRUST_ALL_ENV)) {
+        return Some(true);
+    }
+    owner_is_admin(file)
+}
+
 /// What [`read_trusted`] found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrustedRead {
@@ -132,10 +143,22 @@ fn temp_beside(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Writes `bytes` to a new file beside `path` (flushed to disk) and renames it over `path`, so
-/// the name ends up on a file this process created. Refuses when `path` is a link or reparse
-/// point (nothing is written through it); parent folders are created.
+/// FILE_GENERIC_WRITE | WRITE_OWNER: write the new file and set its owner on the same handle.
+const WRITE_WITH_OWNER: u32 = 0x12_0116 | 0x8_0000;
+
+/// Writes `bytes` to a new file beside `path` (flushed to disk), makes BUILTIN\Administrators
+/// its owner ([`crate::acl::set_owner_admins`], whatever the "default owner" policy says) and
+/// renames it over `path`, so the name ends up on a file this process created and the load-time
+/// owner check trusts. Unelevated the owner cannot be set: that is logged and the file is still
+/// written (development and e2e runs only). Refuses when `path` is a link or reparse point
+/// (nothing is written through it); parent folders are created.
 pub fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_replacing_with(path, bytes, &crate::acl::set_owner_admins)
+}
+
+/// [`write_replacing`] with the owner step `set_owner`, called on the open temporary file.
+pub(crate) fn write_replacing_with(path: &Path, bytes: &[u8], set_owner: &dyn Fn(&File) -> Result<(), String>) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
     if crate::quarantine::fsmove::is_reparse_point(path) {
         return Err(std::io::Error::other(format!("{} is a link or reparse point", path.display())));
     }
@@ -144,9 +167,12 @@ pub fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let tmp = temp_beside(path);
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).access_mode(WRITE_WITH_OWNER).open(&tmp)?;
         std::io::Write::write_all(&mut f, bytes)?;
         f.sync_all()?;
+        if let Err(e) = set_owner(&f) {
+            log::warn!("{}: owner Administrators could not be set ({e}); the file will not be trusted on load", path.display());
+        }
         drop(f);
         std::fs::rename(&tmp, path)
     })();
@@ -212,6 +238,63 @@ pub(crate) mod tests {
         assert!(write_replacing(&link, b"{}").is_err());
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0, "nothing written into the target");
         std::fs::remove_dir(&link).unwrap();
+    }
+
+    /// `STALE_E2E_TRUST_ALL=1` makes loads accept any owner only with the `e2e-overrides` feature.
+    #[test]
+    fn e2e_trust_all_only_with_the_feature() {
+        let _env = crate::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let file = open_no_follow(&path, false).unwrap();
+        std::env::set_var("STALE_E2E_TRUST_ALL", "1");
+        let with_env = live_owner_trusted(&file);
+        std::env::remove_var("STALE_E2E_TRUST_ALL");
+        let without_env = live_owner_trusted(&file);
+        assert_eq!(without_env, owner_is_admin(&file));
+        if cfg!(feature = "e2e-overrides") {
+            assert_eq!(with_env, Some(true));
+        } else {
+            assert_eq!(with_env, owner_is_admin(&file), "the variable is never read without the feature");
+        }
+    }
+
+    #[test]
+    fn saved_file_owner_is_administrators() {
+        // The owner is set on the temporary file, before it takes the name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let calls = std::cell::RefCell::new(Vec::new());
+        let set_owner = |f: &File| {
+            calls.borrow_mut().push(f.metadata().unwrap().len());
+            Ok(())
+        };
+        write_replacing_with(&path, b"abc", &set_owner).unwrap();
+        assert_eq!(*calls.borrow(), vec![3], "called once, on the written temporary file");
+        // A failure is logged, and the file is still written.
+        write_replacing_with(&path, b"de", &|_| Err("not elevated".into())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"de");
+    }
+
+    /// Needs elevation: `cargo test -p stale-core -- --ignored saved_file_owner_is_administrators_live`.
+    #[test]
+    #[ignore]
+    fn saved_file_owner_is_administrators_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        crate::settings::Settings::default().save_to(&path).unwrap();
+        let file = open_no_follow(&path, false).unwrap();
+        assert_eq!(owner_is_admin(&file), Some(true));
+        drop(file);
+        let keep = dir.path().join("important.json");
+        crate::keep::KeepList::default().save_to(&keep).unwrap();
+        assert_eq!(owner_is_admin(&open_no_follow(&keep, false).unwrap()), Some(true));
+        // The sweep's replacement too.
+        let planted = dir.path().join("planted.json");
+        std::fs::write(&planted, b"{}").unwrap();
+        replace_with_own_copy(&planted).unwrap();
+        assert_eq!(owner_is_admin(&open_no_follow(&planted, false).unwrap()), Some(true));
     }
 
     #[test]

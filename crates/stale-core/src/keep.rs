@@ -35,7 +35,7 @@ impl KeepList {
     /// owned by Administrators or SYSTEM (judged on the handle it is read from, see
     /// [`crate::trusted::read_trusted`]).
     pub fn load_from(path: &Path) -> KeepList {
-        Self::load_from_with(path, &crate::trusted::owner_is_admin)
+        Self::load_from_with(path, &crate::trusted::live_owner_trusted)
     }
 
     /// [`Self::load_from`] with the owner check `owner_trusted`.
