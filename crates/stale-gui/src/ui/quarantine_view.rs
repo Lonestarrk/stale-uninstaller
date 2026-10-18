@@ -18,6 +18,8 @@ enum Action {
     CancelPurgeAll,
     PurgeAll,
     Restore(QuarantineId),
+    AskPurge(QuarantineId),
+    CancelPurge,
     Purge(QuarantineId),
 }
 
@@ -41,6 +43,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     if app.confirm_purge_all {
         confirm_window(ui, &app.quarantine, busy, &mut action);
     }
+    if let Some(m) = app.confirm_purge_one.as_ref().and_then(|id| app.quarantine.iter().find(|m| &m.id == id)) {
+        confirm_one_window(ui, m, busy, &mut action);
+    }
     if app.quarantine.is_empty() {
         if !busy {
             ui.label(strings::QUARANTINE_EMPTY);
@@ -59,6 +64,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     match action {
         Some(Action::Back) => {
             app.confirm_purge_all = false;
+            app.confirm_purge_one = None;
             app.view = View::Programs;
         }
         Some(Action::AskPurgeAll) => app.confirm_purge_all = true,
@@ -69,7 +75,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             app.purge_quarantine(ids);
         }
         Some(Action::Restore(id)) => app.restore_quarantine(id),
-        Some(Action::Purge(id)) => app.purge_quarantine(vec![id]),
+        Some(Action::AskPurge(id)) => app.confirm_purge_one = Some(id),
+        Some(Action::CancelPurge) => app.confirm_purge_one = None,
+        Some(Action::Purge(id)) => {
+            app.confirm_purge_one = None;
+            app.purge_quarantine(vec![id]);
+        }
         None => {}
     }
 }
@@ -113,7 +124,7 @@ fn table(ui: &mut egui::Ui, rows: &[QuarantineManifest], busy: bool, action: &mu
                         *action = Some(Action::Restore(m.id.clone()));
                     }
                     if ui.add_enabled(!busy, egui::Button::new(strings::PURGE_ONE)).clicked() {
-                        *action = Some(Action::Purge(m.id.clone()));
+                        *action = Some(Action::AskPurge(m.id.clone()));
                     }
                 });
             });
@@ -148,6 +159,27 @@ fn restore_failures(ui: &mut egui::Ui, failures: &[Failure]) {
             ui.colored_label(STALE_COLOR, failure_text(f));
         }
     });
+}
+
+/// "Detta tar bort {name} permanent ({size}) och kan inte ångras." with Avbryt / Ta bort.
+fn confirm_one_window(ui: &egui::Ui, m: &QuarantineManifest, busy: bool, action: &mut Option<Action>) {
+    let size = format::human_size(Some(m.total_size()));
+    egui::Window::new(strings::PURGE_ONE)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui.ctx(), |ui| {
+            ui.label(strings::purge_one_confirm(&m.program_name, &size));
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(strings::CANCEL).clicked() {
+                    *action = Some(Action::CancelPurge);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(strings::PURGE_ONE_CONFIRM_BUTTON)).clicked() {
+                    *action = Some(Action::Purge(m.id.clone()));
+                }
+            });
+        });
 }
 
 /// "Detta frigör {size} och kan inte ångras." with Avbryt / Töm.

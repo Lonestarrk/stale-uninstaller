@@ -101,6 +101,8 @@ pub struct StaleApp {
     quarantine_admin_rx: Option<Receiver<QuarantineAdminEvent>>,
     /// The "Töm karantän" confirmation is open.
     pub confirm_purge_all: bool,
+    /// The quarantine whose "Ta bort permanent" waits for confirmation.
+    pub confirm_purge_one: Option<QuarantineId>,
     /// What the last partial restore could not put back, shown under its row.
     pub last_restore_failures: Option<(QuarantineId, Vec<Failure>)>,
     /// Every program from the scan, hidden ones included.
@@ -149,6 +151,7 @@ impl StaleApp {
             quarantine_busy: false,
             quarantine_admin_rx: None,
             confirm_purge_all: false,
+            confirm_purge_one: None,
             last_restore_failures: None,
             programs: Vec::new(),
             usage: HashMap::new(),

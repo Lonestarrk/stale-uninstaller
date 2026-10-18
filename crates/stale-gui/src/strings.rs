@@ -181,6 +181,14 @@ pub const PURGE_FAILED: &str = "Kunde inte ta bort karantänposten permanent";
 pub const QUARANTINE_ADMIN_THREAD_FAILED: &str = "Kunde inte starta karantänåtgärden";
 pub const QUARANTINE_ADMIN_ABORTED: &str = "Karantänåtgärden avbröts oväntat – se loggfilen";
 
+/// The confirmation button of "Ta bort permanent".
+pub const PURGE_ONE_CONFIRM_BUTTON: &str = "Ta bort";
+
+/// The "Ta bort permanent" confirmation.
+pub fn purge_one_confirm(name: &str, size: &str) -> String {
+    format!("Detta tar bort {name} permanent ({size}) och kan inte ångras.")
+}
+
 /// The "Töm karantän" confirmation.
 pub fn purge_all_confirm(size: &str) -> String {
     format!("Detta frigör {size} och kan inte ångras.")
@@ -233,5 +241,10 @@ mod tests {
         assert_eq!(core_error("unknown-content-left"), UNKNOWN_CONTENT_LEFT);
         assert_eq!(core_error("something else"), "something else");
         assert_eq!(incomplete_count(2), "2 ofullständiga");
+    }
+
+    #[test]
+    fn purge_one_confirm_names_program_and_size() {
+        assert_eq!(purge_one_confirm("Foo", "38 MB"), "Detta tar bort Foo permanent (38 MB) och kan inte ångras.");
     }
 }
