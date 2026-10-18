@@ -4,6 +4,7 @@
 use chrono::Utc;
 use eframe::egui;
 use stale_core::quarantine::{auto_purge, QuarantineOps};
+use stale_core::selfclean;
 use stale_core::settings::Settings;
 use stale_gui::app::StaleApp;
 use stale_gui::logging;
@@ -54,6 +55,12 @@ fn main() -> eframe::Result {
         message_box(t().e2e_build_refused, true);
         std::process::exit(1);
     }
+    // Run by Stale's own uninstaller: no window and no single-instance check (the uninstaller
+    // makes sure the program is closed).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--uninstall-cleanup") {
+        std::process::exit(uninstall_cleanup(args.iter().any(|a| a == "--silent")));
+    }
     if !single_instance() {
         message_box(t().already_running, false);
         return Ok(());
@@ -80,6 +87,52 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
+}
+
+/// `--uninstall-cleanup [--silent]`: empties or keeps the quarantine and removes
+/// `%ProgramData%\Stale Uninstaller` ([`selfclean::run`]). Returns the exit code: 0 to go on with
+/// the uninstall, [`selfclean::EXIT_ABORT`] to stop it. With `--silent` (a silent uninstall)
+/// nobody is asked, so a quarantine and the data folder are kept.
+fn uninstall_cleanup(silent: bool) -> i32 {
+    // The folder is locked down first so the settings and manifests below it can be trusted; one
+    // that cannot be (e.g. it is a link) is left alone. Nothing is logged: the log lives in it.
+    if let Err(e) = stale_core::paths::secure_data_dir() {
+        eprintln!("could not lock down the data folder, leaving it: {e}");
+        return 0;
+    }
+    let settings = Settings::load_from(&Settings::path());
+    strings::set_lang(strings::startup_lang(settings.language.as_deref()));
+    let ops = QuarantineOps::live();
+    let data_dir = stale_core::paths::data_dir();
+    let out = selfclean::run(&ops, &data_dir, &selfclean::live_payload_parents(), &mut |total| {
+        if silent { None } else { ask_yes_no_cancel(&strings::uninstall_cleanup_prompt(total)) }
+    });
+    for e in &out.errors {
+        eprintln!("{e}");
+    }
+    if out.purge_failed && !silent {
+        message_box(t().uninstall_cleanup_failed, true);
+    }
+    out.exit_code
+}
+
+/// `text` in a Yes/No/Cancel message box (No is the default button); `None` when it could not be shown.
+fn ask_yes_no_cancel(text: &str) -> Option<selfclean::Choice> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDCANCEL, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNOCANCEL,
+    };
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = t().app_title.encode_utf16().chain(std::iter::once(0)).collect();
+    let style = MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST;
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
+    let answer = unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) };
+    match answer {
+        IDYES => Some(selfclean::Choice::Yes),
+        IDNO => Some(selfclean::Choice::No),
+        IDCANCEL => Some(selfclean::Choice::Cancel),
+        _ => None,
+    }
 }
 
 /// Purges quarantines older than `days` on the "stale-auto-purge" thread, so the window never waits.

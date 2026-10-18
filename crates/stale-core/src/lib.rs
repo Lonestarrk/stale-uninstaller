@@ -19,6 +19,7 @@ pub mod quarantine;
 pub mod registry;
 pub mod regwrite;
 pub mod scan;
+pub mod selfclean;
 pub mod session;
 pub mod services;
 pub mod settings;

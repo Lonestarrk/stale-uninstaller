@@ -2,6 +2,10 @@
 
 A Windows uninstaller that tells you **when you last used each program**, so you can find the ones that just take up space, remove them, and clean up what they leave behind. The user interface is available in English and Swedish.
 
+## Download
+
+Download the latest installer from the [Releases page](https://github.com/Lonestarrk/stale-uninstaller/releases). The installer is not code-signed yet, so Windows SmartScreen may warn on first run.
+
 ## Features
 
 - **Program list with "last used".** Every classic installed program with publisher, version, size, install date and **drive letter**, sorted so the programs you have not touched for the longest come first. The date comes from Windows' own execution traces (Prefetch, BAM, UserAssist). Your own launches of the program count, or of any of its own tools (shown as "via link.exe", and marked "autostart" when the program was started automatically at logon or by a scheduled task); updaters, background services, tray helpers and uninstallers never make a program look "used". Every date shows its source.
@@ -16,10 +20,10 @@ A Windows uninstaller that tells you **when you last used each program**, so you
 - **Standalone leftover search** by name for programs that are no longer in the list.
 - **Safety first.** Runs as administrator and treats everything it touches with suspicion: system tools are loaded only from System32, quarantine folders are locked down to administrators, junctions are refused, and nothing is deleted outright.
 - **English and Swedish.** Follows the Windows display language on first start; switch any time in the settings menu.
+- **Installer that cleans up after itself.** Uninstalling Stale removes its data too; if the quarantine still holds anything, you choose whether to empty it, keep it, or cancel the uninstall.
 
 ## Future features
 
-- Installer and a downloadable release.
 - Junk finder: Windows temp folders, update caches and growing AppData folders, explained in plain language with a safety rating, sharing the keep list.
 - Microsoft Store apps.
 - Elevation on demand instead of at start-up.
@@ -35,6 +39,14 @@ cargo build -p stale-gui --release
 ```
 
 The release binary is a single statically linked exe. `cargo test --workspace` runs the unit tests without touching the registry or disk.
+
+To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run its compiler on the script after the release build:
+
+```powershell
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 installer\stale.iss
+```
+
+The setup is written to `installer\Output\StaleUninstaller-Setup-0.1.0.exe`.
 
 ## License
 

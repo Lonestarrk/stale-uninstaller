@@ -86,6 +86,8 @@ pub struct Strings {
     pub already_running: &'static str,
     /// Shown when the build has the test-only e2e-overrides feature; the program then exits.
     pub e2e_build_refused: &'static str,
+    /// `--uninstall-cleanup`: some quarantines could not be purged, so the data folder is kept.
+    pub uninstall_cleanup_failed: &'static str,
     pub loading: &'static str,
     pub no_programs: &'static str,
     pub warnings: &'static str,
@@ -377,6 +379,7 @@ pub static SV: Strings = Strings {
     app_title: "Stale Uninstaller",
     already_running: "Stale Uninstaller körs redan.",
     e2e_build_refused: "Den här versionen är byggd med testfunktionen e2e-overrides och kan inte köras. Bygg om utan den.",
+    uninstall_cleanup_failed: "Allt i karantänen kunde inte tas bort. Stales data och karantänen behålls.",
     loading: "Läser installerade program…",
     no_programs: "Inga program hittades.",
     warnings: "Varningar",
@@ -630,6 +633,7 @@ pub static EN: Strings = Strings {
     app_title: "Stale Uninstaller",
     already_running: "Stale Uninstaller is already running.",
     e2e_build_refused: "This build was made with the test feature e2e-overrides and cannot run. Rebuild it without the feature.",
+    uninstall_cleanup_failed: "Not everything in the quarantine could be removed. Stale's data and the quarantine are kept.",
     loading: "Reading installed programs…",
     no_programs: "No programs found.",
     warnings: "Warnings",
@@ -1155,6 +1159,24 @@ pub fn purge_all_confirm(size: &str) -> String {
     }
 }
 
+/// The `--uninstall-cleanup` question when the quarantine holds `total_bytes` (Yes/No/Cancel).
+pub fn uninstall_cleanup_prompt(total_bytes: u64) -> String {
+    uninstall_cleanup_prompt_in(lang(), total_bytes)
+}
+
+/// [`uninstall_cleanup_prompt`] in `lang`.
+pub fn uninstall_cleanup_prompt_in(lang: Lang, total_bytes: u64) -> String {
+    let size = crate::format::human_size_in(lang, Some(total_bytes));
+    match lang {
+        Lang::Sv => format!(
+            "Karantänen innehåller {size}. Ja = töm den och ta bort Stales data. Nej = behåll karantänen och datan. Avbryt = avbryt avinstallationen."
+        ),
+        Lang::En => format!(
+            "The quarantine holds {size}. Yes = empty it and remove Stale's data. No = keep the quarantine and the data. Cancel = cancel the uninstall."
+        ),
+    }
+}
+
 /// A quarantine's status column: "2 fel".
 pub fn error_count(n: usize) -> String {
     error_count_in(lang(), n)
@@ -1268,6 +1290,19 @@ mod tests {
 
     // The language is process-wide and tests run in parallel: no test here switches it. The
     // default is Swedish; English is checked through the `_in`/`texts` variants.
+
+    #[test]
+    fn uninstall_cleanup_prompt_names_the_size_in_both_languages() {
+        let gib = 2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+        assert_eq!(
+            uninstall_cleanup_prompt_in(Lang::Sv, gib),
+            "Karantänen innehåller 2,5 GB. Ja = töm den och ta bort Stales data. Nej = behåll karantänen och datan. Avbryt = avbryt avinstallationen."
+        );
+        assert_eq!(
+            uninstall_cleanup_prompt_in(Lang::En, gib),
+            "The quarantine holds 2.5 GB. Yes = empty it and remove Stale's data. No = keep the quarantine and the data. Cancel = cancel the uninstall."
+        );
+    }
 
     #[test]
     fn purge_error_translates_known_codes() {
