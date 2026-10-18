@@ -7,6 +7,18 @@
   #error Pass the version: ISCC /DAppVersion=X.Y.Z stale.iss
 #endif
 
+; The setup must carry the exe it names: /DAppVersion has to equal the first three parts of the
+; built exe's version (a.b.c.0, from the stale-gui crate version).
+#define ExePath AddBackslash(SourcePath) + "..\target\release\StaleUninstaller.exe"
+#if !FileExists(ExePath)
+  #error Build the release exe first: cargo build -p stale-gui --release
+#endif
+#define ExeVersionFull GetVersionNumbersString(ExePath)
+#define ExeVersion Copy(ExeVersionFull, 1, RPos(".", ExeVersionFull) - 1)
+#if ExeVersion != AppVersion
+  #error AppVersion does not match the version of target\release\StaleUninstaller.exe: rebuild it or pass the right version
+#endif
+
 [Setup]
 ; Never change the AppId: Windows recognises upgrades and the uninstall entry by it.
 AppId={{006E9CB5-0F91-495D-A821-CB149DD3217F}

@@ -12,8 +12,10 @@ merged. `X.Y.Z` below is the new version.
 ## 1. Version
 
 - Set `version = "X.Y.Z"` in `crates/stale-core/Cargo.toml` and `crates/stale-gui/Cargo.toml`
-  (the exe's version resource comes from the stale-gui version through `build.rs`).
-- Commit: `chore: version X.Y.Z`.
+  (the exe's version resource comes from the stale-gui version through `build.rs`; the exe
+  manifest carries no version).
+- Update the lockfile to the new versions: `cargo update -w`.
+- Commit both Cargo.toml files and `Cargo.lock` together: `chore: version X.Y.Z`.
 
 ## 2. Test and build
 
@@ -41,6 +43,8 @@ Get-FileHash installer\Output\StaleUninstaller-Setup-X.Y.Z.exe
 ```
 
 The setup lands in `installer\Output\` (gitignored). Note its SHA-256 for the release notes.
+`stale.iss` stops with an error when `/DAppVersion` differs from the first three parts of the
+version of `target\release\StaleUninstaller.exe`, so rebuild the exe after the version bump.
 
 ## 4. Elevated smoke test
 
@@ -52,14 +56,16 @@ run `schtasks /run /tn StaleDevElevated`, wait for a new `=== end` line in
 `%ProgramData%\Stale Uninstaller` on the dev machine is real data. The job must:
 
 1. Count the quarantine manifests (`%ProgramData%\Stale Uninstaller\quarantine\*\manifest.json`).
-   If there are any, skip the uninstall half: the user's quarantine must not be touched.
+   If there are any, skip the launch (step 4) and the uninstall (step 5): the user's quarantine
+   must not be touched, and starting Stale runs the automatic purge of old quarantines.
 2. Back up the data folder: `robocopy <data> .superpowers\elevated\backup-<timestamp> /E /B /COPY:DATSO /DCOPY:DAT /XJ`,
    and save the folder's own SDDL (`(Get-Acl <data>).Sddl`).
 3. Install silently: `StaleUninstaller-Setup-X.Y.Z.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=<file>`;
    check exit code 0, `%ProgramFiles%\Stale Uninstaller\StaleUninstaller.exe`, the uninstall key
    `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{006E9CB5-0F91-495D-A821-CB149DD3217F}_is1`
    and the Start-menu shortcut.
-4. Launch the installed exe, find its window, `Save-Shot`, stop it. Look at the screenshot.
+4. Only when step 1 found no manifests: launch the installed exe, find its window, `Save-Shot`,
+   stop it. Look at the screenshot.
 5. Uninstall (only when step 1 found no manifests):
    `%ProgramFiles%\Stale Uninstaller\unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=<file>`;
    check `%ProgramFiles%\Stale Uninstaller`, the uninstall key, the shortcut and
