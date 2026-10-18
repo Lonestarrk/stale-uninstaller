@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use windows::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+};
 
 use super::fsmove::{stored_path_for, FileMover, MoveError, RealFileMover};
 use super::store::{list_trusted_manifests, new_id, owned_by_admins, save_manifest, valid_id};
@@ -38,6 +44,8 @@ pub const DRIVE_MISSING: &str = "drive-missing";
 pub type NameCommand = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Re-creates a task `name` from an XML file.
 pub type CreateTaskCommand = Box<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
+/// A system operation on a file or folder.
+pub type PathCommand = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 /// Whether a folder is owned by a trusted account; `None` when that cannot be told.
 pub type TrustCheck = Box<dyn Fn(&Path) -> Option<bool> + Send + Sync>;
 
@@ -60,6 +68,47 @@ pub struct QuarantineOps {
     /// Whether a `<manifest dir>\<id>` folder may be acted on: `Some(true)` only when it is owned by
     /// Administrators or SYSTEM (`owned_by_admins`), so a planted manifest is never restored or purged.
     pub trusted_dir: TrustCheck,
+    /// Clears a restored item's explicit ACEs so it inherits its parent's ACL again
+    /// ([`crate::acl::reinherit`]), instead of keeping what it had in quarantine.
+    pub reinherit: PathCommand,
+}
+
+/// A service control manager handle, closed with `CloseServiceHandle` on drop.
+struct ScHandle(SC_HANDLE);
+
+impl Drop for ScHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from OpenSCManagerW/OpenServiceW and is closed only here.
+        let _ = unsafe { CloseServiceHandle(self.0) };
+    }
+}
+
+/// The current state of service `name` (`SERVICE_STOPPED` = 1, `SERVICE_RUNNING` = 4, ...) from
+/// `QueryServiceStatusEx`; `None` when no such service exists.
+pub fn service_state(name: &str) -> Result<Option<u32>, String> {
+    // SAFETY: null machine and database names mean the local, active database; the handle is
+    // closed by `ScHandle`.
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        .map_err(|e| format!("open service manager: {}", e.message()))?;
+    let scm = ScHandle(scm);
+    let wname = HSTRING::from(name);
+    // SAFETY: `scm` is open; `wname` is NUL-terminated and outlives the call; the handle is closed
+    // by `ScHandle`.
+    let svc = match unsafe { OpenServiceW(scm.0, &wname, SERVICE_QUERY_STATUS) } {
+        Ok(h) => ScHandle(h),
+        Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => return Ok(None),
+        Err(e) => return Err(format!("open service {name}: {}", e.message())),
+    };
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0u32;
+    // SAFETY: `status` is a plain C struct; the byte view covers exactly it and lives for the call.
+    let buf = unsafe {
+        std::slice::from_raw_parts_mut((&mut status as *mut SERVICE_STATUS_PROCESS).cast::<u8>(), size_of::<SERVICE_STATUS_PROCESS>())
+    };
+    // SAFETY: `svc` is open with SERVICE_QUERY_STATUS; `buf` is a SERVICE_STATUS_PROCESS-sized buffer.
+    unsafe { QueryServiceStatusEx(svc.0, SC_STATUS_PROCESS_INFO, Some(buf), &mut needed) }
+        .map_err(|e| format!("query service {name}: {}", e.message()))?;
+    Ok(Some(status.dwCurrentState.0))
 }
 
 fn tool(name: &str, args: &[&OsStr]) -> Result<(), String> {
@@ -71,42 +120,23 @@ fn task_path(name: &str) -> String {
     if name.starts_with('\\') { name.to_string() } else { format!(r"\{name}") }
 }
 
-/// The state name on the `STATE` line of `sc query` output (`"STOPPED"`, `"RUNNING"`,
-/// `"STOP_PENDING"`, ...); a line with only the number gives `"STOPPED"` for 1. `None` without
-/// such a line.
-fn parse_sc_state(output: &str) -> Option<String> {
-    let line = output.lines().find(|l| l.trim_start().starts_with("STATE"))?;
-    let (_, rest) = line.split_once(':')?;
-    let mut tokens = rest.split_whitespace();
-    let code = tokens.next()?;
-    match tokens.next() {
-        Some(state) => Some(state.to_string()),
-        None => (code == "1").then(|| "STOPPED".to_string()),
-    }
-}
-
-/// `sc query`'s exit code when the service does not exist.
-const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const SERVICE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const SERVICE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// `sc stop` (a service that is not running, error 1062, is fine), then `sc query` every 500 ms
-/// for up to 30 s until it is STOPPED (or gone), then `sc delete`. A service still running after
-/// that is `Err("service-still-running")` and is not deleted.
+/// `sc stop` (a service that is not running, error 1062, is fine), then [`service_state`] every
+/// 500 ms for up to 30 s until it is stopped (or gone), then `sc delete`. A service still running
+/// after that is `Err("service-still-running")` and is not deleted.
 fn live_stop_service(name: &str) -> Result<(), String> {
     match tool("sc.exe", &["stop".as_ref(), name.as_ref()]) {
         Err(e) if !e.contains("1062") => return Err(e),
         _ => {}
     }
-    let sc = system32_tool("sc.exe");
     let started = std::time::Instant::now();
     loop {
-        let (code, out) = crate::proc::run_hidden_output(&sc, &["query".as_ref(), name.as_ref()])?;
-        if code == ERROR_SERVICE_DOES_NOT_EXIST {
-            return Ok(());
-        }
-        if parse_sc_state(&out).is_some_and(|s| s.contains("STOPPED")) {
-            break;
+        match service_state(name)? {
+            None => return Ok(()),
+            Some(state) if state == SERVICE_STOPPED.0 => break,
+            Some(_) => {}
         }
         if started.elapsed() >= SERVICE_STOP_TIMEOUT {
             return Err("service-still-running".to_string());
@@ -140,6 +170,7 @@ impl QuarantineOps {
             delete_task: Box::new(live_delete_task),
             create_task: Box::new(live_create_task),
             trusted_dir: Box::new(owned_by_admins),
+            reinherit: Box::new(crate::acl::reinherit),
         }
     }
 }
@@ -666,7 +697,9 @@ fn check_backup(ops: &QuarantineOps, id: &QuarantineId, file: &Path, pattern: &s
     Ok(())
 }
 
-/// Moves files back, last moved first; returns the items that stay in quarantine.
+/// Moves files back, last moved first, each then re-inheriting its parent's ACL (`ops.reinherit`;
+/// a failure is an `"acl-not-reinherited: ..."` failure but the item counts as restored); returns
+/// the items that stay in quarantine.
 fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], failures: &mut Vec<Failure>) -> Vec<MovedItem> {
     let mut kept = Vec::new();
     for item in moved.iter().rev() {
@@ -693,13 +726,23 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
             kept.push(item.clone());
             continue;
         }
-        match ops.mover.move_path(&item.stored, &item.original) {
-            Ok(()) => {}
+        let back = match ops.mover.move_path(&item.stored, &item.original) {
+            Ok(()) => true,
             // The original is complete again; the leftover copy goes with the payload folder.
-            Err(MoveError::PartialMove { detail, .. }) => fail(format!("partial move: {detail}")),
+            Err(MoveError::PartialMove { detail, .. }) => {
+                fail(format!("partial move: {detail}"));
+                true
+            }
             Err(e) => {
                 fail(e.to_string());
                 kept.push(item.clone());
+                false
+            }
+        };
+        // Back in place, it should inherit its parent's ACL again; a failure leaves it restored.
+        if back {
+            if let Err(e) = (ops.reinherit)(&item.original) {
+                fail(format!("acl-not-reinherited: {e}"));
             }
         }
     }
@@ -1027,6 +1070,8 @@ mod tests {
         regw: Arc<FakeRegistryWriter>,
         /// stop/delete-task/create-task calls, each with what had happened just before it.
         calls: Arc<Mutex<Vec<String>>>,
+        /// Paths given to `reinherit`.
+        reinherited: Arc<Mutex<Vec<PathBuf>>>,
         dir: tempfile::TempDir,
     }
 
@@ -1074,6 +1119,14 @@ mod tests {
                 Ok(())
             }
         };
+        let reinherited: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let reinherit = {
+            let reinherited = reinherited.clone();
+            move |p: &Path| -> Result<(), String> {
+                reinherited.lock().unwrap().push(p.to_path_buf());
+                Ok(())
+            }
+        };
         let ops = QuarantineOps {
             mover: mover.clone(),
             regw: regw.clone(),
@@ -1086,8 +1139,9 @@ mod tests {
             delete_task: Box::new(delete_task),
             create_task: Box::new(create_task),
             trusted_dir: Box::new(|_| Some(true)),
+            reinherit: Box::new(reinherit),
         };
-        Env { ops, mover, regw, calls, dir }
+        Env { ops, mover, regw, calls, reinherited, dir }
     }
 
     fn now() -> DateTime<Utc> {
@@ -1150,16 +1204,6 @@ mod tests {
     /// The mover log line for locking down the manifest dir.
     fn ensure_manifest_dir(e: &Env) -> String {
         format!("ensure {}", e.dir.path().display())
-    }
-
-    #[test]
-    fn parse_sc_state_reads_the_state_line() {
-        let running = "SERVICE_NAME: Spooler \r\n        TYPE               : 110  WIN32_OWN_PROCESS  (interactive)\r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n";
-        assert_eq!(parse_sc_state(running).as_deref(), Some("RUNNING"));
-        assert_eq!(parse_sc_state("        STATE              : 3  STOP_PENDING\n").as_deref(), Some("STOP_PENDING"));
-        assert_eq!(parse_sc_state("        STATE              : 1  STOPPED\n").as_deref(), Some("STOPPED"));
-        assert_eq!(parse_sc_state("        STATE              : 1\n").as_deref(), Some("STOPPED"), "number only");
-        assert_eq!(parse_sc_state("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:"), None);
     }
 
     #[test]
@@ -1324,6 +1368,40 @@ mod tests {
         assert_eq!(*e.calls.lock().unwrap(), vec![format!(r"create-task Foo\Updater from task-0.xml after {}", import("value-0.reg"))]);
         assert!(!mdir.exists());
         assert!(list_manifests(e.dir.path()).is_empty());
+    }
+
+    #[test]
+    fn reinherit_is_called_after_restore() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\foo.exe", 10);
+        e.mover.add_file(r"C:\Apps\Bar\bar.exe", 1);
+        e.mover.add_file(r"C:\ProgramData\Foo\data.bin", 2);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo"), dir_item(r"C:\Apps\Bar"), dir_item(r"C:\ProgramData\Foo")]);
+        assert!(m.failures.is_empty(), "{:?}", m.failures);
+        assert!(e.reinherited.lock().unwrap().is_empty(), "quarantining does not re-inherit");
+        e.mover.add_file(r"C:\Apps\Bar\reinstalled.exe", 1);
+
+        assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail(r"C:\Apps\Bar", "occupied")]));
+        assert_eq!(
+            *e.reinherited.lock().unwrap(),
+            vec![PathBuf::from(r"C:\ProgramData\Foo"), PathBuf::from(r"C:\Apps\Foo")],
+            "only what was moved back"
+        );
+    }
+
+    #[test]
+    fn failed_reinherit_is_a_failure_but_the_item_is_restored() {
+        let mut e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\foo.exe", 10);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
+        e.ops.reinherit = Box::new(|_| Err("access denied".to_string()));
+
+        assert_eq!(
+            restore(&e.ops, &m),
+            RestoreOutcome::Partial(vec![fail(r"C:\Apps\Foo", "acl-not-reinherited: access denied")])
+        );
+        assert!(exists(&e, r"C:\Apps\Foo\foo.exe"));
+        assert!(list_manifests(e.dir.path()).is_empty(), "nothing left in quarantine");
     }
 
     #[test]
@@ -1768,6 +1846,16 @@ mod tests {
         assert!(plan_destinations(&items, &not_ntfs, &|_| None).insufficient.is_empty());
         let all_ok = plan_destinations(&items, &|_| true, &|_| Some(0));
         assert!(all_ok.fallbacks.is_empty() && all_ok.insufficient.is_empty(), "same-drive moves need no space");
+    }
+
+    /// Run with `cargo test -p stale-core -- --ignored service_state_none_when_missing --nocapture`.
+    #[test]
+    #[ignore]
+    fn service_state_none_when_missing() {
+        assert_eq!(service_state("StaleUninstallerNoSuchService"), Ok(None));
+        let spooler = service_state("Spooler");
+        println!("Spooler: {spooler:?}");
+        assert!(matches!(spooler, Ok(Some(1..=7))), "{spooler:?}");
     }
 
     #[test]

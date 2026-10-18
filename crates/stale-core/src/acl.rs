@@ -12,10 +12,11 @@ use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, LookupPrivilegeValueW, ACL,
-    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW,
+    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -242,7 +243,8 @@ struct DirOps<'a> {
 /// that is an error unless the folder was created by us (`created_by_us`, or just now), since its
 /// DACL is then already right.
 ///
-/// Then each direct child that is a reparse point or not owned by Administrators/SYSTEM is renamed
+/// Then each direct child folder or reparse point (plain files are left alone) that is a reparse
+/// point or not owned by Administrators/SYSTEM is renamed
 /// aside to `<name>.untrusted-<timestamp>` (one warning each in the returned list) — re-checked
 /// against a fresh listing of `path` just before; names already holding `.untrusted-` are left
 /// alone. Trusted child folders get the same descriptor (one level: the DACL is inheritable below).
@@ -284,6 +286,11 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
             continue;
         }
         let child = path.join(&name);
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        // Plain files (settings.json, logs) are never moved aside: only folders and links matter.
+        if !is_dir && !(ops.is_reparse)(&child) {
+            continue;
+        }
         if untrusted(&child) {
             // Only what a fresh listing of the (pinned) folder still shows, still untrusted.
             let listed = std::fs::read_dir(path).into_iter().flatten().flatten().any(|e| e.file_name() == name);
@@ -299,13 +306,41 @@ fn secure_dir_with(path: &Path, created_by_us: bool, ops: &DirOps) -> Result<Vec
                 Ok(()) => warnings.push(format!("{} ({why}) moved aside to {}", child.display(), aside.display())),
                 Err(e) => warnings.push(format!("{} ({why}) could not be moved aside: {e}", child.display())),
             }
-        } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
+        } else if is_dir {
             if let Err(e) = (ops.apply)(&child) {
                 warnings.push(e);
             }
         }
     }
     Ok(warnings)
+}
+
+/// Makes `path` inherit its parent's ACL again: an empty, unprotected DACL clears the explicit
+/// ACEs and turns inheritance back on (the inherited ACEs are recomputed, also below `path`). The
+/// owner is left as it is.
+pub fn reinherit(path: &Path) -> Result<(), String> {
+    let mut empty = ACL::default();
+    // SAFETY: `empty` is an ACL header of exactly the size passed; an ACL with no ACEs fits in it.
+    unsafe { InitializeAcl(&mut empty, std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
+        .map_err(|e| format!("initialize ACL: {}", e.message()))?;
+    let name = wide(path);
+    // SAFETY: `name` is NUL-terminated and `empty` an initialized ACL; both outlive the call.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&empty),
+            None,
+        )
+    };
+    if err == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("reset ACL of {}: {}", path.display(), windows::core::Error::from(err.to_hresult()).message()))
+    }
 }
 
 /// The owner and DACL of `path` as SDDL (e.g. `O:BAD:PAI(A;OICI;FA;;;BA)…`); `None` when unreadable.
@@ -396,18 +431,47 @@ mod tests {
         };
         let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &owned, apply: &apply };
         let warnings = secure_dir_with(&dir, false, &ops).unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         let mut names: Vec<String> =
             std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         assert_eq!(names.len(), 4, "{names:?}");
         assert!(names.contains(&"ours".to_string()) && names.contains(&"old.untrusted-20261018120000".to_string()));
         assert!(names.iter().any(|n| n.starts_with("planted.untrusted-")), "{names:?}");
-        assert!(names.iter().any(|n| n.starts_with("planted.txt.untrusted-")), "{names:?}");
+        assert!(names.contains(&"planted.txt".to_string()), "plain files stay: {names:?}");
         assert_eq!(*applied.borrow(), vec![dir.clone(), ours.clone()]);
 
         // A second run finds nothing new to move aside.
         assert_eq!(secure_dir_with(&dir, false, &ops).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sweep_leaves_files_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("root");
+        std::fs::create_dir_all(dir.join("planted")).unwrap();
+        std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+        let ops = DirOps { is_reparse: &|_| false, owned_by_admins: &|_| Some(false), apply: &|_| Ok(()) };
+        let warnings = secure_dir_with(&dir, false, &ops).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(dir.join("settings.json").is_file(), "the file is not renamed");
+        assert!(!dir.join("planted").exists(), "the folder is");
+    }
+
+    #[test]
+    fn reinherit_drops_the_protected_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("restored");
+        std::fs::create_dir(&dir).unwrap();
+        set_security(&dir, false).unwrap();
+        let locked = sddl_of(&dir).unwrap();
+        assert!(locked.contains("D:P"), "{locked}");
+        reinherit(&dir).unwrap();
+        let sddl = sddl_of(&dir).unwrap();
+        let dacl = &sddl[sddl.find("D:").unwrap()..];
+        assert!(!dacl.starts_with("D:P"), "unprotected: {dacl}");
+        assert!(dacl.contains("ID;"), "inherited ACEs: {dacl}");
+        assert!(!dacl.contains("(A;OICI;FA;;;BA)"), "explicit ACEs gone: {dacl}");
     }
 
     #[test]

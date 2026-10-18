@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 /// program's location.
 pub const NOTE_OTHER_PROGRAM: &str = "used-by-other-program";
 
+/// `Leftover::note` of an install folder with a subfolder that likely holds the user's own files
+/// (saves, screenshots, profiles, projects); such a folder is Medium instead of High.
+pub const NOTE_CONTAINS_USER_DATA: &str = "contains-user-data";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Confidence { High, Medium, Low }
 

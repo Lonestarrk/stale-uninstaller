@@ -3,7 +3,7 @@
 use super::names::{
     child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, publisher_matches,
 };
-use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint};
+use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA};
 use crate::fsys::FsReader;
 use crate::pathutil::{is_shared_root, norm, normed_under};
 use std::collections::HashSet;
@@ -66,6 +66,19 @@ fn user_folder_relation(roots: &FsScanRoots, profiles: &[PathBuf], path: &Path) 
     None
 }
 
+/// Subfolder names (compared case-insensitively) that suggest an install folder keeps the user's
+/// own files, such as game saves or projects.
+const USER_DATA_CHILDREN: &[&str] =
+    &["userdata", "saves", "saved", "savegames", "screenshots", "profiles", "workspace", "projects"];
+
+/// True when `dir` has a direct child folder named like [`USER_DATA_CHILDREN`].
+fn holds_user_data(fs: &dyn FsReader, dir: &Path) -> bool {
+    fs.list_dir(dir)
+        .iter()
+        .filter(|e| e.is_dir)
+        .any(|e| USER_DATA_CHILDREN.iter().any(|n| file_name(&e.path).eq_ignore_ascii_case(n)))
+}
+
 pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
     let install = hint.install_location.as_deref().filter(|p| !p.as_os_str().is_empty());
     let install_norm = install.map(norm);
@@ -89,6 +102,7 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
         match user_folder_relation(roots, &profiles, loc) {
             Some(UserFolderRelation::IsFolderOrAncestor) => {}
             Some(UserFolderRelation::Under) => push(loc, Confidence::Low, Some("user-folder")),
+            None if holds_user_data(fs, loc) => push(loc, Confidence::Medium, Some(NOTE_CONTAINS_USER_DATA)),
             None => push(loc, Confidence::High, None),
         }
     }
@@ -172,6 +186,21 @@ mod tests {
         assert_eq!(r.program_data, PathBuf::from(r"C:\ProgramData"));
         assert_eq!(r.per_profile.len(), 4);
         assert_eq!(r.user_folders.len(), 4);
+    }
+
+    #[test]
+    fn install_location_with_userdata_child_is_medium_with_note() {
+        let fs = FakeFs::new().dir(r"D:\Games\Foo\bin", 10).dir(r"D:\Games\Foo\SaveGames", 5).profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Foo", None, Some(r"D:\Games\Foo")));
+        assert_eq!(dirs(&out), vec![(r"D:\Games\Foo".to_string(), Confidence::Medium)]);
+        assert_eq!(out[0].note.as_deref(), Some(NOTE_CONTAINS_USER_DATA));
+        assert_eq!(NOTE_CONTAINS_USER_DATA, "contains-user-data");
+
+        // A file with such a name is not a user-data folder.
+        let fs = FakeFs::new().dir(r"D:\Games\Foo\bin", 10).file(r"D:\Games\Foo\saves", 5).profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Foo", None, Some(r"D:\Games\Foo")));
+        assert_eq!(dirs(&out), vec![(r"D:\Games\Foo".to_string(), Confidence::High)]);
+        assert_eq!(out[0].note, None);
     }
 
     #[test]
