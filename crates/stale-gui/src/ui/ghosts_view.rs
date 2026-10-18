@@ -143,6 +143,9 @@ fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime
     ui.horizontal(|ui| {
         ui.add(egui::Checkbox::without_text(checked));
         ui.strong(&ghost.name);
+        if let Some(publisher) = &ghost.publisher {
+            ui.weak(publisher);
+        }
         let badge = assessment_label(ghost.assessment);
         if ghost.assessment == Assessment::Uncertain {
             ui.colored_label(STALE_COLOR, badge);

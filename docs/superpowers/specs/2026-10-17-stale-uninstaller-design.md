@@ -337,7 +337,9 @@ använd från körningsspåren, och en bedömning:
 
 Användaren bockar i vad som ska bort; samma förtroendenivåer och samma
 karantän som i avsnitt 6.1 och 7 gäller. Mappar i användarens dokumentmappar
-visas aldrig här. Poster kan märkas *Behåll*, vilket sparas i samma
+visas aldrig här. Mappar som används av en levande tjänst, drivrutin,
+schemalagd uppgift, autostart eller genväg är aldrig förbockade. Poster kan
+märkas *Behåll*, vilket sparas i samma
 viktig-lista som skräpletaren (avsnitt 9) så de inte visas igen.
 
 **Krav på plan 1 från detta:** körningsspår ska sparas även när exe-filen

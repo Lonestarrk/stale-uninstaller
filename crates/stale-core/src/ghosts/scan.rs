@@ -3,7 +3,7 @@
 use super::folders::orphan_folders;
 use super::refs::{service_collect, shortcut_collect, task_collect, usage_collect};
 use super::registry::registry_collect;
-use super::{group, Collected, Evidence, Ghost, InstalledIndex, LiveRefs, NameRoots};
+use super::{ghost_name_of, group, Collected, Evidence, Ghost, InstalledIndex, LiveRefs, NameRoots};
 use crate::leftovers::LeftoverSources;
 use crate::model::{Program, ProgramId};
 use std::collections::HashSet;
@@ -57,21 +57,22 @@ pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
     let drive_present: &dyn Fn(char) -> bool = &*src.drive_present;
     let installed = InstalledIndex::from_programs(&src.programs);
     let shortcuts: Vec<ShortcutTarget> = l.start_menu_targets.iter().chain(&l.desktop_targets).cloned().collect();
+    let roots = NameRoots::new(&l.fs_roots, &fs.profile_dirs(), &src.programs);
+    let mut evidence: Vec<Evidence> = orphan_folders(fs, &l.fs_roots, &installed, keep);
+    let folder_names: Vec<String> = evidence.iter().filter_map(|e| ghost_name_of(e, &roots)).collect();
     let collected: Vec<Collected> = vec![
-        registry_collect(reg, fs, &l.reg_roots, &installed, keep, drive_present),
+        registry_collect(reg, fs, &l.reg_roots, &installed, keep, drive_present, &folder_names),
         service_collect(reg, fs, &installed, keep, drive_present),
         task_collect(fs, &l.tasks_root, &installed, keep, drive_present),
         shortcut_collect(fs, &shortcuts, &installed, keep, drive_present),
         usage_collect(fs, &src.unmatched_hits, &installed, keep, drive_present),
     ];
-    let mut evidence: Vec<Evidence> = orphan_folders(fs, &l.fs_roots, &installed, keep);
     let mut live_targets = Vec::new();
     for c in collected {
         evidence.extend(c.evidence);
         live_targets.extend(c.live_targets);
     }
     let live = LiveRefs::from_targets(live_targets);
-    let roots = NameRoots::new(&l.fs_roots, &fs.profile_dirs(), &src.programs);
     let current_profile = fs.env("USERPROFILE").map(PathBuf::from);
     group(evidence, &installed, keep, &roots, current_profile.as_deref(), &live)
 }
@@ -169,6 +170,36 @@ mod tests {
         // The merged list goes straight into the live sources.
         let src = GhostSources { programs: merged, ..sources(base_fs(), FakeRegistry::new()) };
         assert_eq!(src.programs.len(), 1);
+    }
+
+    #[test]
+    fn vendor_key_without_path_joins_folder_ghost() {
+        let fs = base_fs().file(r"C:\Program Files\Old Tool\data.bin", 5);
+        let mut reg = FakeRegistry::new();
+        let hkcu = |p: &str| key(Hive::CurrentUser, p);
+        reg.set(hkcu(r"Software\OldTool"), "Theme", RegValue::Str("dark".into()));
+        reg.set(hkcu(r"Software\Unrelated Vendor"), "Theme", RegValue::Str("dark".into()));
+        let mut src = sources(fs, reg);
+        src.leftovers.reg_roots.software = vec![hkcu("Software")];
+        let ghosts = scan_ghosts(&src);
+        assert_eq!(ghosts.len(), 1, "{ghosts:?}");
+        let g = &ghosts[0];
+        assert_eq!((g.name.as_str(), g.assessment), ("Old Tool", Assessment::LeftoversOnly));
+        assert!(g.evidence.contains(&Evidence::RegKeyOrphan { key: hkcu(r"Software\OldTool") }), "{g:?}");
+        let key_item = to_leftovers(g, Path::new(r"C:\T"))
+            .items
+            .into_iter()
+            .find(|l| matches!(l.kind, crate::leftovers::LeftoverKind::RegKey { .. }))
+            .unwrap();
+        assert_eq!(key_item.confidence, Confidence::Low, "a vendor key is Low unless the ghost is probably uninstalled");
+        let mut sure = g.clone();
+        sure.assessment = Assessment::ProbablyUninstalled;
+        let key_item = to_leftovers(&sure, Path::new(r"C:\T"))
+            .items
+            .into_iter()
+            .find(|l| matches!(l.kind, crate::leftovers::LeftoverKind::RegKey { .. }))
+            .unwrap();
+        assert_eq!(key_item.confidence, Confidence::Medium);
     }
 
     /// Regression: a running Win32 service's own folder was a pre-checked LeftoversOnly ghost.

@@ -27,6 +27,11 @@ pub mod usage;
 
 pub use model::*;
 
+/// True when this build has the test-only `e2e-overrides` feature (`STALE_E2E_*` environment
+/// overrides that drop security checks). The GUI refuses to start then, e.g. after a
+/// `cargo build --all-features`.
+pub const E2E_OVERRIDES: bool = cfg!(feature = "e2e-overrides");
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

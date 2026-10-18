@@ -4,6 +4,7 @@
 use super::{format_location, Collected, Evidence, InstalledIndex, RefKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
+use crate::leftovers::names::name_matches_exact;
 use crate::leftovers::reg_scan::{child, default_string, path_in_value, string_value, RegScanRoots};
 use crate::leftovers::system_root_norm;
 use crate::model::RegKeyPath;
@@ -34,6 +35,8 @@ struct Ctx<'a> {
     system_root: String,
     /// Existing targets of the Run / App Paths / COM server / shell command entries read.
     live: std::cell::RefCell<Vec<PathBuf>>,
+    /// Names of the orphan folders found: a vendor key named exactly like one is that program's.
+    folder_names: &'a [String],
 }
 
 impl Ctx<'_> {
@@ -80,11 +83,13 @@ pub fn registry_evidence(
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
 ) -> Vec<Evidence> {
-    registry_collect(reg, fs, roots, installed, keep, drive_present).evidence
+    registry_collect(reg, fs, roots, installed, keep, drive_present, &[]).evidence
 }
 
 /// [`registry_evidence`], plus the existing targets of the Run values, App Paths entries, COM
-/// servers and shell commands it read (live references).
+/// servers and shell commands it read (live references). A vendor key without a path value
+/// whose name is exactly one of `folder_names` (the orphan folders found) is a
+/// [`Evidence::RegKeyOrphan`].
 pub fn registry_collect(
     reg: &dyn RegistryReader,
     fs: &dyn FsReader,
@@ -92,8 +97,18 @@ pub fn registry_collect(
     installed: &InstalledIndex,
     keep: &KeepList,
     drive_present: &dyn Fn(char) -> bool,
+    folder_names: &[String],
 ) -> Collected {
-    let cx = Ctx { reg, fs, installed, keep, drive_present, system_root: system_root_norm(), live: Default::default() };
+    let cx = Ctx {
+        reg,
+        fs,
+        installed,
+        keep,
+        drive_present,
+        system_root: system_root_norm(),
+        live: Default::default(),
+        folder_names,
+    };
     let mut out = Vec::new();
     for root in &roots.software {
         software_keys(&cx, root, &mut out);
@@ -123,6 +138,11 @@ fn software_keys(cx: &Ctx, root: &RegKeyPath, out: &mut Vec<Evidence>) {
         }
         let forced = CONTAINER_KEYS.iter().any(|c| c.eq_ignore_ascii_case(&sub));
         if !forced && path_values(cx, &k, out) {
+            continue;
+        }
+        // No path value, but named exactly like an orphan folder: that program's vendor key.
+        if !forced && cx.folder_names.iter().any(|f| name_matches_exact(&sub, f)) {
+            out.push(Evidence::RegKeyOrphan { key: k });
             continue;
         }
         let children = cx.reg.subkeys(&k).unwrap_or_default();
@@ -460,7 +480,7 @@ mod tests {
             .file(r"C:\Apps\Live\live.exe", 1)
             .file(r"C:\Apps\Live\ext.dll", 1)
             .file(r"C:\Apps\Live\open.exe", 1);
-        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives);
+        let got = registry_collect(&reg, &fs, &roots(), &InstalledIndex::default(), &KeepList::default(), &all_drives, &[]);
         assert_eq!(got.evidence, vec![]);
         let mut live: Vec<String> = got.live_targets.iter().map(|p| p.display().to_string()).collect();
         live.sort();

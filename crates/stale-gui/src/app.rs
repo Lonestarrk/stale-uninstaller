@@ -153,6 +153,10 @@ pub struct StaleApp {
     ghost_rx: Option<Receiver<GhostEvent>>,
     /// A ghost scan was asked for while the program scan ran; it starts once that is done.
     ghost_scan_waiting: bool,
+    /// Bumped whenever the program list is replaced.
+    programs_generation: u64,
+    /// The `programs_generation` the shown (or running) ghost scan was started with.
+    ghosts_generation: Option<u64>,
     /// What the user chose to keep ("Behåll"); saved to `paths::keep_list_path()`.
     pub keep: KeepList,
     /// The "Behållna" window (the keep list, editable) is open.
@@ -219,6 +223,8 @@ impl StaleApp {
             ghosts: None,
             ghost_rx: None,
             ghost_scan_waiting: false,
+            programs_generation: 0,
+            ghosts_generation: None,
             keep: KeepList::default(),
             keep_window_open: false,
             last_kept: None,
@@ -251,6 +257,7 @@ impl StaleApp {
         match ev {
             ScanEvent::Programs(programs) => {
                 self.programs = programs;
+                self.programs_generation += 1;
                 self.rebuild_rows();
             }
             ScanEvent::Usage(usage) => {
@@ -744,13 +751,24 @@ impl StaleApp {
         self.ghost_rx.is_some()
     }
 
-    /// Switches to the ghosts view and starts a ghost scan; a finished removal is closed first.
+    /// Switches to the ghosts view; a finished removal is closed first. The last ghost scan's
+    /// result is shown again as long as the program list has not changed since it started;
+    /// otherwise (or when there is none) a ghost scan starts.
     pub fn show_ghosts(&mut self) {
         if self.view == View::Leftovers {
             self.leave_leftovers();
         }
         self.view = View::Ghosts;
-        self.refresh_ghosts();
+        if self.ghosts_need_scan() {
+            self.refresh_ghosts();
+        }
+    }
+
+    /// True when there is no ghost scan result (nor one running or waiting) for the current
+    /// program list.
+    fn ghosts_need_scan(&self) -> bool {
+        let have = self.ghosts.is_some() || self.ghost_scan_busy();
+        !have || self.ghosts_generation != Some(self.programs_generation)
     }
 
     /// Starts a ghost scan over the installed programs, unless one runs or the program scan has
@@ -772,6 +790,7 @@ impl StaleApp {
             return;
         }
         self.ghost_rx = Some(worker::spawn_ghost_scan(self.programs.clone(), self.unmatched_hits.clone()));
+        self.ghosts_generation = Some(self.programs_generation);
     }
 
     /// Starts (or refuses, see [`Self::refresh_ghosts`]) a ghost scan that waited for the
@@ -1236,6 +1255,29 @@ mod tests {
         assert_eq!(app.unmatched_hits, vec![hit]);
         app.clear_scan_data();
         assert!(app.unmatched_hits.is_empty(), "a new scan starts without the old hits");
+    }
+
+    #[test]
+    fn show_ghosts_reuses_the_cached_scan_until_programs_change() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::Assessment;
+        let mut app = StaleApp::empty(Settings::default());
+        app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
+        app.ghosts = Some(GhostSelection::new(vec![ghost("Alpha", Assessment::LeftoversOnly, 1)]));
+        app.ghosts_generation = Some(app.programs_generation);
+        app.show_ghosts();
+        assert_eq!(app.view, View::Ghosts);
+        assert!(app.ghost_rx.is_none(), "the cached result is shown again");
+        assert_eq!(app.ghosts.as_ref().unwrap().ghosts.len(), 1);
+
+        assert!(!app.ghosts_need_scan());
+        // A new program list (Uppdatera) means a new ghost scan; not started here, it would read
+        // the real machine.
+        app.apply_event(ScanEvent::Programs(vec![program("a", false), program("b", false)]));
+        assert!(app.ghosts_need_scan());
+        app.ghosts = None;
+        app.ghosts_generation = Some(app.programs_generation);
+        assert!(app.ghosts_need_scan(), "no result yet");
     }
 
     #[test]

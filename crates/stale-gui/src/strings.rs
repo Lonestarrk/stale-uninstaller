@@ -2,6 +2,8 @@
 
 pub const APP_TITLE: &str = "Stale Uninstaller";
 pub const ALREADY_RUNNING: &str = "Stale Uninstaller körs redan.";
+/// Shown when the build has the test-only e2e-overrides feature; the program then exits.
+pub const E2E_BUILD_REFUSED: &str = "Den här versionen är byggd med testfunktionen e2e-overrides och kan inte köras. Bygg om utan den.";
 pub const LOADING: &str = "Läser installerade program…";
 pub const NO_PROGRAMS: &str = "Inga program hittades.";
 pub const WARNINGS: &str = "Varningar";

@@ -424,9 +424,15 @@ fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
             note: Some(REASON_CONTAINS_USER_DATA.to_string()),
         },
         Evidence::Folder { path, size, .. } => owned(LeftoverKind::Dir { path: path.clone(), size: *size }),
-        Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => {
-            owned(LeftoverKind::RegKey { key: key.clone() })
-        }
+        Evidence::RegKeyMissingPath { key, .. } => owned(LeftoverKind::RegKey { key: key.clone() }),
+        // A vendor key with no path value says little on its own: Medium only for a ghost that
+        // is probably uninstalled.
+        Evidence::RegKeyOrphan { key } if g.assessment != Assessment::ProbablyUninstalled => Leftover {
+            kind: LeftoverKind::RegKey { key: key.clone() },
+            confidence: Confidence::Low,
+            note: g.reasons.first().cloned(),
+        },
+        Evidence::RegKeyOrphan { key } => item(LeftoverKind::RegKey { key: key.clone() }, Confidence::Medium),
         Evidence::DanglingRef { kind, location, target, value_name } => {
             let kind = match kind {
                 RefKind::Run => LeftoverKind::RegValue { key: parse_location(location)?, name: value_name.clone()? },

@@ -7,7 +7,7 @@ use stale_core::quarantine::{auto_purge, QuarantineOps};
 use stale_core::settings::Settings;
 use stale_gui::app::StaleApp;
 use stale_gui::logging;
-use stale_gui::strings::{ALREADY_RUNNING, APP_TITLE};
+use stale_gui::strings::{ALREADY_RUNNING, APP_TITLE, E2E_BUILD_REFUSED};
 
 /// Name of the machine-wide mutex that marks a running Stale Uninstaller.
 const INSTANCE_MUTEX: &str = r"Global\StaleUninstaller";
@@ -33,19 +33,26 @@ fn single_instance() -> bool {
     }
 }
 
-/// "Stale Uninstaller körs redan." in a message box.
-fn show_already_running() {
+/// `text` in a message box titled with the app's name; `error` picks the error icon.
+fn message_box(text: &str, error: bool) {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-    let text: Vec<u16> = ALREADY_RUNNING.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let title: Vec<u16> = APP_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
     // SAFETY: both strings are NUL-terminated and outlive the call; no owner window.
-    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION) };
+    unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | icon) };
 }
 
 fn main() -> eframe::Result {
+    // A build whose stale-core has the test-only environment overrides (e.g. `--all-features`)
+    // would trust whatever STALE_E2E_* says: never run it.
+    if stale_core::E2E_OVERRIDES {
+        message_box(E2E_BUILD_REFUSED, true);
+        std::process::exit(1);
+    }
     if !single_instance() {
-        show_already_running();
+        message_box(ALREADY_RUNNING, false);
         return Ok(());
     }
     // Before anything (the log included) is written below the data folder.
