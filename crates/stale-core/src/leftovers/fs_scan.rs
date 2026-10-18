@@ -3,7 +3,7 @@
 use super::names::{name_matches, publisher_matches};
 use super::{Confidence, Leftover, LeftoverKind, ProgramHint};
 use crate::fsys::FsReader;
-use crate::pathutil::{is_shared_root, norm};
+use crate::pathutil::{is_shared_root, norm, normed_under};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,30 @@ fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserFolderRelation {
+    /// The path is a user folder (Documents, Desktop, ...) or one of its ancestors.
+    IsFolderOrAncestor,
+    /// The path lies strictly inside a user folder.
+    Under,
+}
+
+fn user_folder_relation(roots: &FsScanRoots, profiles: &[PathBuf], path: &Path) -> Option<UserFolderRelation> {
+    let n = norm(path);
+    for profile in profiles {
+        for rel in &roots.user_folders {
+            let folder = norm(&profile.join(rel));
+            if n == folder || normed_under(&folder, &n) {
+                return Some(UserFolderRelation::IsFolderOrAncestor);
+            }
+            if normed_under(&n, &folder) {
+                return Some(UserFolderRelation::Under);
+            }
+        }
+    }
+    None
+}
+
 pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) -> Vec<Leftover> {
     let install = hint.install_location.as_deref().filter(|p| !p.as_os_str().is_empty());
     let install_norm = install.map(norm);
@@ -58,13 +82,14 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
         });
     };
 
-    if let Some(loc) = install {
-        if fs.is_dir(loc) {
-            push(loc, Confidence::High, None);
+    let profiles = fs.profile_dirs();
+    if let Some(loc) = install.filter(|l| fs.is_dir(l)) {
+        match user_folder_relation(roots, &profiles, loc) {
+            Some(UserFolderRelation::IsFolderOrAncestor) => {}
+            Some(UserFolderRelation::Under) => push(loc, Confidence::Low, Some("user-folder")),
+            None => push(loc, Confidence::High, None),
         }
     }
-
-    let profiles = fs.profile_dirs();
     let mut name_roots: Vec<PathBuf> = roots.program_files.clone();
     if !roots.program_data.as_os_str().is_empty() {
         name_roots.push(roots.program_data.clone());
@@ -203,6 +228,36 @@ mod tests {
         let fs = FakeFs::new().dir(r"C:\Program Files\Tools", 1);
         let out = scan_folders(&fs, &roots(), &hint("Tools", None, None));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn install_location_under_downloads_is_low_with_note() {
+        let fs = FakeFs::new().dir(r"C:\Users\A\Downloads\Foo", 9).profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Foo Studio", None, Some(r"C:\Users\A\Downloads\Foo")));
+        assert_eq!(dirs(&out), vec![(r"C:\Users\A\Downloads\Foo".to_string(), Confidence::Low)]);
+        assert_eq!(out[0].note.as_deref(), Some("user-folder"));
+    }
+
+    #[test]
+    fn install_location_equal_to_documents_is_not_listed() {
+        let fs = FakeFs::new().dir(r"C:\Users\A\Documents", 9).profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Foo Studio", None, Some(r"C:\Users\A\Documents")));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn drive_root_install_location_is_not_listed() {
+        let fs = FakeFs::new().dir(r"C:\Foo", 1);
+        let out = scan_folders(&fs, &roots(), &hint("Foo Studio", None, Some(r"C:\")));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn trailing_backslash_install_location_dedupes() {
+        let fs = FakeFs::new().dir(r"C:\Program Files\Foo Studio", 4);
+        let out = scan_folders(&fs, &roots(), &hint("Foo Studio", None, Some(r"C:\Program Files\Foo Studio\")));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].confidence, Confidence::High);
     }
 
     #[test]
