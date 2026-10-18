@@ -465,17 +465,13 @@ fn group_hits(
                 .or((!main && listed(task_exes, &exe)).then_some(ExcludeReason::ScheduledTask))
                 .or((!main && !in_folder(&exe)).then_some(ExcludeReason::NotMain));
             // UserAssist records launches by the user, so an otherwise excluded exe counts when the
-            // user started it (running an uninstaller never does).
+            // user started it (running an uninstaller never does). Only those launches date it:
+            // its Prefetch/BAM traces come from tasks, services or other programs, not the user.
             let user_launched = background.is_some() && group.iter().any(is_ua) && !is_uninstaller(&exe);
-            // A service or helper (updater, tray, …) also runs on its own, so only those launches
-            // date it, never its Prefetch/BAM traces.
-            let helper = matches!(background, Some(ExcludeReason::Service | ExcludeReason::NamePattern));
             let (group, excluded): (Vec<UsageHit>, Option<ExcludeReason>) = if installer {
                 (group, Some(ExcludeReason::NamePattern))
-            } else if user_launched && helper {
-                (group.into_iter().filter(is_ua).collect(), None)
             } else if user_launched {
-                (group, None)
+                (group.into_iter().filter(is_ua).collect(), None)
             } else {
                 (group, background)
             };
@@ -1414,6 +1410,18 @@ mod tests {
         assert_eq!(u.last_used.when, Some(days_ago(365)));
         assert_eq!(u.last_used.source, Some(UsageSource::UserAssist));
         assert_eq!((u.exes[0].last_run, u.exes[0].source, u.exes[0].run_count), (days_ago(365), UsageSource::UserAssist, Some(1)));
+        assert_eq!(u.exes[0].excluded, None);
+    }
+
+    #[test]
+    fn userassist_bypass_dates_task_exe_only_from_userassist() {
+        let programs = [prog("Foo", Some(r"C:\Apps\Foo"))];
+        let exe = r"C:\Apps\Foo\agent.exe";
+        let hits = [hit(exe, 365, UsageSource::UserAssist), hit(exe, 0, UsageSource::Bam)];
+        let r = run_with_tasks(&programs, &hits, &HashSet::from([norm(Path::new(exe))]));
+        let u = usage(&r, "Foo");
+        assert_eq!(u.last_used.when, Some(days_ago(365)));
+        assert_eq!(u.last_used.source, Some(UsageSource::UserAssist));
         assert_eq!(u.exes[0].excluded, None);
     }
 
