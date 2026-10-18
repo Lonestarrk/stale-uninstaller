@@ -30,6 +30,10 @@ const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 /// for after a restore or purge; the folder and the manifest are kept.
 pub const UNKNOWN_CONTENT_LEFT: &str = "unknown-content-left";
 
+/// Prefix of the purge error `"drive-missing: X:"`: a drive holding stored items is not connected,
+/// so nothing is purged and the manifest is kept.
+pub const DRIVE_MISSING: &str = "drive-missing";
+
 /// A system command run on a service or task name.
 pub type NameCommand = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Re-creates a task `name` from an XML file.
@@ -752,7 +756,8 @@ fn remove_manifest_folder(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), 
 /// and then the manifest folder for good. If anything cannot be deleted, or a payload folder holds
 /// anything unknown ([`UNKNOWN_CONTENT_LEFT`], recorded in the manifest), the manifest is kept, so
 /// nothing is orphaned and the purge can be retried. A quarantine folder not owned by
-/// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched.
+/// Administrators or SYSTEM (`ops.trusted_dir`) is refused untouched, and so is one with stored
+/// items on a drive that is not connected (`Err("drive-missing: X:")`).
 pub fn purge(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
     secure_manifest_dir(ops)?;
     purge_secured(ops, m)
@@ -764,6 +769,12 @@ fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), Stri
     }
     check_trusted(ops, &m.id)?;
     let mut kept = adopt_pending(ops, m);
+    // An unplugged drive would make its items look purged: keep everything until it is back.
+    let mut drives: Vec<char> = kept.moved.iter().filter_map(|i| drive_letter(&i.stored)).collect();
+    drives.dedup();
+    if let Some(d) = drives.into_iter().find(|d| !ops.mover.exists(Path::new(&format!(r"{d}:\")))) {
+        return Err(format!("{DRIVE_MISSING}: {d}:"));
+    }
     let known: Vec<PathBuf> = kept.moved.iter().map(|i| i.stored.clone()).collect();
     let left_over = clean_payload(ops, &m.id, &known);
     if !left_over.is_empty() {
@@ -860,7 +871,8 @@ fn clean_payload(ops: &QuarantineOps, id: &QuarantineId, known: &[PathBuf]) -> V
 }
 
 /// Purges every quarantine created more than `days` days before `now`; `0` turns this off.
-/// Quarantines whose folder `ops.trusted_dir` does not vouch for are skipped. Returns the purged ids.
+/// Quarantines whose folder `ops.trusted_dir` does not vouch for, or with items on a drive that
+/// is not connected ([`DRIVE_MISSING`]), are skipped. Returns the purged ids.
 pub fn auto_purge(ops: &QuarantineOps, days: u32, now: DateTime<Utc>) -> Vec<QuarantineId> {
     if days == 0 {
         return Vec::new();
@@ -1588,5 +1600,23 @@ mod tests {
         assert_eq!(left[0].keys, vec![m.keys[0].clone()]);
         assert_eq!(left[0].values, m.values);
         assert_eq!(left[0].services, m.services);
+    }
+
+    #[test]
+    fn purge_with_missing_drive_keeps_manifest() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"D:\Games\Foo\a.pak", 5);
+        e.mover.add_file(r"C:\Apps\Foo\b.dll", 1);
+        let m = quarantine(&e.ops, "Foo", &[dir_item(r"D:\Games\Foo"), dir_item(r"C:\Apps\Foo")], now() - Duration::days(40), &|_| {});
+        assert!(m.failures.is_empty(), "{:?}", m.failures);
+        // D: is unplugged.
+        e.mover.remove_all(Path::new(r"D:\")).unwrap();
+        e.mover.log.lock().unwrap().clear();
+
+        assert_eq!(purge(&e.ops, &m), Err("drive-missing: D:".to_string()));
+        assert_eq!(auto_purge(&e.ops, 30, now()), vec![], "auto-purge skips it");
+        assert!(e.mover.exists(&m.moved[1].stored), "nothing on C: was purged either");
+        assert!(!e.mover.log.lock().unwrap().iter().any(|l| l.starts_with("remove") || l.starts_with("prune")));
+        assert_eq!(list_manifests(e.dir.path()), vec![m]);
     }
 }
