@@ -76,20 +76,10 @@ impl ProgramHint {
     /// (`Program Files`, a drive root, ...), paths without a drive letter and anything inside
     /// `%SystemRoot%` (msiexec, rundll32, `Installer` icons) are left out.
     pub fn with_other_programs(mut self, programs: &[Program], me: &ProgramId) -> ProgramHint {
-        let system_root = norm(Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())));
+        let system_root = system_root_norm();
         let mut seen: HashSet<String> = self.other_locations.iter().map(|p| norm(p)).collect();
         for p in programs.iter().filter(|p| &p.id != me && !p.hidden) {
-            let icon_dir = p.display_icon.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-            let uninstaller_dir = p
-                .uninstall_string
-                .as_deref()
-                .and_then(first_path_in_command)
-                .and_then(|exe| exe.parent().map(Path::to_path_buf));
-            for dir in [p.install_location.clone(), icon_dir, uninstaller_dir].into_iter().flatten() {
-                let n = norm(&dir);
-                if drive_letter(&dir).is_none() || is_shared_root(&dir) || n == system_root || normed_under(&n, &system_root) {
-                    continue;
-                }
+            for n in program_locations(p, &system_root) {
                 if seen.insert(n.clone()) {
                     self.other_locations.push(PathBuf::from(n));
                 }
@@ -109,6 +99,27 @@ impl ProgramHint {
             other_locations: Vec::new(),
         }
     }
+}
+
+/// `%SystemRoot%` [`norm`]ed (`C:\WINDOWS` when unset).
+pub(crate) fn system_root_norm() -> String {
+    norm(Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())))
+}
+
+/// The folders `p` occupies, [`norm`]ed: install folder, display-icon folder and uninstaller
+/// folder. Shared roots, paths without a drive letter and anything inside `system_root`
+/// (msiexec, rundll32, `Installer` icons) are left out.
+pub(crate) fn program_locations(p: &Program, system_root: &str) -> Vec<String> {
+    let icon_dir = p.display_icon.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+    let uninstaller_dir =
+        p.uninstall_string.as_deref().and_then(first_path_in_command).and_then(|exe| exe.parent().map(Path::to_path_buf));
+    [p.install_location.clone(), icon_dir, uninstaller_dir]
+        .into_iter()
+        .flatten()
+        .filter(|dir| drive_letter(dir).is_some() && !is_shared_root(dir))
+        .map(|dir| norm(&dir))
+        .filter(|n| n != system_root && !normed_under(n, system_root))
+        .collect()
 }
 
 /// Folders and files that are, hold or lie inside one of `others` become Low with the note

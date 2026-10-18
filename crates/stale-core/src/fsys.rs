@@ -1,6 +1,7 @@
 //! Testable read-only file-system view: [`RealFs`] for production, [`FakeFs`] for tests.
 
 use crate::pathutil::norm;
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,8 @@ pub trait FsReader: Send + Sync {
     /// Every profile dir except Public, Default, Default User and All Users.
     fn profile_dirs(&self) -> Vec<PathBuf>;
     fn env(&self, var: &str) -> Option<String>;
+    /// Last-modified time; `None` if unknown or unreadable.
+    fn modified(&self, p: &Path) -> Option<DateTime<Utc>>;
 }
 
 /// Decodes file bytes as text: UTF-8 (BOM stripped), UTF-16 with a BOM, or BOM-less UTF-16LE
@@ -88,6 +91,10 @@ impl FsReader for RealFs {
     fn env(&self, var: &str) -> Option<String> {
         std::env::var(var).ok()
     }
+
+    fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
+        std::fs::metadata(p).ok()?.modified().ok().map(DateTime::<Utc>::from)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +103,7 @@ struct Node {
     is_dir: bool,
     size: Option<u64>,
     text: Option<String>,
+    modified: Option<DateTime<Utc>>,
 }
 
 /// In-memory file system for tests; paths compare case-insensitively via [`norm`].
@@ -125,7 +133,7 @@ impl FakeFs {
             }
             self.nodes
                 .entry(norm(&p))
-                .or_insert_with(|| Node { path: p.clone(), is_dir: true, size: None, text: None });
+                .or_insert_with(|| Node { path: p.clone(), is_dir: true, size: None, text: None, modified: None });
             cur = parent_of(&p);
         }
     }
@@ -133,14 +141,14 @@ impl FakeFs {
     pub fn dir(mut self, path: &str, size: u64) -> Self {
         let p = PathBuf::from(path);
         self.add_parents(&p);
-        self.nodes.insert(norm(&p), Node { path: p, is_dir: true, size: Some(size), text: None });
+        self.nodes.insert(norm(&p), Node { path: p, is_dir: true, size: Some(size), text: None, modified: None });
         self
     }
 
     pub fn file(mut self, path: &str, size: u64) -> Self {
         let p = PathBuf::from(path);
         self.add_parents(&p);
-        self.nodes.insert(norm(&p), Node { path: p, is_dir: false, size: Some(size), text: None });
+        self.nodes.insert(norm(&p), Node { path: p, is_dir: false, size: Some(size), text: None, modified: None });
         self
     }
 
@@ -148,12 +156,23 @@ impl FakeFs {
         let p = PathBuf::from(path);
         self.add_parents(&p);
         let size = content.len() as u64;
-        self.nodes.insert(norm(&p), Node { path: p, is_dir: false, size: Some(size), text: Some(content.to_string()) });
+        self.nodes.insert(norm(&p), Node { path: p, is_dir: false, size: Some(size), text: Some(content.to_string()), modified: None });
         self
     }
 
     pub fn env(mut self, var: &str, value: &str) -> Self {
         self.env.insert(var.to_uppercase(), value.to_string());
+        self
+    }
+
+    /// Sets the modified time of `path`, adding it as a folder when missing.
+    pub fn modified(mut self, path: &str, at: DateTime<Utc>) -> Self {
+        if !self.nodes.contains_key(&norm(Path::new(path))) {
+            self = self.dir(path, 0);
+        }
+        if let Some(n) = self.nodes.get_mut(&norm(Path::new(path))) {
+            n.modified = Some(at);
+        }
         self
     }
 
@@ -206,6 +225,10 @@ impl FsReader for FakeFs {
     fn env(&self, var: &str) -> Option<String> {
         self.env.get(&var.to_uppercase()).cloned()
     }
+
+    fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
+        self.nodes.get(&norm(p)).and_then(|n| n.modified)
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +256,25 @@ mod tests {
         assert_eq!(FsReader::env(&fs, "APPDATA").as_deref(), Some(r"C:\U"));
         assert_eq!(fs.profile_dirs(), vec![PathBuf::from(r"C:\Users\A")]);
         assert!(fs.exists(Path::new(r"C:\x")));
+    }
+
+    #[test]
+    fn fake_modified_is_none_unless_set() {
+        let at = DateTime::parse_from_rfc3339("2024-05-06T07:08:09Z").unwrap().with_timezone(&Utc);
+        let fs = FakeFs::new().dir(r"C:\A", 1).modified(r"c:\a", at).modified(r"C:\New", at);
+        assert_eq!(FsReader::modified(&fs, Path::new(r"C:\A")), Some(at));
+        assert_eq!(fs.dir_size(Path::new(r"C:\A")), Some(1));
+        assert!(fs.is_dir(Path::new(r"C:\New")));
+        assert_eq!(FsReader::modified(&fs, Path::new(r"C:\New")), Some(at));
+        assert_eq!(FsReader::modified(&fs, Path::new(r"C:\Other")), None);
+    }
+
+    #[test]
+    fn real_fs_modified_reads_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = RealFs.modified(dir.path()).expect("modified time");
+        assert!((Utc::now() - got).num_minutes().abs() < 5);
+        assert_eq!(RealFs.modified(&dir.path().join("missing")), None);
     }
 
     #[test]
