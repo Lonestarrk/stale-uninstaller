@@ -3,7 +3,7 @@
 //! A quarantine `<id>` keeps its manifest, `.reg` exports and task XML copies in
 //! `<manifest dir>\<id>\`, and the moved files in `<drive>:\Stale Uninstaller\quarantine\<id>\`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -176,9 +176,14 @@ impl Run<'_> {
         self.m.failures.push(Failure { what: what.into(), error: error.into() });
     }
 
-    fn save(&mut self) {
-        if let Err(e) = save_manifest(&self.ops.manifest_dir, &self.m) {
-            self.fail("manifest", e);
+    /// Saves the manifest; on failure records `manifest-save-failed` and returns false.
+    fn save(&mut self) -> bool {
+        match save_manifest(&self.ops.manifest_dir, &self.m) {
+            Ok(()) => true,
+            Err(e) => {
+                self.fail("manifest", format!("manifest-save-failed: {e}"));
+                false
+            }
         }
     }
 
@@ -349,9 +354,40 @@ impl Run<'_> {
     }
 }
 
+/// For each item, whether it is a file, folder or shortcut strictly inside a listed folder (it then
+/// goes along with that folder and is not handled on its own).
+fn covered_by_listed_dir(items: &[Leftover]) -> Vec<bool> {
+    let dirs: Vec<String> = items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            LeftoverKind::Dir { path, .. } => Some(norm(path)),
+            _ => None,
+        })
+        .collect();
+    items
+        .iter()
+        .map(|i| {
+            let p = match &i.kind {
+                LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => path,
+                LeftoverKind::Shortcut { lnk, .. } => lnk,
+                _ => return false,
+            };
+            let p = norm(p);
+            dirs.iter().any(|d| p.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('\\')))
+        })
+        .collect()
+}
+
+/// Locks the manifest folder down like a payload root (Administrators and SYSTEM only), so the
+/// `.reg`/XML backups a restore imports cannot be planted by an unprivileged user.
+fn secure_manifest_dir(ops: &QuarantineOps) -> Result<(), String> {
+    ops.mover.ensure_payload_root(&ops.manifest_dir)
+}
+
 /// Quarantines `items` in the order services, tasks, registry values, registry keys, shortcuts,
 /// files/folders. Every failure is recorded in the manifest and the rest continues; the manifest
-/// is saved before anything is touched and after each group.
+/// is saved before anything is touched and after each group (a failed save stops further groups).
+/// Files, folders and shortcuts inside a listed folder go along with that folder.
 pub fn quarantine(
     ops: &QuarantineOps,
     program_name: &str,
@@ -377,7 +413,7 @@ pub fn quarantine(
     };
     let mut run =
         Run { ops, m, folder: ops.manifest_dir.join(&id.0), done: 0, total: items.len(), progress, roots: BTreeMap::new() };
-    if let Err(e) = save_manifest(&ops.manifest_dir, &run.m) {
+    if let Err(e) = secure_manifest_dir(ops).and_then(|()| save_manifest(&ops.manifest_dir, &run.m)) {
         // Without a manifest nothing could be restored, so nothing is touched.
         for it in items {
             run.fail(describe(&it.kind), format!("manifest could not be saved: {e}"));
@@ -385,25 +421,56 @@ pub fn quarantine(
         progress(QuarantineProgress::Finished(run.m.clone()));
         return run.m;
     }
-    run.services(items);
-    run.save();
-    run.tasks(items);
-    run.save();
-    run.values(items);
-    run.save();
-    run.keys(items);
-    run.save();
-    run.shortcuts(items);
-    run.save();
-    run.files(items);
-    run.save();
+    let covered = covered_by_listed_dir(items);
+    let mut work = Vec::new();
+    for (it, covered) in items.iter().zip(covered) {
+        if covered {
+            run.step(&describe(&it.kind));
+        } else {
+            work.push(it.clone());
+        }
+    }
+    for group in 0..6 {
+        match group {
+            0 => run.services(&work),
+            1 => run.tasks(&work),
+            2 => run.values(&work),
+            3 => run.keys(&work),
+            4 => run.shortcuts(&work),
+            _ => run.files(&work),
+        }
+        if !run.save() {
+            break;
+        }
+    }
     progress(QuarantineProgress::Finished(run.m.clone()));
     run.m
 }
 
-/// `<payload root of each drive holding moved items>\<id>`.
-fn payload_dirs(ops: &QuarantineOps, m: &QuarantineManifest) -> BTreeSet<PathBuf> {
-    m.moved.iter().filter_map(|i| drive_letter(&i.stored)).map(|d| (ops.payload_root_for)(d).join(&m.id.0)).collect()
+/// Every existing `<payload root of drive A..Z>\<id>`, whether or not the manifest lists items there.
+fn payload_dirs(ops: &QuarantineOps, id: &QuarantineId) -> Vec<PathBuf> {
+    ('A'..='Z').map(|d| (ops.payload_root_for)(d).join(&id.0)).filter(|p| ops.mover.exists(p)).collect()
+}
+
+/// A backup a restore may use: a non-link file named after `pattern` (`N` = digits, `*` = any
+/// non-empty text) directly in `<manifest dir>\<id>`.
+fn check_backup(ops: &QuarantineOps, id: &QuarantineId, file: &Path, pattern: &str) -> Result<(), String> {
+    let outside = || format!("backup file outside the quarantine folder: {}", file.display());
+    let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(outside)?;
+    let (prefix, suffix) = pattern.split_once(['N', '*']).ok_or_else(outside)?;
+    let middle = name.strip_prefix(prefix).and_then(|r| r.strip_suffix(suffix)).ok_or_else(outside)?;
+    if middle.is_empty() || (pattern.contains('N') && !middle.chars().all(|c| c.is_ascii_digit())) {
+        return Err(outside());
+    }
+    let parent = file.parent().and_then(|p| std::fs::canonicalize(p).ok());
+    let folder = std::fs::canonicalize(ops.manifest_dir.join(&id.0)).ok();
+    if parent.is_none() || parent != folder {
+        return Err(outside());
+    }
+    if ops.mover.is_reparse(file) {
+        return Err(format!("backup file is a link: {}", file.display()));
+    }
+    Ok(())
 }
 
 /// Moves files back, last moved first; returns the items that stay in quarantine.
@@ -428,6 +495,11 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
             kept.push(item.clone());
             continue;
         }
+        if let Some(p) = item.original.ancestors().skip(1).find(|a| ops.mover.is_reparse(a)) {
+            fail(format!("reparse-in-destination: {}", p.display()));
+            kept.push(item.clone());
+            continue;
+        }
         match ops.mover.move_path(&item.stored, &item.original) {
             Ok(()) => {}
             // The original is complete again; the leftover copy goes with the payload folder.
@@ -442,10 +514,11 @@ fn restore_moved(ops: &QuarantineOps, id: &QuarantineId, moved: &[MovedItem], fa
     kept
 }
 
-fn restore_keys(ops: &QuarantineOps, keys: &[ExportedKey], failures: &mut Vec<Failure>) -> Vec<ExportedKey> {
+fn restore_keys(ops: &QuarantineOps, id: &QuarantineId, keys: &[ExportedKey], failures: &mut Vec<Failure>) -> Vec<ExportedKey> {
     let mut kept = Vec::new();
     for k in keys.iter().rev() {
-        if let Err(error) = ops.regw.import_file(&k.reg_file) {
+        let imported = check_backup(ops, id, &k.reg_file, "key-N.reg").and_then(|()| ops.regw.import_file(&k.reg_file));
+        if let Err(error) = imported {
             failures.push(Failure { what: key_text(&k.key), error });
             kept.push(k.clone());
         }
@@ -455,7 +528,12 @@ fn restore_keys(ops: &QuarantineOps, keys: &[ExportedKey], failures: &mut Vec<Fa
 }
 
 /// Imports each value export once (it re-creates the whole key as it was).
-fn restore_values(ops: &QuarantineOps, values: &[RemovedValue], failures: &mut Vec<Failure>) -> Vec<RemovedValue> {
+fn restore_values(
+    ops: &QuarantineOps,
+    id: &QuarantineId,
+    values: &[RemovedValue],
+    failures: &mut Vec<Failure>,
+) -> Vec<RemovedValue> {
     let mut files: Vec<&Path> = Vec::new();
     for v in values.iter().rev() {
         if !files.contains(&v.reg_file.as_path()) {
@@ -464,7 +542,7 @@ fn restore_values(ops: &QuarantineOps, values: &[RemovedValue], failures: &mut V
     }
     let mut failed: Vec<&Path> = Vec::new();
     for file in files {
-        if let Err(error) = ops.regw.import_file(file) {
+        if let Err(error) = check_backup(ops, id, file, "value-N.reg").and_then(|()| ops.regw.import_file(file)) {
             for v in values.iter().filter(|v| v.reg_file == file) {
                 failures.push(Failure { what: format!(r"{}\{}", key_text(&v.key), v.name), error: error.clone() });
             }
@@ -474,10 +552,12 @@ fn restore_values(ops: &QuarantineOps, values: &[RemovedValue], failures: &mut V
     values.iter().filter(|v| failed.contains(&v.reg_file.as_path())).cloned().collect()
 }
 
-fn restore_tasks(ops: &QuarantineOps, tasks: &[RemovedTask], failures: &mut Vec<Failure>) -> Vec<RemovedTask> {
+fn restore_tasks(ops: &QuarantineOps, id: &QuarantineId, tasks: &[RemovedTask], failures: &mut Vec<Failure>) -> Vec<RemovedTask> {
     let mut kept = Vec::new();
     for t in tasks.iter().rev() {
-        if let Err(error) = (ops.create_task)(&t.name, &t.xml_backup) {
+        let created =
+            check_backup(ops, id, &t.xml_backup, "task-N.xml").and_then(|()| (ops.create_task)(&t.name, &t.xml_backup));
+        if let Err(error) = created {
             failures.push(Failure { what: t.name.clone(), error });
             kept.push(t.clone());
         }
@@ -489,13 +569,14 @@ fn restore_tasks(ops: &QuarantineOps, tasks: &[RemovedTask], failures: &mut Vec<
 /// Re-imports service keys; a restored service only starts after a reboot (noted in `notes`).
 fn restore_services(
     ops: &QuarantineOps,
+    id: &QuarantineId,
     services: &[RemovedService],
     failures: &mut Vec<Failure>,
     notes: &mut Vec<String>,
 ) -> Vec<RemovedService> {
     let mut kept = Vec::new();
     for s in services.iter().rev() {
-        match ops.regw.import_file(&s.reg_file) {
+        match check_backup(ops, id, &s.reg_file, "service-*.reg").and_then(|()| ops.regw.import_file(&s.reg_file)) {
             Ok(()) => notes.push(format!("service-needs-reboot:{}", s.name)),
             Err(error) => {
                 failures.push(Failure { what: s.name.clone(), error });
@@ -515,13 +596,16 @@ pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
     if !valid_id(&m.id) {
         return RestoreOutcome::Partial(vec![Failure { what: m.id.0.clone(), error: "invalid quarantine id".to_string() }]);
     }
+    if let Err(error) = secure_manifest_dir(ops) {
+        return RestoreOutcome::Partial(vec![Failure { what: "manifest".to_string(), error }]);
+    }
     let mut failures = Vec::new();
     let mut left = m.clone();
     left.moved = restore_moved(ops, &m.id, &m.moved, &mut failures);
-    left.keys = restore_keys(ops, &m.keys, &mut failures);
-    left.values = restore_values(ops, &m.values, &mut failures);
-    left.tasks = restore_tasks(ops, &m.tasks, &mut failures);
-    left.services = restore_services(ops, &m.services, &mut failures, &mut left.notes);
+    left.keys = restore_keys(ops, &m.id, &m.keys, &mut failures);
+    left.values = restore_values(ops, &m.id, &m.values, &mut failures);
+    left.tasks = restore_tasks(ops, &m.id, &m.tasks, &mut failures);
+    left.services = restore_services(ops, &m.id, &m.services, &mut failures, &mut left.notes);
 
     let nothing_left = left.moved.is_empty()
         && left.keys.is_empty()
@@ -529,7 +613,7 @@ pub fn restore(ops: &QuarantineOps, m: &QuarantineManifest) -> RestoreOutcome {
         && left.tasks.is_empty()
         && left.services.is_empty();
     if nothing_left {
-        for dir in payload_dirs(ops, m) {
+        for dir in payload_dirs(ops, &m.id) {
             if let Err(e) = ops.mover.remove_all(&dir) {
                 log::warn!("quarantine {}: removing {}: {e}", m.id.0, dir.display());
             }
@@ -555,10 +639,15 @@ fn remove_manifest_folder(ops: &QuarantineOps, id: &QuarantineId) -> Result<(), 
 /// Deletes the payload folders and then the manifest folder for good. If a payload folder cannot
 /// be deleted the manifest is kept, so nothing is orphaned and the purge can be retried.
 pub fn purge(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
+    secure_manifest_dir(ops)?;
+    purge_secured(ops, m)
+}
+
+fn purge_secured(ops: &QuarantineOps, m: &QuarantineManifest) -> Result<(), String> {
     if !valid_id(&m.id) {
         return Err(format!("invalid quarantine id {:?}", m.id.0));
     }
-    let errors: Vec<String> = payload_dirs(ops, m).iter().filter_map(|d| ops.mover.remove_all(d).err()).collect();
+    let errors: Vec<String> = payload_dirs(ops, &m.id).iter().filter_map(|d| ops.mover.remove_all(d).err()).collect();
     if !errors.is_empty() {
         return Err(errors.join("; "));
     }
@@ -571,11 +660,15 @@ pub fn auto_purge(ops: &QuarantineOps, days: u32, now: DateTime<Utc>) -> Vec<Qua
     if days == 0 {
         return Vec::new();
     }
-    let cutoff = now - Duration::days(i64::from(days));
+    let Some(cutoff) = now.checked_sub_signed(Duration::days(i64::from(days))) else { return Vec::new() };
+    if let Err(e) = secure_manifest_dir(ops) {
+        log::warn!("auto-purge: {e}");
+        return Vec::new();
+    }
     list_manifests(&ops.manifest_dir)
         .into_iter()
         .filter(|m| m.created < cutoff)
-        .filter_map(|m| match purge(ops, &m) {
+        .filter_map(|m| match purge_secured(ops, &m) {
             Ok(()) => Some(m.id),
             Err(e) => {
                 log::warn!("auto-purge of quarantine {}: {e}", m.id.0);
@@ -728,6 +821,11 @@ mod tests {
         Failure { what: what.to_string(), error: error.to_string() }
     }
 
+    /// The mover log line for locking down the manifest dir.
+    fn ensure_manifest_dir(e: &Env) -> String {
+        format!("ensure {}", e.dir.path().display())
+    }
+
     #[test]
     fn new_id_is_timestamp_and_four_hex_digits() {
         let id = new_id(now()).0;
@@ -838,6 +936,7 @@ mod tests {
         assert_eq!(
             *e.mover.log.lock().unwrap(),
             vec![
+                ensure_manifest_dir(&e),
                 r"ensure D:\Stale Uninstaller".to_string(),
                 r"ensure D:\Stale Uninstaller\quarantine".to_string(),
                 format!(r"move D:\Games\Foo -> {}", d.display()),
@@ -875,6 +974,7 @@ mod tests {
         assert_eq!(
             *e.mover.log.lock().unwrap(),
             vec![
+                ensure_manifest_dir(&e),
                 format!(r"move {} -> C:\Apps\Foo", stored('C', &m, r"C\Apps\Foo").display()),
                 format!(r"move {} -> C:\Users\A\Desktop\Foo.lnk", stored('C', &m, r"C\Users\A\Desktop\Foo.lnk").display()),
                 format!(r"remove C:\Stale Uninstaller\quarantine\{}", m.id.0),
@@ -912,14 +1012,18 @@ mod tests {
         e.mover.add_file(r"D:\Games\Foo\a.pak", 5);
         e.mover.add_file(r"C:\Apps\Foo\b.dll", 1);
         let m = run(&e, &[dir_item(r"D:\Games\Foo"), dir_item(r"C:\Apps\Foo"), key_item(r"SOFTWARE\Foo")]);
+        // A payload folder on a drive the manifest does not mention is purged too.
+        e.mover.add_file(&format!(r"F:\Stale Uninstaller\quarantine\{}\stray.bin", m.id.0), 1);
         e.mover.log.lock().unwrap().clear();
 
         purge(&e.ops, &m).unwrap();
         assert_eq!(
             *e.mover.log.lock().unwrap(),
             vec![
+                ensure_manifest_dir(&e),
                 format!(r"remove C:\Stale Uninstaller\quarantine\{}", m.id.0),
                 format!(r"remove D:\Stale Uninstaller\quarantine\{}", m.id.0),
+                format!(r"remove F:\Stale Uninstaller\quarantine\{}", m.id.0),
             ]
         );
         assert!(m.moved.iter().all(|i| !e.mover.exists(&i.stored) && !e.mover.exists(&i.original)));
@@ -937,6 +1041,7 @@ mod tests {
         let new = quarantine(&e.ops, "New", &[dir_item(r"C:\New")], now() - Duration::days(5), &|_| {});
 
         assert_eq!(auto_purge(&e.ops, 0, now()), vec![]);
+        assert_eq!(auto_purge(&e.ops, u32::MAX, now()), vec![], "cutoff before chrono's range purges nothing");
         assert_eq!(list_manifests(e.dir.path()), vec![new.clone(), old.clone()], "newest first");
         assert_eq!(auto_purge(&e.ops, 30, now()), vec![old.id.clone()]);
         assert_eq!(list_manifests(e.dir.path()), vec![new.clone()]);
@@ -1005,5 +1110,116 @@ mod tests {
         assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")));
         assert!(!exists(&e, r"C:\Apps\Foo"));
         assert_eq!(list_manifests(e.dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn nested_child_listed_before_parent_is_covered_by_parent() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\foo.exe", 10);
+        e.mover.add_file(r"C:\Apps\Foo\Foo.lnk", 1);
+        let events = RefCell::new(Vec::new());
+        let items = [shortcut_item(r"C:\Apps\Foo\Foo.lnk"), dir_item(r"C:\Apps\Foo")];
+        let m = quarantine(&e.ops, "Foo", &items, now(), &|p| {
+            if let QuarantineProgress::Item { done, total, what } = p {
+                events.borrow_mut().push(format!("{done}/{total} {what}"));
+            }
+        });
+        assert!(m.failures.is_empty(), "{:?}", m.failures);
+        assert_eq!(m.moved, vec![MovedItem { original: PathBuf::from(r"C:\Apps\Foo"), stored: stored('C', &m, r"C\Apps\Foo"), is_dir: true, size: 11 }]);
+        assert!(e.mover.exists(&stored('C', &m, r"C\Apps\Foo\Foo.lnk")));
+        assert_eq!(e.mover.log.lock().unwrap().iter().filter(|l| l.starts_with("move")).count(), 1);
+        assert_eq!(events.into_inner(), vec![r"0/2 C:\Apps\Foo\Foo.lnk".to_string(), r"1/2 C:\Apps\Foo".to_string()]);
+    }
+
+    #[test]
+    fn nested_child_listed_after_parent_is_not_a_failure() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\foo.exe", 10);
+        e.mover.add_file(r"C:\Apps\Foo\cfg\settings.ini", 2);
+        e.mover.add_file(r"C:\Apps\FooBar\other.exe", 3);
+        let items = [
+            dir_item(r"C:\Apps\Foo"),
+            dir_item(r"c:\apps\foo\cfg"),
+            file_item(r"C:\Apps\Foo\cfg\settings.ini"),
+            dir_item(r"C:\Apps\FooBar"),
+        ];
+        let m = run(&e, &items);
+        assert!(m.failures.is_empty(), "{:?}", m.failures);
+        let originals: Vec<PathBuf> = m.moved.iter().map(|i| i.original.clone()).collect();
+        assert_eq!(originals, vec![PathBuf::from(r"C:\Apps\Foo"), PathBuf::from(r"C:\Apps\FooBar")], "a name-prefix sibling is not nested");
+        assert!(e.mover.exists(&stored('C', &m, r"C\Apps\Foo\cfg\settings.ini")));
+    }
+
+    #[test]
+    fn restore_refuses_reg_file_outside_manifest_dir() {
+        let e = env(FakeFs::new());
+        let m = run(&e, &[key_item(r"SOFTWARE\Foo"), key_item(r"SOFTWARE\Bar")]);
+        let mut tampered = m.clone();
+        let planted = e.dir.path().join("key-0.reg");
+        std::fs::write(&planted, "Windows Registry Editor Version 5.00").unwrap();
+        tampered.keys[0].reg_file = planted.clone();
+        tampered.keys[1].reg_file = e.dir.path().join(&m.id.0).join("evil.reg");
+        e.regw.log.lock().unwrap().clear();
+
+        let outside = |p: &Path| format!("backup file outside the quarantine folder: {}", p.display());
+        assert_eq!(
+            restore(&e.ops, &tampered),
+            RestoreOutcome::Partial(vec![
+                fail(r"HKLM\SOFTWARE\Bar", &outside(&tampered.keys[1].reg_file)),
+                fail(r"HKLM\SOFTWARE\Foo", &outside(&planted)),
+            ])
+        );
+        assert!(e.regw.log.lock().unwrap().is_empty(), "nothing imported");
+        assert_eq!(list_manifests(e.dir.path())[0].keys, tampered.keys);
+    }
+
+    #[test]
+    fn restore_refuses_task_backup_outside_manifest_dir() {
+        let e = env(FakeFs::new().text(&format!(r"{TASKS}\Foo\Updater"), "<Task>u</Task>"));
+        let m = run(&e, &[task_item(r"Foo\Updater")]);
+        let mut tampered = m.clone();
+        let other = tempfile::tempdir().unwrap();
+        tampered.tasks[0].xml_backup = other.path().join(&m.id.0).join("task-0.xml");
+        std::fs::create_dir_all(other.path().join(&m.id.0)).unwrap();
+        e.calls.lock().unwrap().clear();
+
+        let err = format!("backup file outside the quarantine folder: {}", tampered.tasks[0].xml_backup.display());
+        assert_eq!(restore(&e.ops, &tampered), RestoreOutcome::Partial(vec![fail(r"Foo\Updater", &err)]));
+        assert!(e.calls.lock().unwrap().is_empty(), "no task created");
+    }
+
+    #[test]
+    fn restore_refuses_reparse_in_destination() {
+        let e = env(FakeFs::new());
+        e.mover.add_file(r"C:\Apps\Foo\a.dll", 1);
+        let m = run(&e, &[dir_item(r"C:\Apps\Foo")]);
+        e.mover.set_reparse(r"C:\Apps");
+        assert_eq!(restore(&e.ops, &m), RestoreOutcome::Partial(vec![fail(r"C:\Apps\Foo", r"reparse-in-destination: C:\Apps")]));
+        assert!(e.mover.exists(&m.moved[0].stored.join("a.dll")));
+        assert!(!exists(&e, r"C:\Apps\Foo"));
+    }
+
+    #[test]
+    fn failed_group_save_stops_further_groups() {
+        let mut e = env(FakeFs::new().text(&format!(r"{TASKS}\Foo\Updater"), "<Task>u</Task>"));
+        // Stopping the service replaces the manifest folder with a file, so the next save fails.
+        let dir = e.dir.path().to_path_buf();
+        e.ops.stop_service = Box::new(move |_| {
+            for sub in std::fs::read_dir(&dir).unwrap().flatten() {
+                std::fs::remove_dir_all(sub.path()).unwrap();
+                std::fs::write(sub.path(), b"x").unwrap();
+            }
+            Ok(())
+        });
+        e.mover.add_file(r"C:\Apps\Foo\a.dll", 1);
+        let m = run(&e, &[service_item("FooSvc"), task_item(r"Foo\Updater"), key_item(r"SOFTWARE\Foo"), dir_item(r"C:\Apps\Foo")]);
+        assert_eq!(m.services.len(), 1);
+        assert_eq!(m.failures.len(), 1, "{:?}", m.failures);
+        assert_eq!(m.failures[0].what, "manifest");
+        assert!(m.failures[0].error.starts_with("manifest-save-failed: "), "{:?}", m.failures);
+        assert!(m.tasks.is_empty() && m.keys.is_empty() && m.moved.is_empty());
+        assert!(e.calls.lock().unwrap().is_empty(), "task not deleted");
+        assert_eq!(e.regw.log.lock().unwrap().len(), 1, "only the service export");
+        assert!(exists(&e, r"C:\Apps\Foo\a.dll"));
     }
 }

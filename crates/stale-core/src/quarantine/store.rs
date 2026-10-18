@@ -3,6 +3,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -31,7 +32,12 @@ pub fn save_manifest(dir: &Path, m: &QuarantineManifest) -> Result<(), String> {
     let json = serde_json::to_string_pretty(m).map_err(|e| e.to_string())?;
     let tmp = folder.join("manifest.json.tmp");
     let file = folder.join(MANIFEST_FILE);
-    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let write = |tmp: &Path| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    };
+    write(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &file).map_err(|e| format!("write {}: {e}", file.display()))
 }
 
