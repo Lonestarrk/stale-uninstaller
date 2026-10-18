@@ -3,7 +3,7 @@
 use super::{is_container_folder, is_skipped_folder, Evidence, InstalledIndex, RootKind};
 use crate::fsys::FsReader;
 use crate::keep::KeepList;
-use crate::leftovers::fs_scan::FsScanRoots;
+use crate::leftovers::fs_scan::{holds_user_data, FsScanRoots};
 use crate::leftovers::names::is_matchable;
 use crate::pathutil::{is_shared_root, norm};
 use std::collections::HashSet;
@@ -86,6 +86,7 @@ pub fn orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &Instal
                 size: fs.dir_size(dir),
                 modified: fs.modified(dir),
                 root_kind,
+                holds_user_data: holds_user_data(fs, dir),
             });
         }
     };
@@ -183,10 +184,36 @@ mod tests {
                 size: Some(42),
                 modified: Some(at),
                 root_kind: RootKind::ProgramFiles,
+                holds_user_data: false,
             }
         );
         let data = ev.iter().find(|e| matches!(e, Evidence::Folder { path, .. } if path.ends_with("Gone Corp App"))).unwrap();
         assert!(matches!(data, Evidence::Folder { root_kind: RootKind::ProgramData, size: Some(7), modified: None, .. }));
+    }
+
+    #[test]
+    fn user_data_child_is_flagged() {
+        let fs = FakeFs::new()
+            .dir(r"C:\Program Files\Old Game\Saves\slot1", 5)
+            .dir(r"C:\Program Files\Old Tool\bin", 1)
+            .dir(r"C:\Program Files\Deep Game\data\saves", 1);
+        let ev = scan(&fs, &[], &KeepList::default());
+        let mut flagged: Vec<(String, bool)> = ev
+            .iter()
+            .map(|e| match e {
+                Evidence::Folder { path, holds_user_data, .. } => (path.display().to_string(), *holds_user_data),
+                e => panic!("unexpected {e:?}"),
+            })
+            .collect();
+        flagged.sort();
+        assert_eq!(
+            flagged,
+            vec![
+                (r"C:\Program Files\Deep Game".to_string(), false),
+                (r"C:\Program Files\Old Game".to_string(), true),
+                (r"C:\Program Files\Old Tool".to_string(), false),
+            ]
+        );
     }
 
     #[test]

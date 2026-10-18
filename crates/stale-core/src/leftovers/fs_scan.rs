@@ -49,7 +49,7 @@ const USER_DATA_CHILDREN: &[&str] =
     &["userdata", "saves", "saved", "savegames", "screenshots", "profiles", "workspace", "projects"];
 
 /// True when `dir` has a direct child folder named like [`USER_DATA_CHILDREN`].
-fn holds_user_data(fs: &dyn FsReader, dir: &Path) -> bool {
+pub(crate) fn holds_user_data(fs: &dyn FsReader, dir: &Path) -> bool {
     fs.list_dir(dir)
         .iter()
         .filter(|e| e.is_dir)

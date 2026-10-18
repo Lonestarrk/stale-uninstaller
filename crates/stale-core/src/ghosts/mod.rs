@@ -22,7 +22,15 @@ use std::path::{Path, PathBuf};
 /// One trace a vanished program left behind.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Evidence {
-    Folder { path: PathBuf, size: Option<u64>, modified: Option<DateTime<Utc>>, root_kind: RootKind },
+    /// `holds_user_data`: a direct child is named like user data (`saves`, `profiles`, ...).
+    Folder {
+        path: PathBuf,
+        size: Option<u64>,
+        modified: Option<DateTime<Utc>>,
+        root_kind: RootKind,
+        #[serde(default)]
+        holds_user_data: bool,
+    },
     RegKeyMissingPath { key: RegKeyPath, value_name: String, path: PathBuf },
     RegKeyOrphan { key: RegKeyPath },
     /// `location` is the key path, `.lnk` path, service name or task name holding the reference.

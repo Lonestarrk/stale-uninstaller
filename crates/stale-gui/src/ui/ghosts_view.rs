@@ -202,6 +202,7 @@ mod tests {
             size: Some(3 * 1024 * 1024),
             modified: None,
             root_kind: RootKind::ProgramFiles,
+            holds_user_data: false,
         };
         assert_eq!(evidence_line(&folder), strings::evidence_folder(r"C:\Program Files\Foo", "3 MB"));
         let missing = Evidence::RegKeyMissingPath { key: key.clone(), value_name: "Path".into(), path: r"D:\Foo".into() };

@@ -65,6 +65,7 @@ pub(crate) mod tests {
                     size: Some(size),
                     modified: None,
                     root_kind: RootKind::ProgramFiles,
+                    holds_user_data: false,
                 },
                 Evidence::RegKeyOrphan { key: RegKeyPath { hive: Hive::LocalMachine, path: format!(r"SOFTWARE\{name}") } },
             ],

@@ -57,6 +57,8 @@ pub const REASON_SIBLING_OWNED: &str = "sibling-owned";
 pub const REASON_OTHER_PROFILE: &str = "other-profile";
 /// The name is an installed program's publisher (`Binary Fortress Software` for DisplayFusion).
 pub const REASON_PUBLISHER_OF_INSTALLED: &str = "publisher-of-installed";
+/// A folder holds a user-data subfolder (`saves`, `profiles`, ...); also the note of its item.
+pub const REASON_CONTAINS_USER_DATA: &str = crate::leftovers::NOTE_CONTAINS_USER_DATA;
 /// The only evidence is AppData folders.
 pub const REASON_APPDATA_ONLY: &str = "appdata-only";
 /// The only evidence is ProgramData and AppData folders (data, not a program).
@@ -276,6 +278,9 @@ fn assess(
     if folders().any(in_launcher_library) {
         reasons.push(REASON_LAUNCHER_LIBRARY);
     }
+    if evidence.iter().any(|e| matches!(e, Evidence::Folder { holds_user_data: true, .. })) {
+        reasons.push(REASON_CONTAINS_USER_DATA);
+    }
     if installed.matches_first_word(name) {
         reasons.push(REASON_FIRST_WORD);
     } else if installed.is_word_of_name(name) {
@@ -412,6 +417,12 @@ fn leftover_of(e: &Evidence, g: &Ghost, tasks_root: &Path) -> Option<Leftover> {
         }
     };
     Some(match e {
+        // The user's own files (saves, projects): never pre-checked, whatever the ghost.
+        Evidence::Folder { path, size, holds_user_data: true, .. } => Leftover {
+            kind: LeftoverKind::Dir { path: path.clone(), size: *size },
+            confidence: Confidence::Low,
+            note: Some(REASON_CONTAINS_USER_DATA.to_string()),
+        },
         Evidence::Folder { path, size, .. } => owned(LeftoverKind::Dir { path: path.clone(), size: *size }),
         Evidence::RegKeyMissingPath { key, .. } | Evidence::RegKeyOrphan { key } => {
             owned(LeftoverKind::RegKey { key: key.clone() })
@@ -507,7 +518,7 @@ mod tests {
     }
 
     fn folder(path: &str, size: u64, root_kind: RootKind) -> Evidence {
-        Evidence::Folder { path: path.into(), size: Some(size), modified: None, root_kind }
+        Evidence::Folder { path: path.into(), size: Some(size), modified: None, root_kind, holds_user_data: false }
     }
 
     fn pf(path: &str, size: u64) -> Evidence {
@@ -776,6 +787,35 @@ mod tests {
                 ("Gone Elsewhere".to_string(), Assessment::ProbablyUninstalled),
                 ("Gone Suite".to_string(), Assessment::ProbablyUninstalled),
                 ("Gone Viewer".to_string(), Assessment::ProbablyUninstalled),
+            ]
+        );
+    }
+
+    #[test]
+    fn ghost_folder_with_saves_is_low() {
+        let r = roots(&[]);
+        let saves = Evidence::Folder {
+            path: r"C:\Program Files\Old Game".into(),
+            size: Some(900),
+            modified: None,
+            root_kind: RootKind::ProgramFiles,
+            holds_user_data: true,
+        };
+        let ev = vec![saves, run(r"C:\Program Files\Old Game\game.exe", "OldGame")];
+        let ghosts = group_t(ev, &installed(&[]), &KeepList::default(), &r, None);
+        assert_eq!(summary(&ghosts), vec![("Old Game".to_string(), Assessment::Uncertain)]);
+        assert_eq!(reasons(&ghosts[0]), vec![REASON_CONTAINS_USER_DATA]);
+        let items: Vec<(LeftoverKind, Confidence, Option<String>)> =
+            to_leftovers(&ghosts[0], Path::new(r"C:\T")).items.into_iter().map(|l| (l.kind, l.confidence, l.note)).collect();
+        assert_eq!(
+            items,
+            vec![
+                (LeftoverKind::RegValue { key: key(Hive::CurrentUser, RUN), name: "OldGame".into() }, Confidence::High, None),
+                (
+                    LeftoverKind::Dir { path: r"C:\Program Files\Old Game".into(), size: Some(900) },
+                    Confidence::Low,
+                    Some("contains-user-data".into())
+                ),
             ]
         );
     }
