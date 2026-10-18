@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Test all: `cargo test --workspace`
 - Single test: `cargo test -p stale-core <name>` / `cargo test -p stale-gui <name>`
 - Live tests that read the real registry/Prefetch/shell are `#[ignore]`; run with `cargo test -p stale-core -- --ignored <name>` (some need elevation).
-- Lint: `cargo clippy --workspace --all-targets`
+- Lint: `cargo clippy --workspace --all-targets`; the code behind the debug-only `e2e-overrides` feature also needs `cargo clippy -p stale-core --all-targets --examples --features e2e-overrides` and `cargo test -p stale-core --features e2e-overrides`
 - Do not run `cargo fmt` on the workspace: the core is not rustfmt-formatted and the churn swamps reviews.
 
 ## Architecture

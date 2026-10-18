@@ -321,7 +321,16 @@ After run 3: `winget list --id Obsidian.Obsidian` → "No installed package foun
 key, no `%LOCALAPPDATA%\Programs\Obsidian`, no `%LOCALAPPDATA%\obsidian-updater`, no shortcuts, no
 `Markdown`/`PDF`/`Obsidian Canvas`/`Obsidian Base` ProgIDs, no `.canvas`/`.base`; `.md` and `.pdf`
 remain (see above). The manifest and payload folders were purged;
-`%LOCALAPPDATA%\Temp\stale-e2e-data` was deleted afterwards.
+`%LOCALAPPDATA%\Temp\stale-e2e-data` was deleted afterwards. Left behind on purpose:
+`C:\Stale Uninstaller\quarantine`, empty, created by runs 1–3 through `UnlockedFileMover` with
+an inherited (not locked-down) ACL. The real `RealFileMover::ensure_payload_root` locks it down
+the next time the application quarantines something on `C:`; it can also be deleted by hand.
+
+Review follow-up (fix round 1): `effective_install_dir` now also rejects temp, installer-cache
+and user folders; a program-named file type is listed only when its ProgID is missing or its
+handler exe is missing or inside the program's folder (so `.canvas`/`.base` are still found here,
+a live side-by-side Python's `.py` is not); a `<name>-data` folder is Low; the e2e build feature
+`e2e-overrides` is debug-only (`compile_error!` in release).
 
 | Step | Run 3 (vendor `/S`, Task 6c) |
 |---|---|

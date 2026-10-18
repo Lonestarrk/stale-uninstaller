@@ -289,7 +289,8 @@ fn main() -> ExitCode {
     println!("\n== 5. quarantine");
     let m = quarantine(&ops, &p.name, &checked, Utc::now(), &progress);
     print_manifest(&m, &ops);
-    let quarantined = m.failures.is_empty() && m.pending.is_empty() && !(m.moved.is_empty() && m.keys.is_empty());
+    let quarantined =
+        m.failures.is_empty() && m.pending.is_empty() && !(m.moved.is_empty() && m.keys.is_empty() && m.values.is_empty());
     steps.record("5 quarantine", quarantined, format!("{} moved, {} keys, {} values, {} failures", m.moved.len(), m.keys.len(), m.values.len(), m.failures.len()));
     if m.moved.is_empty() && m.keys.is_empty() && m.values.is_empty() {
         return finish(&steps);

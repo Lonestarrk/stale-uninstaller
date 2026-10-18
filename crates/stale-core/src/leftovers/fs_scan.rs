@@ -1,7 +1,7 @@
 //! Folders a program left behind.
 
 use super::names::{
-    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, name_matches_suffixed,
+    child_matches_in_container, name_matches, name_matches_exact, name_matches_first_word_only, matched_helper_suffix,
     publisher_matches,
 };
 use super::{mark_used_by_others, user_folder_relation, UserFolderRelation, USER_FOLDERS, Confidence, Leftover, LeftoverKind, ProgramHint, NOTE_CONTAINS_USER_DATA, NOTE_SUFFIX_MATCH};
@@ -98,9 +98,11 @@ pub fn scan_folders(fs: &dyn FsReader, roots: &FsScanRoots, hint: &ProgramHint) 
                 if !is_install(&entry.path) {
                     push(&entry.path, Confidence::Medium, None);
                 }
-            } else if name_matches_suffixed(&name, &hint.name) {
+            } else if let Some(suffix) = matched_helper_suffix(&name, &hint.name) {
+                // `<name>-data` may hold the user's own databases: listed, never preselected.
+                let confidence = if suffix == "data" { Confidence::Low } else { Confidence::Medium };
                 if !is_install(&entry.path) {
-                    push(&entry.path, Confidence::Medium, Some(NOTE_SUFFIX_MATCH));
+                    push(&entry.path, confidence, Some(NOTE_SUFFIX_MATCH));
                 }
             } else if name_matches_first_word_only(&name, &hint.name)
                 || hint.publisher.as_deref().is_some_and(|p| publisher_matches(&name, p))
@@ -274,6 +276,12 @@ mod tests {
             .profile(r"C:\Users\A");
         let out = scan_folders(&fs, &roots(), &hint("Obsidian", None, None));
         assert_eq!(dirs(&out), vec![(r"C:\Users\A\AppData\Local\obsidian-updater".to_string(), Confidence::Medium)]);
+        assert_eq!(out[0].note.as_deref(), Some("suffix-match"));
+
+        // A `-data` folder may hold the user's own databases: Low.
+        let fs = FakeFs::new().dir(r"C:\Users\A\AppData\Roaming\Obsidian_Data", 3).profile(r"C:\Users\A");
+        let out = scan_folders(&fs, &roots(), &hint("Obsidian", None, None));
+        assert_eq!(dirs(&out), vec![(r"C:\Users\A\AppData\Roaming\Obsidian_Data".to_string(), Confidence::Low)]);
         assert_eq!(out[0].note.as_deref(), Some("suffix-match"));
     }
 

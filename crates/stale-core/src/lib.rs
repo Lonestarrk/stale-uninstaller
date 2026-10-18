@@ -1,3 +1,6 @@
+#[cfg(all(feature = "e2e-overrides", not(debug_assertions)))]
+compile_error!("e2e-overrides is a debug-only feature");
+
 pub mod acl;
 pub mod devicepath;
 pub mod fsys;
