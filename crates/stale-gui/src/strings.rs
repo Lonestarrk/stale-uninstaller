@@ -1009,6 +1009,19 @@ pub fn checked_summary(checked: usize, total: usize, size: &str) -> String {
     }
 }
 
+/// A leftovers row's count: "2 av 5" / "2 of 5".
+pub fn items_checked(checked: usize, total: usize) -> String {
+    items_checked_in(lang(), checked, total)
+}
+
+/// [`items_checked`] in `lang`.
+pub fn items_checked_in(lang: Lang, checked: usize, total: usize) -> String {
+    match lang {
+        Lang::Sv => format!("{checked} av {total}"),
+        Lang::En => format!("{checked} of {total}"),
+    }
+}
+
 /// "4 objekt flyttade till karantän".
 pub fn moved_to_quarantine(count: usize) -> String {
     moved_to_quarantine_in(lang(), count)
@@ -1430,6 +1443,8 @@ mod tests {
         assert_eq!(moved_to_quarantine_in(Lang::En, 4), "4 items moved to quarantine");
         assert_eq!(section_counts_in(Lang::En, 1, "3 MB"), "(1 hit, 3 MB)");
         assert_eq!(section_counts_in(Lang::En, 3, "3 MB"), "(3 hits, 3 MB)");
+        assert_eq!(items_checked_in(Lang::Sv, 2, 5), "2 av 5");
+        assert_eq!(items_checked_in(Lang::En, 2, 5), "2 of 5");
         assert_eq!(run_count_in(Lang::En, 1), "1 run");
         assert_eq!(run_count_in(Lang::En, 5), "5 runs");
         assert_eq!(run_count_in(Lang::Sv, 5), "5 körningar");

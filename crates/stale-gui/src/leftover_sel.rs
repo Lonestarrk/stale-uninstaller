@@ -14,6 +14,9 @@ pub struct LeftoverGroup {
     pub program_name: String,
     pub items: Vec<Leftover>,
     pub checked: Vec<bool>,
+    /// The check marks `toggle_all` last cleared, so the next toggle (a double-click is two) puts
+    /// back what the user had chosen in the popup instead of the defaults.
+    remembered: Option<Vec<bool>>,
 }
 
 impl LeftoverSelection {
@@ -25,6 +28,7 @@ impl LeftoverSelection {
                 program_name: name.clone(),
                 items: report.items.clone(),
                 checked: report.items.iter().map(Leftover::default_checked).collect(),
+                remembered: None,
             })
             .collect();
         LeftoverSelection { groups }
@@ -34,6 +38,7 @@ impl LeftoverSelection {
     pub fn mark_safe(&mut self) {
         for g in &mut self.groups {
             g.checked = g.items.iter().map(Leftover::default_checked).collect();
+            g.remembered = None;
         }
     }
 
@@ -56,6 +61,28 @@ impl LeftoverSelection {
 }
 
 impl LeftoverGroup {
+    /// A row click: when any item is checked, uncheck all (remembering the choices); otherwise
+    /// restore the remembered choices, or check the `default_checked` items (Low is never one).
+    pub fn toggle_all(&mut self) {
+        if self.checked.iter().any(|c| *c) {
+            self.remembered = Some(std::mem::replace(&mut self.checked, vec![false; self.items.len()]));
+        } else {
+            self.checked = match self.remembered.take() {
+                Some(r) if r.len() == self.items.len() => r,
+                _ => self.items.iter().map(Leftover::default_checked).collect(),
+            };
+        }
+    }
+
+    pub fn checked_count(&self) -> usize {
+        self.checked.iter().filter(|c| **c).count()
+    }
+
+    /// The bytes the checked items free.
+    pub fn checked_bytes(&self) -> u64 {
+        self.checked_iter().map(|l| l.size().unwrap_or(0)).sum()
+    }
+
     fn checked_iter(&self) -> impl Iterator<Item = &Leftover> {
         self.items.iter().zip(&self.checked).filter(|(_, c)| **c).map(|(l, _)| l)
     }
@@ -99,6 +126,48 @@ mod tests {
         assert_eq!(sel.groups[1].program_name, "B");
         assert_eq!(sel.groups[1].checked, vec![true, true]);
         assert_eq!(sel.groups[1].items.len(), 2);
+    }
+
+    #[test]
+    fn toggle_all_unchecks_then_restores_defaults() {
+        let mut sel = selection();
+        let g = &mut sel.groups[0];
+        g.toggle_all();
+        assert_eq!(g.checked, vec![false, false]);
+        g.toggle_all();
+        assert_eq!(g.checked, vec![true, false]);
+        // With nothing default-checked, nothing gets checked.
+        let mut only_low = LeftoverSelection::from_reports(&[("L".to_string(), report(vec![dir(r"C:\Users\x\L", Confidence::Low, 1)]))]);
+        only_low.groups[0].toggle_all();
+        assert_eq!(only_low.groups[0].checked, vec![false]);
+    }
+
+    #[test]
+    fn toggle_all_never_checks_low_items() {
+        let mut sel = selection();
+        let g = &mut sel.groups[0];
+        g.checked = vec![false, false];
+        g.toggle_all();
+        assert_eq!(g.checked, vec![true, false]);
+    }
+
+    #[test]
+    fn toggle_all_twice_keeps_popup_choices() {
+        let mut sel = selection();
+        let g = &mut sel.groups[0];
+        g.checked = vec![false, true];
+        g.toggle_all();
+        g.toggle_all();
+        assert_eq!(g.checked, vec![false, true]);
+    }
+
+    #[test]
+    fn group_counts_and_bytes() {
+        let mut sel = selection();
+        assert_eq!((sel.groups[0].checked_count(), sel.groups[0].checked_bytes()), (1, 100));
+        sel.groups[0].checked[1] = true;
+        assert_eq!((sel.groups[0].checked_count(), sel.groups[0].checked_bytes()), (2, 150));
+        assert_eq!((sel.groups[1].checked_count(), sel.groups[1].checked_bytes()), (2, 7));
     }
 
     #[test]

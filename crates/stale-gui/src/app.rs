@@ -145,6 +145,8 @@ pub struct StaleApp {
     rx: Option<Receiver<ScanEvent>>,
     /// The leftovers view's items and check marks.
     pub leftovers: Option<LeftoverSelection>,
+    /// The group whose items the leftovers popup shows.
+    pub leftover_popup: Option<usize>,
     quarantine_rx: Option<Receiver<QuarantineEvent>>,
     /// `(done, total, what)` while checked leftovers are being moved to quarantine.
     pub removal_progress: Option<(usize, usize, String)>,
@@ -242,6 +244,7 @@ impl StaleApp {
             stop_waiting: None,
             rx: None,
             leftovers: None,
+            leftover_popup: None,
             quarantine_rx: None,
             removal_progress: None,
             removal_done: false,
@@ -598,6 +601,7 @@ impl StaleApp {
     /// Switches to the leftovers view with a fresh selection.
     fn show_leftovers(&mut self, sel: LeftoverSelection) {
         self.leftovers = Some(sel);
+        self.leftover_popup = None;
         self.removal_done = false;
         self.last_manifests.clear();
         self.view = View::Leftovers;
@@ -609,6 +613,7 @@ impl StaleApp {
     pub fn leave_leftovers(&mut self) {
         self.view = self.leftovers_origin;
         self.removal_plan = None;
+        self.leftover_popup = None;
         if self.removal_done {
             self.leftovers = None;
             self.removal_done = false;
