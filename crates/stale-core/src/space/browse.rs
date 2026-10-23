@@ -31,6 +31,8 @@ pub struct Child {
     pub is_dir: bool,
     /// `None` when a folder could not be measured.
     pub size: Option<u64>,
+    /// The size is a lower bound: something below could not be read.
+    pub partial: bool,
     pub blocked: Option<BlockReason>,
 }
 
@@ -41,6 +43,13 @@ fn in_program_files(n: &str) -> bool {
     }
     let Some(rest) = n.get(2..) else { return false };
     [r"\PROGRAM FILES", r"\PROGRAM FILES (X86)"].iter().any(|pf| rest == *pf || rest.strip_prefix(pf).is_some_and(|r| r.starts_with('\\')))
+}
+
+/// Folders only Windows cleans (`Windows.old` and the upgrade folders), as [`norm`]ed path components.
+const WINDOWS_OWNED: [&str; 4] = ["WINDOWS.OLD", "$WINDOWS.~BT", "$WINDOWS.~WS", "$WINDOWS.~TMP"];
+
+fn in_windows_owned(n: &str) -> bool {
+    n.split('\\').skip(1).any(|c| WINDOWS_OWNED.contains(&c))
 }
 
 /// `windows` and `profiles` are [`norm`]ed.
@@ -55,6 +64,7 @@ fn block_reason(path: &Path, windows: &str, profiles: &[String], installed: &Ins
         || n == windows
         || normed_under(&n, windows)
         || in_program_files(&n)
+        || in_windows_owned(&n)
         || is_shared_root(path)
         || (on_drive_root && never_listed(&name))
     {
@@ -69,6 +79,9 @@ fn block_reason(path: &Path, windows: &str, profiles: &[String], installed: &Ins
 /// The direct children of `dir`, largest first (unknown sizes last), at most `limit` of them, and
 /// how many more there are. Links are skipped; folders are measured.
 pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, own: &OwnPaths, limit: usize) -> (Vec<Child>, usize) {
+    if fs.is_reparse(dir) {
+        return (Vec::new(), 0);
+    }
     let windows = norm(&fs.windows_dir());
     let profiles: Vec<String> = fs.profile_dirs().iter().map(|p| norm(p)).collect();
     let mut out: Vec<Child> = fs
@@ -76,9 +89,15 @@ pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, own: 
         .into_iter()
         .filter(|e| !fs.is_reparse(&e.path))
         .map(|e| {
-            let size = if e.is_dir { fs.dir_size_partial(&e.path).map(|(s, _)| s) } else { Some(e.size) };
-            let blocked = block_reason(&e.path, &windows, &profiles, installed, own);
-            Child { path: e.path, is_dir: e.is_dir, size, blocked }
+            let (size, partial) = if e.is_dir {
+                match fs.dir_size_partial(&e.path) {
+                    Some((s, p)) => (Some(s), p),
+                    None => (None, false),
+                }
+            } else {
+                (Some(e.size), false)
+            };
+            Child { path: e.path, is_dir: e.is_dir, size, partial, blocked: None }
         })
         .collect();
     out.sort_by(|a, b| {
@@ -92,6 +111,9 @@ pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, own: 
     });
     let more = out.len().saturating_sub(limit);
     out.truncate(limit);
+    for c in &mut out {
+        c.blocked = block_reason(&c.path, &windows, &profiles, installed, own);
+    }
     (out, more)
 }
 
@@ -187,5 +209,44 @@ mod tests {
         assert_eq!(more, 0);
         let names: Vec<String> = c.iter().map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["Real", "f.bin"]);
+    }
+
+    #[test]
+    fn unknown_sizes_sort_last_and_partial_is_kept() {
+        let fs = FakeFs::new()
+            .dir(r"D:\Data\Locked", 0)
+            .unreadable(r"D:\Data\Locked")
+            .file(r"D:\Data\a.bin", 1)
+            .dir(r"D:\Data\Part\Sub", 0)
+            .file(r"D:\Data\Part\x.bin", 7)
+            .unreadable(r"D:\Data\Part\Sub");
+        let (i, o) = none();
+        let (c, _) = children(&fs, Path::new(r"D:\Data"), &i, &o, 10);
+        let names: Vec<String> = c.iter().map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["Part", "a.bin", "Locked"]);
+        assert_eq!(c.iter().map(|c| (c.size, c.partial)).collect::<Vec<_>>(), [(Some(7), true), (Some(1), false), (None, false)]);
+    }
+
+    #[test]
+    fn a_linked_dir_lists_nothing() {
+        let fs = FakeFs::new().dir(r"D:\Link\f", 5).reparse(r"D:\Link");
+        let (i, o) = none();
+        assert_eq!(children(&fs, Path::new(r"D:\Link"), &i, &o, 10), (vec![], 0));
+    }
+
+    #[test]
+    fn windows_owned_folders_are_blocked_at_any_depth() {
+        let fs = FakeFs::new()
+            .dir(r"D:\Windows.old\Users\x", 5)
+            .dir(r"C:\$WINDOWS.~BT\Sources", 5)
+            .dir(r"E:\$Windows.~WS\a\b\c", 5)
+            .dir(r"E:\$Windows.~TMP\z", 5)
+            .dir(r"D:\Other\Windows.older", 1);
+        let (i, o) = none();
+        let first = |d: &str| children(&fs, Path::new(d), &i, &o, 10).0[0].blocked;
+        for d in [r"D:\Windows.old", r"D:\Windows.old\Users", r"C:\$Windows.~BT", r"E:\$Windows.~WS\a\b", r"E:\$Windows.~TMP"] {
+            assert_eq!(first(d), Some(BlockReason::System), "{d}");
+        }
+        assert_eq!(first(r"D:\Other"), None);
     }
 }
