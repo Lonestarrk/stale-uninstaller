@@ -58,7 +58,7 @@ fn mb(bytes: u64) -> String {
 /// their evidence. Nothing is deleted.
 fn dump_ghosts() {
     let (tx, rx) = channel();
-    let scanner = std::thread::spawn(move || run_scan(ScanSources::live(), tx));
+    let scanner = std::thread::spawn(move || run_scan(ScanSources::live(all_accounts()), tx));
     let (mut programs, mut unmatched) = (Vec::new(), Vec::new());
     for event in rx {
         match event {
@@ -125,7 +125,7 @@ fn exe_names_under(dir: &Path) -> HashSet<String> {
 /// main exes, and every usage hit related to it with what matching did with it.
 fn dump_usage(name: &str) {
     let needle = name.to_lowercase();
-    let src = ScanSources::live();
+    let src = ScanSources::live(all_accounts());
     let programs = enumerate_programs(&*src.reg);
     let inputs = gather_usage(&src, &programs);
     for w in &inputs.warnings {
@@ -181,7 +181,7 @@ fn dump_usage(name: &str) {
 /// what the details panel shows about where it came from.
 fn dump_provenance(name: &str) {
     let needle = name.to_lowercase();
-    let src = ScanSources::live();
+    let src = ScanSources::live(all_accounts());
     let programs = enumerate_programs(&*src.reg);
     let inputs = gather_usage(&src, &programs);
     let result = match_usage(&inputs.match_input(&programs, &src.shortcut_targets));
@@ -199,6 +199,22 @@ fn dump_provenance(name: &str) {
         println!("installed:   {:?}", prov.install_date);
         println!("source:      {:?}", prov.source);
         println!("took:        {} ms", started.elapsed().as_millis());
+    }
+}
+
+/// `STALE_DUMP_ALL_ACCOUNTS=1`: lock the data folder down as the program does at start
+/// (`secure_data_dir`, which changes its ACL) so signed-out accounts' hives count too. Without it
+/// only signed-in accounts count and nothing is written.
+fn all_accounts() -> bool {
+    if std::env::var_os("STALE_DUMP_ALL_ACCOUNTS").is_none_or(|v| v != "1") {
+        return false;
+    }
+    match stale_core::paths::secure_data_dir() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("could not lock down the data folder, signed-out accounts left out: {e}");
+            false
+        }
     }
 }
 
@@ -238,7 +254,7 @@ fn main() {
         return;
     }
     let (tx, rx) = channel();
-    let scanner = std::thread::spawn(move || run_scan(ScanSources::live(), tx));
+    let scanner = std::thread::spawn(move || run_scan(ScanSources::live(all_accounts()), tx));
 
     let (mut programs, mut usage, mut sizes) = (Vec::new(), HashMap::new(), HashMap::new());
     let (mut warnings, mut unmatched) = (Vec::new(), 0);

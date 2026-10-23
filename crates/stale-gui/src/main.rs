@@ -75,6 +75,7 @@ fn main() -> eframe::Result {
     }
     // Before anything (the log included) is written below the data folder.
     let secured = stale_core::paths::secure_data_dir();
+    let data_dir_secured = secured.is_ok();
     if let Err(e) = &secured {
         eprintln!("could not lock down the data folder: {e}");
     }
@@ -82,7 +83,11 @@ fn main() -> eframe::Result {
     install_panic_hook();
     log::info!("Stale Uninstaller {} starting", stale_core::version());
     match secured {
-        Ok(warnings) => warnings.iter().for_each(|w| log::warn!("data folder: {w}")),
+        Ok(warnings) => {
+            warnings.iter().for_each(|w| log::warn!("data folder: {w}"));
+            // Hive copies a crashed scan left behind (`hives\*`).
+            stale_core::offline_hives::clean_stale_copies();
+        }
         Err(e) => log::warn!("could not lock down the data folder: {e}"),
     }
     // The data folder is ours now: the saved language, else the Windows display language.
@@ -99,7 +104,7 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
+    eframe::run_native(t().app_title, options, Box::new(move |cc| Ok(Box::new(StaleApp::new(cc, data_dir_secured)))))
 }
 
 /// `--uninstall-cleanup`, run by Stale's own uninstaller in two phases:

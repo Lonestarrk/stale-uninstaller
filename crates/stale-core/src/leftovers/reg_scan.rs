@@ -342,12 +342,23 @@ fn run_values(reg: &dyn RegistryReader, root: &RegKeyPath, target: &Target, foun
     }
 }
 
-/// `norm()`ed exes the `Run`/`RunOnce` values (HKLM, its WOW6432Node, HKCU) start at logon,
+/// `norm()`ed exes the `Run`/`RunOnce` values (HKLM, its WOW6432Node, HKCU and every
+/// `HKU\<SID>` the reader lists) start at logon,
 /// with the target a launcher names in its arguments (Squirrel's `Update.exe --processStart
 /// App.exe`, see [`autostart_targets`](crate::usage::matching::autostart_targets)). Unreadable
 /// keys contribute nothing.
 pub fn run_value_exes(reg: &dyn RegistryReader) -> HashSet<String> {
-    let roots = RegScanRoots::standard(reg).run;
+    let mut roots = RegScanRoots::standard(reg).run;
+    // Every account's own Run/RunOnce under HKU (`.DEFAULT` and `_Classes` are not accounts);
+    // one that is also HKCU adds nothing new to the set.
+    for sid in reg.subkeys(&key(Hive::Users, "")).unwrap_or_default() {
+        if sid.eq_ignore_ascii_case(".DEFAULT") || sid.to_lowercase().ends_with("_classes") {
+            continue;
+        }
+        for leaf in ["Run", "RunOnce"] {
+            roots.push(key(Hive::Users, &format!(r"{sid}\Software\Microsoft\Windows\CurrentVersion\{leaf}")));
+        }
+    }
     roots
         .iter()
         .filter_map(|root| reg.values(root).ok().map(|values| (root, values)))
@@ -518,6 +529,20 @@ mod tests {
         let exes = run_value_exes(&reg);
         assert_eq!(exes, HashSet::from([norm(&Path::new(INSTALL).join("foo.exe")), norm(Path::new(r"C:\Bar\bar.exe"))]));
         assert!(run_value_exes(&FakeRegistry::new()).is_empty());
+    }
+
+    #[test]
+    fn run_values_of_every_hku_sid_count() {
+        let mut reg = FakeRegistry::new();
+        let user_run = |sid: &str, leaf: &str| key(Hive::Users, &format!(r"{sid}\Software\Microsoft\Windows\CurrentVersion\{leaf}"));
+        reg.set(user_run("S-1-5-21-1", "Run"), "A", s(r"C:\A\a.exe"));
+        reg.set(user_run("S-1-5-21-1", "RunOnce"), "B", s(r#""C:\B\b.exe" /once"#));
+        // The same exe in HKCU and HKU counts once; .DEFAULT and _Classes are not accounts.
+        reg.set(key(Hive::CurrentUser, RUN), "A", s(r"C:\A\a.exe"));
+        reg.set(user_run(".DEFAULT", "Run"), "D", s(r"C:\D\d.exe"));
+        reg.set(user_run("S-1-5-21-1_Classes", "Run"), "C", s(r"C:\C\c.exe"));
+        let exes = run_value_exes(&reg);
+        assert_eq!(exes, HashSet::from([norm(Path::new(r"C:\A\a.exe")), norm(Path::new(r"C:\B\b.exe"))]));
     }
 
     #[test]

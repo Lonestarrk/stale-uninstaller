@@ -99,6 +99,12 @@ pub fn logs_dir() -> PathBuf {
     dir
 }
 
+/// `data_dir()\hives`: this scan's private copies of signed-out accounts' registry hives
+/// ([`crate::offline_hives`]). Not created here.
+pub fn hives_dir() -> PathBuf {
+    data_dir().join("hives")
+}
+
 /// The Users folder from `SHGetKnownFolderPath(FOLDERID_UserProfiles)`; `%SystemDrive%\Users`
 /// only when that fails.
 pub fn user_profiles_root() -> PathBuf {

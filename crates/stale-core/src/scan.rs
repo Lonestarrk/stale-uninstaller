@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 use crate::devicepath::WinDeviceMap;
 use crate::model::{Program, ProgramId};
+use crate::offline_hives::{load_for_scan, loaded_sids, profile_sids, HiveCache, LiveHiveOps, OfflineSlot, RootTrust, SlotGuard};
 use crate::pathutil::{exe_under, is_shared_root};
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
 use crate::services::service_exes;
-use crate::shortcuts::{resolve_lnk, shortcut_targets, start_menu_dirs, startup_dirs, ShortcutTarget};
+use crate::fsys::FsReader;
+use crate::shortcuts::{profile_start_menu_dirs, profile_startup_dirs, resolve_lnk, shortcut_targets, ShortcutTarget};
 use crate::usage::bam::BamProvider;
 use crate::usage::filetime::FileTimeProvider;
 use crate::usage::matching::{
@@ -71,6 +73,9 @@ pub type ResolveLnkFn = Box<dyn Fn(&Path) -> Option<ShortcutTarget> + Send>;
 /// Files named exactly `name` (e.g. `Discord.exe`) under a folder, at most 3 levels deep.
 pub type FindExesFn = Box<dyn Fn(&Path, &str) -> Vec<PathBuf> + Send>;
 
+/// Loads the signed-out accounts' hive copies for the usage readers; `None` loads nothing.
+pub type OfflineHivesFn = Box<dyn Fn() -> Option<SlotGuard> + Send>;
+
 /// Total size of a folder, `None` when it cannot be measured.
 pub type DirSizeFn = Box<dyn Fn(&Path) -> Option<u64> + Send>;
 
@@ -94,25 +99,37 @@ pub struct ScanSources {
     pub autostart_exes: Box<dyn Fn() -> HashSet<String> + Send>,
     /// Resolves `.lnk` hits (UserAssist records Start Menu launches by shortcut path).
     pub resolve_lnk: ResolveLnkFn,
+    /// Makes the signed-out accounts' hives readable to the usage readers (UserAssist, Run values)
+    /// until the guard drops; [`gather_usage`] holds it only while it gathers.
+    pub offline_hives: OfflineHivesFn,
 }
 
 impl ScanSources {
     /// The real machine: registry, BAM, UserAssist, Prefetch, Start Menu shortcuts, file system.
-    pub fn live() -> ScanSources {
+    /// UserAssist and Run values cover every account (signed-out ones through snapshots of their
+    /// hive copies, only when `data_dir_secured`: [`crate::paths::secure_data_dir`] succeeded in
+    /// this process), shortcuts every profile's Start Menu.
+    pub fn live(data_dir_secured: bool) -> ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
         // Usage matching rejects other profiles' Temp folders as install folders.
-        crate::leftovers::init_profile_roots(&crate::fsys::RealFs::live());
+        let fs = crate::fsys::RealFs::live();
+        crate::leftovers::init_profile_roots(&fs);
+        let profiles = fs.profile_dirs();
+        // UserAssist and Run values also see the signed-out accounts' hives while usage is gathered.
+        let slot = OfflineSlot::default();
+        let usage_reg: Arc<dyn RegistryReader> = Arc::new(slot.reader(reg.clone()));
+        let hives_reg = reg.clone();
         let system_root = crate::paths::windows_dir().to_string_lossy().into_owned();
         let services_reg = reg.clone();
-        let autostart_reg = reg.clone();
+        let autostart_reg = usage_reg.clone();
         ScanSources {
             providers: vec![
                 Box::new(BamProvider { reg: reg.clone(), map: Arc::new(WinDeviceMap::new()) }),
-                Box::new(UserAssistProvider { reg: reg.clone() }),
+                Box::new(UserAssistProvider { reg: usage_reg }),
                 Box::new(PrefetchProvider { dir: PathBuf::from(system_root).join("Prefetch") }),
             ],
             reg,
-            shortcut_targets: shortcut_targets(&start_menu_dirs()),
+            shortcut_targets: shortcut_targets(&profile_start_menu_dirs(&profiles)),
             list_root_exes: Box::new(crate::size::list_root_exes),
             find_exes: Box::new(crate::size::find_exes),
             dir_size: Box::new(crate::size::dir_size),
@@ -124,13 +141,26 @@ impl ScanSources {
             autostart_exes: Box::new(move || {
                 let mut exes = crate::leftovers::reg_scan::run_value_exes(&*autostart_reg);
                 exes.extend(
-                    shortcut_targets(&startup_dirs())
+                    shortcut_targets(&profile_startup_dirs(&profiles))
                         .iter()
                         .flat_map(|t| crate::usage::matching::autostart_targets(&t.path, &t.arguments)),
                 );
                 exes
             }),
             resolve_lnk: Box::new(resolve_lnk),
+            offline_hives: Box::new(move || {
+                let profiles = profile_sids(&*hives_reg, &crate::paths::windows_dir());
+                let hives = load_for_scan(
+                    data_dir_secured,
+                    &crate::paths::hives_dir(),
+                    &RootTrust::live(),
+                    &profiles,
+                    &loaded_sids(&*hives_reg),
+                    &LiveHiveOps::new(),
+                    HiveCache::process(),
+                )?;
+                Some(slot.fill(hives))
+            }),
         }
     }
 }
@@ -195,7 +225,8 @@ impl UsageInputs {
 }
 
 /// Reads root exes and Squirrel argument exes (in each program's [`usage_install_dir`]), every
-/// provider's hits and the service exes.
+/// provider's hits and the service exes. The offline hives (`src.offline_hives`) are loaded
+/// for the providers and autostart values and released before it returns.
 pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     let dirs: Vec<(&ProgramId, PathBuf)> =
         programs.iter().filter_map(|p| Some((&p.id, usage_install_dir(p, &src.shortcut_targets)?))).collect();
@@ -219,6 +250,7 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
         })
         .collect();
 
+    let offline = (src.offline_hives)();
     let (mut hits, mut warnings) = (Vec::new(), Vec::new());
     for provider in &src.providers {
         let (result, provider_warnings) = provider.collect_with_warnings();
@@ -230,7 +262,11 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     }
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
-    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, autostart_exes: (src.autostart_exes)(), warnings }
+    let autostart_exes = (src.autostart_exes)();
+    // The offline snapshots are released here, before matching and the scan's `Done` (their keys
+    // and copies are already gone).
+    drop(offline);
+    UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, autostart_exes, warnings }
 }
 
 /// Blocking. Stops early when the receiver hangs up.
@@ -341,7 +377,111 @@ mod tests {
             task_exes: Box::new(HashSet::new),
             autostart_exes: Box::new(HashSet::new),
             resolve_lnk: Box::new(|_: &Path| None),
+            offline_hives: Box::new(|| None),
         }
+    }
+
+    const OFFLINE_SID: &str = "S-1-5-21-9-1002";
+    const UA_COUNT: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count";
+
+    /// The UserAssist value of five launches of `exe`, the last on 2026-01-02.
+    fn userassist_value(hive: &mut FakeRegistry, exe: &str) {
+        let mut data = vec![0u8; 72];
+        data[4..8].copy_from_slice(&5u32.to_le_bytes());
+        let ft = (Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap().timestamp() as u64 + 11_644_473_600) * 10_000_000;
+        data[60..68].copy_from_slice(&ft.to_le_bytes());
+        hive.set(key(Hive::Users, UA_COUNT), &crate::usage::userassist::rot13(exe), RegValue::Binary(data));
+    }
+
+    /// `src` with its usage readers going through an `OfflineSlot` that `offline_hives` fills with
+    /// `hive` as the signed-out account [`OFFLINE_SID`]; the slot is returned too.
+    fn with_offline_hive(mut src: ScanSources, hive: FakeRegistry) -> (ScanSources, crate::offline_hives::OfflineSlot) {
+        use crate::offline_hives::{fake::FakeHiveOps, OfflineHives, OfflineSlot};
+        let slot = OfflineSlot::default();
+        let usage_reg: Arc<dyn RegistryReader> = Arc::new(slot.reader(src.reg.clone()));
+        src.providers = vec![Box::new(UserAssistProvider { reg: usage_reg.clone() })];
+        src.autostart_exes = Box::new(move || crate::leftovers::reg_scan::run_value_exes(&*usage_reg));
+        let ops = std::sync::Mutex::new(Some(FakeHiveOps::default().with(r"C:\Users\b", hive)));
+        let fill = slot.clone();
+        src.offline_hives = Box::new(move || {
+            let ops = ops.lock().unwrap().take()?;
+            let profiles = [(OFFLINE_SID.to_string(), PathBuf::from(r"C:\Users\b"))];
+            let cache = crate::offline_hives::HiveCache::default();
+            Some(fill.fill(OfflineHives::load(&profiles, &HashSet::new(), &ops, &cache)))
+        });
+        (src, slot)
+    }
+
+    #[test]
+    fn overlay_reads_offline_userassist() {
+        let mut hive = FakeRegistry::new();
+        userassist_value(&mut hive, r"D:\Apps\Alpha\main.exe");
+        let (src, slot) = with_offline_hive(sources(FixedProvider(Ok(vec![]))), hive);
+        let programs = enumerate_programs(&*src.reg);
+        let inputs = gather_usage(&src, &programs);
+        assert!(!slot.is_filled(), "the hives are released before gather_usage returns");
+        let hit = inputs.hits.iter().find(|h| h.exe_path == Path::new(r"D:\Apps\Alpha\main.exe")).expect("offline hit");
+        assert_eq!((hit.source, hit.run_count), (UsageSource::UserAssist, Some(5)));
+        let usage = match_usage(&inputs.match_input(&programs, &src.shortcut_targets)).by_program;
+        let alpha = usage.keys().find(|id| id.0.ends_with("Alpha")).expect("Alpha has usage");
+        assert_eq!(usage[alpha].last_used.source, Some(UsageSource::UserAssist));
+    }
+
+    #[test]
+    fn run_values_of_offline_users_mark_autostart() {
+        let mut hive = FakeRegistry::new();
+        let run_key = key(Hive::Users, r"Software\Microsoft\Windows\CurrentVersion\Run");
+        hive.set(run_key, "Beta", RegValue::Str(r#""D:\Apps\Beta\main.exe" --tray"#.into()));
+        let (src, slot) = with_offline_hive(sources(FixedProvider(Ok(vec![]))), hive);
+        let programs = enumerate_programs(&*src.reg);
+        let inputs = gather_usage(&src, &programs);
+        assert!(!slot.is_filled());
+        let beta = crate::pathutil::norm(Path::new(r"D:\Apps\Beta\main.exe"));
+        assert!(inputs.autostart_exes.contains(&beta), "{:?}", inputs.autostart_exes);
+    }
+
+    #[test]
+    fn program_list_ignores_offline_hives() {
+        let mut hive = FakeRegistry::new();
+        let ghost = key(Hive::Users, r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Ghost");
+        hive.set(ghost, "DisplayName", RegValue::Str("Ghost".into()));
+        userassist_value(&mut hive, r"D:\Apps\Alpha\main.exe");
+        let (src, slot) = with_offline_hive(sources(FixedProvider(Ok(vec![]))), hive);
+        let events = run(src);
+        assert!(!slot.is_filled());
+        let ScanEvent::Programs(programs) = &events[0] else { unreachable!() };
+        assert!(programs.iter().all(|p| p.name != "Ghost"), "{programs:?}");
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let alpha = usage.keys().find(|id| id.0.ends_with("Alpha")).expect("the overlay was in use for usage");
+        assert_eq!(usage[alpha].last_used.source, Some(UsageSource::UserAssist));
+    }
+
+    #[test]
+    fn start_menu_of_every_profile_feeds_main_exe_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        let menu = b.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
+        std::fs::create_dir_all(menu.join("Startup")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        crate::shortcuts::tests::write_lnk(&menu.join("Gamma.lnk"), Path::new(r"D:\Apps\Gamma\gamma.exe"));
+        let dirs = crate::shortcuts::profile_start_menu_dirs(&[a.clone(), b.clone()]);
+        assert!(dirs.contains(&menu), "{dirs:?}");
+        assert!(!dirs.iter().any(|d| d.starts_with(&a)), "missing folders are left out: {dirs:?}");
+        let startup = crate::shortcuts::profile_startup_dirs(&[a, b.clone(), b]);
+        assert_eq!(startup.iter().filter(|d| d.starts_with(tmp.path())).collect::<Vec<_>>(), [&menu.join("Startup")]);
+
+        let mut reg = FakeRegistry::new();
+        add_program(&mut reg, "Gamma", r"D:\Apps\Gamma", false);
+        let mut src = sources(FixedProvider(Ok(vec![hit(r"D:\Apps\Gamma\gamma.exe")])));
+        src.reg = Arc::new(reg);
+        src.list_root_exes = Box::new(|dir: &Path| vec![(dir.join("big.exe"), 900), (dir.join("gamma.exe"), 100)]);
+        src.shortcut_targets = shortcut_targets(&dirs);
+        let events = run(src);
+        let ScanEvent::Usage(usage) = &events[1] else { unreachable!() };
+        let gamma = usage.keys().find(|id| id.0.ends_with("Gamma")).unwrap();
+        let main: Vec<_> = usage[gamma].exes.iter().filter(|e| e.is_main).map(|e| e.exe_path.clone()).collect();
+        assert_eq!(main, [PathBuf::from(r"D:\Apps\Gamma\gamma.exe")]);
     }
 
     fn run(src: ScanSources) -> Vec<ScanEvent> {
