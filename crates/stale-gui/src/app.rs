@@ -197,12 +197,18 @@ pub struct StaleApp {
     provenance_rx: HashMap<ProgramId, Receiver<Provenance>>,
 }
 
+/// The interface zoom when none is saved.
+pub const DEFAULT_UI_SCALE: f32 = 1.5;
+/// The sizes offered in the settings menu.
+pub const UI_SCALES: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+
 impl StaleApp {
     /// Loads settings and starts the background scan. `data_dir_secured`: `secure_data_dir`
     /// succeeded at start (signed-out accounts' hives may then be read for "last used").
     pub fn new(cc: &eframe::CreationContext, data_dir_secured: bool) -> Self {
         crate::ui::apply_style(&cc.egui_ctx);
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
+        cc.egui_ctx.set_zoom_factor(app.ui_scale());
         app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
         app.data_dir_secured = data_dir_secured;
         let id = session::identity();
@@ -430,6 +436,30 @@ impl StaleApp {
         if let Err(e) = self.settings.save_to(path) {
             log::warn!("could not save settings to {}: {e}", path.display());
         }
+    }
+
+    /// The interface zoom factor: the saved one, else [`DEFAULT_UI_SCALE`].
+    pub fn ui_scale(&self) -> f32 {
+        self.settings.ui_scale.unwrap_or(DEFAULT_UI_SCALE)
+    }
+
+    /// Saves `scale` as the interface zoom (the caller applies it to the egui context).
+    pub fn set_ui_scale_at(&mut self, scale: f32, path: &Path) {
+        self.settings.ui_scale = Some(scale);
+        if let Err(e) = self.settings.save_to(path) {
+            log::warn!("could not save settings to {}: {e}", path.display());
+        }
+    }
+
+    /// Saves a zoom changed with the keyboard (Ctrl + / - / 0); true when it differed from the
+    /// stored scale. Called every frame, saves only on a change.
+    fn sync_zoom_at(&mut self, zoom: f32, path: &Path) -> bool {
+        let zoom = (zoom * 100.0).round() / 100.0;
+        if (zoom - self.ui_scale()).abs() < 0.005 {
+            return false;
+        }
+        self.set_ui_scale_at(zoom, path);
+        true
     }
 
     /// Opens the summary dialog for the checked rows that are visible under the current filters.
@@ -995,6 +1025,7 @@ impl eframe::App for StaleApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Utc::now();
+        self.sync_zoom_at(ui.ctx().zoom_factor(), &Settings::path());
         egui::Panel::top("top").show(ui, |ui| {
             toolbar::show(ui, self);
             if !self.warnings.is_empty() {
@@ -1486,6 +1517,35 @@ mod tests {
 
     /// Swedish only: the language is process-wide and other tests running in parallel expect
     /// Swedish text.
+    #[test]
+    fn ui_scale_defaults_to_150_percent() {
+        let app = StaleApp::empty(Settings::default());
+        assert_eq!(app.ui_scale(), 1.5);
+        assert!(UI_SCALES.contains(&DEFAULT_UI_SCALE));
+    }
+
+    #[test]
+    fn set_ui_scale_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings::default());
+        app.set_ui_scale_at(1.25, &path);
+        assert_eq!(app.ui_scale(), 1.25);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(1.25));
+    }
+
+    #[test]
+    fn keyboard_zoom_is_saved_once_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings::default());
+        assert!(!app.sync_zoom_at(1.5, &path), "unchanged: nothing saved");
+        assert!(!path.exists());
+        assert!(app.sync_zoom_at(1.6000001, &path));
+        assert!(!app.sync_zoom_at(1.6000001, &path), "same value again is not saved again");
+        assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(1.6));
+    }
+
     #[test]
     fn chosen_language_is_saved() {
         let dir = tempfile::tempdir().unwrap();

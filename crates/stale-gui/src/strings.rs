@@ -144,6 +144,8 @@ pub struct Strings {
     pub kept_menu: &'static str,
     /// The language submenu; the same in both languages.
     pub language_menu: &'static str,
+    /// The interface size submenu.
+    pub size_menu: &'static str,
     /// Same in both languages.
     pub lang_sv: &'static str,
     /// Same in both languages.
@@ -435,6 +437,7 @@ pub static SV: Strings = Strings {
     auto_purge_days: "Töm karantän automatiskt efter N dagar",
     auto_purge_off: "(av)",
     kept_menu: "Behållna…",
+    size_menu: "Storlek",
     language_menu: "Språk / Language",
     lang_sv: "Svenska",
     lang_en: "English",
@@ -693,6 +696,7 @@ pub static EN: Strings = Strings {
     auto_purge_days: "Empty the quarantine automatically after N days",
     auto_purge_off: "(off)",
     kept_menu: "Keep list…",
+    size_menu: "Size",
     language_menu: "Språk / Language",
     lang_sv: "Svenska",
     lang_en: "English",

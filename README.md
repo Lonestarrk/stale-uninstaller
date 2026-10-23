@@ -20,6 +20,7 @@ Download the latest installer from the [Releases page](https://github.com/Lonest
 - **Standalone leftover search** by name for programs that are no longer in the list.
 - **Safety first.** Runs as administrator and treats everything it touches with suspicion: system tools are loaded only from System32, quarantine folders are locked down to administrators, junctions are refused, and nothing is deleted outright.
 - **English and Swedish.** Follows the Windows display language on first start; switch any time in the settings menu.
+- **Adjustable size.** The interface opens at 150 %; pick 100-200 % in the settings menu or zoom with Ctrl +, Ctrl - and Ctrl 0. The choice is remembered.
 - **Installer that cleans up after itself.** Uninstalling Stale removes its data too; if the quarantine still holds anything, you choose whether to empty it, keep it, or cancel the uninstall.
 
 ## Future features

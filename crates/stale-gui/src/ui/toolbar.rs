@@ -38,6 +38,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         let mut save_days = false;
         let mut open_kept = false;
         let mut chosen_lang = None;
+        let mut chosen_scale = None;
         ui.menu_button(strings::t().settings_menu, |ui| {
             toggled = ui.checkbox(&mut show_hidden, strings::t().show_hidden).changed();
             ui.horizontal(|ui| {
@@ -53,6 +54,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 open_kept = true;
                 ui.close();
             }
+            ui.menu_button(strings::t().size_menu, |ui| {
+                let current = app.ui_scale();
+                for scale in crate::app::UI_SCALES {
+                    let label = format!("{} %", (scale * 100.0).round() as u32);
+                    if ui.radio((current - scale).abs() < 0.005, label).clicked() {
+                        chosen_scale = Some(scale);
+                        ui.close();
+                    }
+                }
+            });
             ui.menu_button(strings::t().language_menu, |ui| {
                 let current = strings::lang();
                 for (lang, label) in [(strings::Lang::Sv, strings::t().lang_sv), (strings::Lang::En, strings::t().lang_en)] {
@@ -63,6 +74,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 }
             });
         });
+        if let Some(scale) = chosen_scale {
+            ui.ctx().set_zoom_factor(scale);
+            app.set_ui_scale_at(scale, &stale_core::settings::Settings::path());
+        }
         if let Some(lang) = chosen_lang {
             app.set_language(lang);
         }
