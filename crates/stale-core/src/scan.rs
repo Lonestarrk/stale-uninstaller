@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::devicepath::WinDeviceMap;
 use crate::model::{Program, ProgramId};
-use crate::offline_hives::{loaded_sids, profile_sids, LiveHiveOps, OfflineHives, OfflineSlot, SlotGuard};
+use crate::offline_hives::{load_for_scan, loaded_sids, profile_sids, HiveCache, LiveHiveOps, OfflineSlot, RootTrust, SlotGuard};
 use crate::pathutil::{exe_under, is_shared_root};
 use crate::programs::enumerate_programs;
 use crate::registry::{RegistryReader, WinRegistry};
@@ -106,9 +106,10 @@ pub struct ScanSources {
 
 impl ScanSources {
     /// The real machine: registry, BAM, UserAssist, Prefetch, Start Menu shortcuts, file system.
-    /// UserAssist and Run values cover every account (signed-out ones through their hive copies),
-    /// shortcuts every profile's Start Menu.
-    pub fn live() -> ScanSources {
+    /// UserAssist and Run values cover every account (signed-out ones through snapshots of their
+    /// hive copies, only when `data_dir_secured`: [`crate::paths::secure_data_dir`] succeeded in
+    /// this process), shortcuts every profile's Start Menu.
+    pub fn live(data_dir_secured: bool) -> ScanSources {
         let reg: Arc<dyn RegistryReader> = Arc::new(WinRegistry);
         // Usage matching rejects other profiles' Temp folders as install folders.
         let fs = crate::fsys::RealFs::live();
@@ -149,7 +150,15 @@ impl ScanSources {
             resolve_lnk: Box::new(resolve_lnk),
             offline_hives: Box::new(move || {
                 let profiles = profile_sids(&*hives_reg, &crate::paths::windows_dir());
-                let hives = OfflineHives::load(&profiles, &loaded_sids(&*hives_reg), &LiveHiveOps::new());
+                let hives = load_for_scan(
+                    data_dir_secured,
+                    &crate::paths::hives_dir(),
+                    &RootTrust::live(),
+                    &profiles,
+                    &loaded_sids(&*hives_reg),
+                    &LiveHiveOps::new(),
+                    HiveCache::process(),
+                )?;
                 Some(slot.fill(hives))
             }),
         }
@@ -254,7 +263,8 @@ pub fn gather_usage(src: &ScanSources, programs: &[Program]) -> UsageInputs {
     let mut hits = resolve_lnk_hits(hits, &*src.resolve_lnk);
     hits.extend((src.file_times)(&mains));
     let autostart_exes = (src.autostart_exes)();
-    // The copies are closed and deleted here, before matching and the scan's `Done`.
+    // The offline snapshots are released here, before matching and the scan's `Done` (their keys
+    // and copies are already gone).
     drop(offline);
     UsageInputs { root_exes, arg_exes, hits, service_exes, task_exes, autostart_exes, warnings }
 }
@@ -397,7 +407,8 @@ mod tests {
         src.offline_hives = Box::new(move || {
             let ops = ops.lock().unwrap().take()?;
             let profiles = [(OFFLINE_SID.to_string(), PathBuf::from(r"C:\Users\b"))];
-            Some(fill.fill(OfflineHives::load(&profiles, &HashSet::new(), &ops)))
+            let cache = crate::offline_hives::HiveCache::default();
+            Some(fill.fill(OfflineHives::load(&profiles, &HashSet::new(), &ops, &cache)))
         });
         (src, slot)
     }

@@ -16,7 +16,7 @@ use windows::Win32::Security::{
     GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW, ACE_HEADER, ACE_REVISION, INHERITED_ACE,
     SE_DACL_PROTECTED, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    SE_BACKUP_NAME, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::CreateDirectoryW;
@@ -69,10 +69,11 @@ impl Drop for Sd {
 /// Serializes privilege changes: each lock-down enables the privileges and restores them after.
 static PRIVILEGES: Mutex<()> = Mutex::new(());
 
-/// SeRestorePrivilege and SeTakeOwnershipPrivilege enabled on the process token (so an elevated
-/// process can always make Administrators the owner) while this guard lives; dropping it puts
-/// back their previous state. Unheld privileges are ignored.
-struct OwnerPrivileges {
+/// Privileges enabled on the process token while this guard lives; dropping it puts back their
+/// previous state. Unheld privileges are ignored. [`OwnerPrivileges::enable`] enables
+/// SeRestorePrivilege and SeTakeOwnershipPrivilege (so an elevated process can always make
+/// Administrators the owner); [`backup_privilege`] enables SeBackupPrivilege.
+pub(crate) struct OwnerPrivileges {
     _lock: MutexGuard<'static, ()>,
     token: HANDLE,
     previous: Vec<TOKEN_PRIVILEGES>,
@@ -80,6 +81,10 @@ struct OwnerPrivileges {
 
 impl OwnerPrivileges {
     fn enable() -> OwnerPrivileges {
+        OwnerPrivileges::enable_named(&[SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME])
+    }
+
+    fn enable_named(names: &[PCWSTR]) -> OwnerPrivileges {
         let lock = PRIVILEGES.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = OwnerPrivileges { _lock: lock, token: HANDLE::default(), previous: Vec::new() };
         // SAFETY: the pseudo handle needs no closing; `token` is closed in `drop`.
@@ -87,7 +92,7 @@ impl OwnerPrivileges {
             guard.token = HANDLE::default();
             return guard;
         }
-        for name in [SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME] {
+        for &name in names {
             let mut luid = LUID::default();
             // SAFETY: `name` is a static NUL-terminated string; `luid` is a valid local.
             if unsafe { LookupPrivilegeValueW(PCWSTR::null(), name, &mut luid) }.is_err() {
@@ -118,6 +123,13 @@ impl OwnerPrivileges {
         }
         guard
     }
+}
+
+/// SeBackupPrivilege enabled while the guard lives: with `FILE_FLAG_BACKUP_SEMANTICS`, an open for
+/// reading then passes even a DACL that excludes Administrators. Never nest it with another
+/// guard of this module (they share one lock).
+pub(crate) fn backup_privilege() -> OwnerPrivileges {
+    OwnerPrivileges::enable_named(&[SE_BACKUP_NAME])
 }
 
 impl Drop for OwnerPrivileges {

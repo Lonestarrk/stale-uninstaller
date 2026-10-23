@@ -126,6 +126,8 @@ pub enum KeepEntry {
 }
 
 pub struct StaleApp {
+    /// The data folder was locked down at start: scans may copy signed-out accounts' hives.
+    pub data_dir_secured: bool,
     pub rows: Vec<Row>,
     pub settings: Settings,
     pub scanning: bool,
@@ -196,17 +198,19 @@ pub struct StaleApp {
 }
 
 impl StaleApp {
-    /// Loads settings and starts the background scan.
-    pub fn new(cc: &eframe::CreationContext) -> Self {
+    /// Loads settings and starts the background scan. `data_dir_secured`: `secure_data_dir`
+    /// succeeded at start (signed-out accounts' hives may then be read for "last used").
+    pub fn new(cc: &eframe::CreationContext, data_dir_secured: bool) -> Self {
         crate::ui::apply_style(&cc.egui_ctx);
         let mut app = StaleApp::empty(Settings::load_from(&Settings::path()));
         app.keep = KeepList::load_from(&stale_core::paths::keep_list_path());
+        app.data_dir_secured = data_dir_secured;
         let id = session::identity();
         if session::runs_as_other_account(&id) {
             let session = id.session_user.clone().unwrap_or_default();
             app.warnings.push(Warning::OtherAccount { session, token: id.token_user.clone() });
         }
-        app.rx = Some(worker::spawn_scan());
+        app.rx = Some(worker::spawn_scan(app.data_dir_secured));
         app.scanning = true;
         // For the toolbar's count.
         app.refresh_quarantine();
@@ -216,6 +220,7 @@ impl StaleApp {
     /// State with no scan running.
     pub fn empty(settings: Settings) -> Self {
         StaleApp {
+            data_dir_secured: false,
             rows: Vec::new(),
             settings,
             scanning: false,
@@ -265,7 +270,7 @@ impl StaleApp {
     /// Drops all scan results and starts a new scan.
     pub fn refresh(&mut self) {
         self.clear_scan_data();
-        self.rx = Some(worker::spawn_scan());
+        self.rx = Some(worker::spawn_scan(self.data_dir_secured));
         self.scanning = true;
     }
 

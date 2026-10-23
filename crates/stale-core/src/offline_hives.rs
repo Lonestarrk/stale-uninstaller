@@ -1,25 +1,146 @@
 //! Signed-out accounts' `NTUSER.DAT`, made readable for the usage sources (UserAssist and Run
 //! values) without touching the original.
 //!
+//! Only when the data folder was locked down at start-up (`data_dir_secured`) and its `hives`
+//! folder, when present, is a plain folder owned by Administrators or SYSTEM ([`root_trusted`]);
+//! otherwise the scan uses the live registry alone.
+//!
 //! Each hive not already loaded under `HKU` is copied, with its `.LOG1`/`.LOG2`, into a private
-//! folder below `%ProgramData%\Stale Uninstaller\hives` (admin-only DACL), and only the copy is
-//! loaded, read-only, with `RegLoadAppKeyW`. [`UsersOverlay`] shows each copy as `HKU\<SID>`.
-//! Dropping [`OfflineHives`] closes every key and deletes the copies; a crash leaves them to
-//! [`clean_stale_copies`] at the next start. The program list, leftover scanners, ghosts and
-//! quarantine never see the overlay.
+//! folder `hives\<random>` below `%ProgramData%\Stale Uninstaller` (admin-only DACL). The source
+//! is opened with backup semantics while SeBackupPrivilege is enabled, so a hive whose ACL leaves
+//! out Administrators is still read; the open shares read and write, so the owner is never locked
+//! out. Only the copy is loaded, read-only, with `RegLoadAppKeyW`. The keys the usage sources read
+//! ([`snapshot_keys`]) are taken into memory ([`HiveSnapshot`]), then the key is closed and the
+//! copies are deleted before [`OfflineHives::load`] returns; a crash leaves them to
+//! [`clean_stale_copies`] at the next start. The snapshots are cached for the life of the process
+//! by SID, hive size and last write ([`HiveCache`]), so a refresh with unchanged signed-out hives
+//! copies nothing. [`UsersOverlay`] shows each snapshot as `HKU\<SID>`.
+//!
+//! A user signing in while the copy runs: the profile service opens the hive exclusively, so our
+//! open fails (that profile is skipped this scan) or the profile service waits for our brief read;
+//! the live hive is never changed by us. A user signed in but not yet under `HKU` is skipped the
+//! same way.
+//!
+//! The program list, leftover scanners, ghosts and quarantine never see the overlay. Other
+//! profiles' Start Menu shortcuts ([`crate::shortcuts::profile_start_menu_dirs`]) only steer the
+//! main-exe choice and labels, never what is removed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::model::{Hive, RegKeyPath};
 use crate::pathutil::{norm, normed_under};
 use crate::registry::{key, RegError, RegValue, RegistryReader};
+use crate::usage::userassist::{USERASSIST_EXE_GUID, USERASSIST_LNK_GUID};
 
 /// A profile's registry hive file.
 pub const HIVE_FILE: &str = "NTUSER.DAT";
 /// The hive's transaction logs, copied along when present.
 const HIVE_LOGS: [&str; 2] = ["NTUSER.DAT.LOG1", "NTUSER.DAT.LOG2"];
+
+const USERASSIST: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist";
+
+/// The keys (paths inside a hive) the usage sources read from an offline hive: UserAssist's two
+/// `Count` keys and `Run`/`RunOnce`. A usage reader that needs more from other accounts must add
+/// its keys here.
+pub fn snapshot_keys() -> [String; 4] {
+    [
+        format!(r"{USERASSIST}\{USERASSIST_EXE_GUID}\Count"),
+        format!(r"{USERASSIST}\{USERASSIST_LNK_GUID}\Count"),
+        r"Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        r"Software\Microsoft\Windows\CurrentVersion\RunOnce".to_string(),
+    ]
+}
+
+/// Size and last write (FILETIME) of a profile's `NTUSER.DAT`: an unchanged stamp means an
+/// unchanged hive, whose cached snapshot is reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HiveStamp {
+    pub size: u64,
+    pub modified: u64,
+}
+
+/// The values of [`snapshot_keys`] read from one hive. Keys are addressed by their path inside the
+/// hive (the `hive` field of a [`RegKeyPath`] is ignored), case-insensitively.
+#[derive(Debug, Default)]
+pub struct HiveSnapshot {
+    /// Original-case key path and its values, for each key that existed.
+    keys: Vec<(String, Vec<(String, RegValue)>)>,
+}
+
+impl HiveSnapshot {
+    /// Reads every key of [`snapshot_keys`] from `reader`; missing keys are left out.
+    pub fn take(reader: &dyn RegistryReader) -> HiveSnapshot {
+        let keys = snapshot_keys()
+            .into_iter()
+            .filter_map(|p| reader.values(&key(Hive::Users, &p)).ok().map(|v| (p, v)))
+            .collect();
+        HiveSnapshot { keys }
+    }
+
+    fn path_of(k: &RegKeyPath) -> String {
+        k.path.trim_matches('\\').to_lowercase()
+    }
+}
+
+impl RegistryReader for HiveSnapshot {
+    fn subkeys(&self, k: &RegKeyPath) -> Result<Vec<String>, RegError> {
+        if !self.key_exists(k) {
+            return Err(RegError::NotFound);
+        }
+        let path = HiveSnapshot::path_of(k);
+        let mut out: Vec<String> = Vec::new();
+        for (p, _) in &self.keys {
+            let rest = if path.is_empty() {
+                Some(p.as_str())
+            } else {
+                p.get(path.len()..).filter(|r| p.to_lowercase().starts_with(&path) && r.starts_with('\\')).map(|r| &r[1..])
+            };
+            if let Some(child) = rest.and_then(|r| r.split('\\').next()).filter(|c| !c.is_empty()) {
+                if !out.iter().any(|o| o.eq_ignore_ascii_case(child)) {
+                    out.push(child.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn values(&self, k: &RegKeyPath) -> Result<Vec<(String, RegValue)>, RegError> {
+        let path = HiveSnapshot::path_of(k);
+        self.keys.iter().find(|(p, _)| p.to_lowercase() == path).map(|(_, v)| v.clone()).ok_or(RegError::NotFound)
+    }
+
+    fn key_exists(&self, k: &RegKeyPath) -> bool {
+        let path = HiveSnapshot::path_of(k);
+        path.is_empty()
+            || self.keys.iter().any(|(p, _)| {
+                let p = p.to_lowercase();
+                p == path || p.starts_with(&format!("{path}\\"))
+            })
+    }
+}
+
+/// Snapshots of signed-out accounts' hives by SID, each with the [`HiveStamp`] it was taken at.
+#[derive(Default)]
+pub struct HiveCache(Mutex<HashMap<String, (HiveStamp, Arc<HiveSnapshot>)>>);
+
+impl HiveCache {
+    /// The cache the live scans share for the life of the process.
+    pub fn process() -> &'static HiveCache {
+        static CACHE: OnceLock<HiveCache> = OnceLock::new();
+        CACHE.get_or_init(HiveCache::default)
+    }
+
+    fn get(&self, sid: &str, stamp: HiveStamp) -> Option<Arc<HiveSnapshot>> {
+        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&sid.to_uppercase()).filter(|(s, _)| *s == stamp).map(|(_, snap)| snap.clone())
+    }
+
+    fn put(&self, sid: &str, stamp: HiveStamp, snap: Arc<HiveSnapshot>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(sid.to_uppercase(), (stamp, snap));
+    }
+}
 
 /// The private folder holding one scan's hive copies; dropping it removes the folder.
 pub struct ScratchDir {
@@ -45,6 +166,9 @@ impl Drop for ScratchDir {
 
 /// What [`OfflineHives::load`] asks of the system, so tests can substitute it.
 pub trait HiveOps {
+    /// Size and last write of `<profile>\NTUSER.DAT`; `Err` when the profile folder or the hive is
+    /// missing or a link.
+    fn stamp(&self, profile: &Path) -> Result<HiveStamp, String>;
     /// Creates this scan's private copy folder.
     fn create_scratch(&self) -> Result<ScratchDir, String>;
     /// Copies `<profile>\NTUSER.DAT` and its logs into the new folder `dest` and returns the
@@ -55,69 +179,137 @@ pub trait HiveOps {
     fn load(&self, hive: &Path) -> Result<Box<dyn RegistryReader>, String>;
 }
 
-/// The loaded copies of the signed-out accounts' hives, by SID.
+/// Snapshots of the signed-out accounts' hives, by SID. Holds no registry key and no file.
 pub struct OfflineHives {
-    hives: Vec<(String, Box<dyn RegistryReader>)>,
-    scratch: Option<ScratchDir>,
+    hives: Vec<(String, Arc<HiveSnapshot>)>,
 }
 
 impl OfflineHives {
     /// No hives.
     pub fn empty() -> OfflineHives {
-        OfflineHives { hives: Vec::new(), scratch: None }
+        OfflineHives { hives: Vec::new() }
     }
 
-    /// Copies and loads the hive of every profile whose SID is not in `loaded_sids` (compared
-    /// case-insensitively). A profile whose copy or load fails is skipped (debug log only). The
-    /// copy folder is created only when there is a profile to copy.
-    pub fn load(profiles: &[(String, PathBuf)], loaded_sids: &HashSet<String>, ops: &dyn HiveOps) -> OfflineHives {
+    /// A snapshot of the hive of every profile whose SID is not in `loaded_sids` (compared
+    /// case-insensitively): from `cache` when the hive's [`HiveStamp`] is unchanged, else copied,
+    /// loaded, read, closed and deleted here. A profile that cannot be read is skipped (debug log
+    /// only). The copy folder is created only when something is copied, and removed (after every
+    /// key is closed) before this returns. Logs one info line with the counts and the time taken.
+    pub fn load(profiles: &[(String, PathBuf)], loaded_sids: &HashSet<String>, ops: &dyn HiveOps, cache: &HiveCache) -> OfflineHives {
+        let started = std::time::Instant::now();
         let loaded: HashSet<String> = loaded_sids.iter().map(|s| s.to_uppercase()).collect();
         let mut out = OfflineHives::empty();
-        let wanted: Vec<&(String, PathBuf)> = profiles.iter().filter(|(sid, _)| !loaded.contains(&sid.to_uppercase())).collect();
-        if wanted.is_empty() {
-            return out;
-        }
-        let scratch = match ops.create_scratch() {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("offline hives: could not create the copy folder: {e}");
-                return out;
-            }
-        };
-        let base = scratch.path().to_path_buf();
-        out.scratch = Some(scratch);
-        for (i, (sid, profile)) in wanted.into_iter().enumerate() {
-            if out.hives.iter().any(|(s, _)| s.eq_ignore_ascii_case(sid)) {
+        let mut scratch: Option<ScratchDir> = None;
+        let (mut copied, mut cached) = (0usize, 0usize);
+        for (i, (sid, profile)) in profiles.iter().enumerate() {
+            if loaded.contains(&sid.to_uppercase()) || out.hives.iter().any(|(s, _)| s.eq_ignore_ascii_case(sid)) {
                 continue;
             }
-            let loaded = ops
-                .copy_hive(profile, &base.join(i.to_string()))
-                .and_then(|hive| ops.load(&hive));
-            match loaded {
-                Ok(reader) => out.hives.push((sid.clone(), reader)),
+            let stamp = match ops.stamp(profile) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("offline hives: skipped {sid} ({}): {e}", profile.display());
+                    continue;
+                }
+            };
+            if let Some(snap) = cache.get(sid, stamp) {
+                out.hives.push((sid.clone(), snap));
+                cached += 1;
+                continue;
+            }
+            if scratch.is_none() {
+                match ops.create_scratch() {
+                    Ok(s) => scratch = Some(s),
+                    Err(e) => {
+                        log::warn!("offline hives: could not create the copy folder: {e}");
+                        break;
+                    }
+                }
+            }
+            let Some(base) = scratch.as_ref().map(|s| s.path().join(i.to_string())) else { break };
+            // The reader (the loaded key) is dropped at the end of this statement.
+            let snap = ops.copy_hive(profile, &base).and_then(|hive| ops.load(&hive)).map(|reader| HiveSnapshot::take(&*reader));
+            match snap {
+                Ok(snap) => {
+                    let snap = Arc::new(snap);
+                    cache.put(sid, stamp, snap.clone());
+                    out.hives.push((sid.clone(), snap));
+                    copied += 1;
+                }
                 Err(e) => log::debug!("offline hives: skipped {sid} ({}): {e}", profile.display()),
             }
         }
-        log::info!("offline hives: {} loaded", out.hives.len());
+        drop(scratch);
+        log::info!(
+            "offline hives: {} account(s), {copied} copied, {cached} from cache, in {} ms",
+            out.hives.len(),
+            started.elapsed().as_millis()
+        );
         out
     }
 
-    /// The SIDs of the loaded copies.
+    /// The SIDs of the snapshots.
     pub fn sids(&self) -> Vec<String> {
         self.hives.iter().map(|(s, _)| s.clone()).collect()
     }
 
     fn reader(&self, sid: &str) -> Option<&dyn RegistryReader> {
-        self.hives.iter().find(|(s, _)| s.eq_ignore_ascii_case(sid)).map(|(_, r)| &**r)
+        self.hives.iter().find(|(s, _)| s.eq_ignore_ascii_case(sid)).map(|(_, r)| &**r as &dyn RegistryReader)
     }
 }
 
-impl Drop for OfflineHives {
-    /// Every key is closed before the copies are deleted.
-    fn drop(&mut self) {
-        self.hives.clear();
-        self.scratch.take();
+/// What [`root_trusted`] asks of the system, so tests can substitute it.
+pub struct RootTrust<'a> {
+    pub owned_by_admins: &'a dyn Fn(&Path) -> Option<bool>,
+    pub is_reparse: &'a dyn Fn(&Path) -> bool,
+}
+
+impl RootTrust<'static> {
+    /// The real checks ([`crate::quarantine::store::owned_by_admins`], reparse attribute).
+    pub fn live() -> RootTrust<'static> {
+        RootTrust {
+            owned_by_admins: &crate::quarantine::store::owned_by_admins,
+            is_reparse: &crate::quarantine::fsmove::is_reparse_point,
+        }
     }
+}
+
+/// `Ok` when offline hives may be copied below `root`: the data folder was locked down at start
+/// (`data_dir_secured`) and `root` is missing (it is then created locked) or a plain folder owned
+/// by Administrators or SYSTEM. `Err` says why not.
+pub fn root_trusted(data_dir_secured: bool, root: &Path, trust: &RootTrust) -> Result<(), String> {
+    if !data_dir_secured {
+        return Err("the data folder could not be locked down".into());
+    }
+    let Ok(md) = std::fs::symlink_metadata(root) else { return Ok(()) };
+    if (trust.is_reparse)(root) || md.file_type().is_symlink() {
+        return Err(format!("{} is a link or reparse point", root.display()));
+    }
+    if !md.is_dir() {
+        return Err(format!("{} is not a folder", root.display()));
+    }
+    if (trust.owned_by_admins)(root) != Some(true) {
+        return Err(format!("{} is not owned by Administrators or SYSTEM", root.display()));
+    }
+    Ok(())
+}
+
+/// [`OfflineHives::load`] when [`root_trusted`] allows it; else `None` (with a warning), and the
+/// scan reads the live registry only.
+pub fn load_for_scan(
+    data_dir_secured: bool,
+    root: &Path,
+    trust: &RootTrust,
+    profiles: &[(String, PathBuf)],
+    loaded_sids: &HashSet<String>,
+    ops: &dyn HiveOps,
+    cache: &HiveCache,
+) -> Option<OfflineHives> {
+    if let Err(why) = root_trusted(data_dir_secured, root, trust) {
+        log::warn!("offline hives skipped, only signed-in accounts count: {why}");
+        return None;
+    }
+    Some(OfflineHives::load(profiles, loaded_sids, ops, cache))
 }
 
 /// The `(SID, profile folder)` pairs of the registry's ProfileList, without service profiles
@@ -153,7 +345,7 @@ pub fn loaded_sids(reg: &dyn RegistryReader) -> HashSet<String> {
         .collect()
 }
 
-/// `live`, with each offline copy shown as `HKU\<SID>`.
+/// `live`, with each offline snapshot shown as `HKU\<SID>`.
 pub struct UsersOverlay<'a> {
     pub live: &'a dyn RegistryReader,
     pub offline: &'a OfflineHives,
@@ -230,7 +422,7 @@ impl OfflineSlot {
     }
 }
 
-/// Empties its [`OfflineSlot`] on drop, which closes the keys and deletes the copies.
+/// Empties its [`OfflineSlot`] on drop.
 pub struct SlotGuard(OfflineSlot);
 
 impl Drop for SlotGuard {
@@ -301,16 +493,29 @@ fn is_link(md: &std::fs::Metadata) -> bool {
     md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-/// Copies the file `from` (opened with backup semantics, never through a reparse point, sharing
-/// read and write so the owner is never locked out) to the new file `to`.
+/// `profile` itself, refused when missing, a link or not a folder.
+fn plain_profile(profile: &Path) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
+    if is_link(&md) || !md.is_dir() {
+        return Err(format!("{} is a link or not a folder", profile.display()));
+    }
+    Ok(())
+}
+
+/// Copies the file `from` to the new file `to`. `from` is opened with backup semantics while
+/// SeBackupPrivilege is enabled (so its DACL need not admit Administrators), never through a
+/// reparse point, sharing read and write so the owner is never locked out.
 fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
     use std::os::windows::fs::OpenOptionsExt;
-    let mut src = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(from)
-        .map_err(|e| format!("open {}: {e}", from.display()))?;
+    let opened = {
+        let _backup = crate::acl::backup_privilege();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(from)
+    };
+    let mut src = opened.map_err(|e| format!("open {}: {e}", from.display()))?;
     let md = src.metadata().map_err(|e| format!("read {}: {e}", from.display()))?;
     if is_link(&md) || !md.is_file() {
         return Err(format!("{} is not a plain file", from.display()));
@@ -336,7 +541,30 @@ fn remove_copies(dir: &Path) {
     }
 }
 
+/// 128 random bits from the system RNG, as hex: the copy folder's name.
+fn random_name() -> Result<String, String> {
+    use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut buf = [0u8; 16];
+    // SAFETY: `buf` is a valid, writable buffer of the length the wrapper passes.
+    let status = unsafe { BCryptGenRandom(None, &mut buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status.is_err() {
+        return Err(format!("random name: {status:?}"));
+    }
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 impl HiveOps for LiveHiveOps {
+    fn stamp(&self, profile: &Path) -> Result<HiveStamp, String> {
+        use std::os::windows::fs::MetadataExt;
+        plain_profile(profile)?;
+        let hive = profile.join(HIVE_FILE);
+        let md = std::fs::symlink_metadata(&hive).map_err(|e| format!("{}: {e}", hive.display()))?;
+        if is_link(&md) || !md.is_file() {
+            return Err(format!("{} is not a plain file", hive.display()));
+        }
+        Ok(HiveStamp { size: md.len(), modified: md.last_write_time() })
+    }
+
     fn create_scratch(&self) -> Result<ScratchDir, String> {
         match std::fs::symlink_metadata(&self.root) {
             Ok(md) if is_link(&md) || !md.is_dir() => {
@@ -345,17 +573,13 @@ impl HiveOps for LiveHiveOps {
             Ok(_) => {}
             Err(_) => crate::acl::create_locked(&self.root)?,
         }
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-        let dir = self.root.join(format!("{:x}-{nanos:x}", std::process::id()));
+        let dir = self.root.join(random_name()?);
         crate::acl::create_locked(&dir)?;
         Ok(ScratchDir::new(dir, Box::new(remove_copies)))
     }
 
     fn copy_hive(&self, profile: &Path, dest: &Path) -> Result<PathBuf, String> {
-        let md = std::fs::symlink_metadata(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
-        if is_link(&md) || !md.is_dir() {
-            return Err(format!("{} is a link or not a folder", profile.display()));
-        }
+        plain_profile(profile)?;
         std::fs::create_dir(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
         copy_file(&profile.join(HIVE_FILE), &dest.join(HIVE_FILE))?;
         for log in HIVE_LOGS {
@@ -390,26 +614,31 @@ pub(crate) mod fake {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    use super::{HiveOps, ScratchDir, HIVE_FILE};
+    use super::{HiveOps, HiveStamp, ScratchDir, HIVE_FILE};
     use crate::model::RegKeyPath;
     use crate::registry::{FakeRegistry, RegError, RegValue, RegistryReader};
 
     pub(crate) const SCRATCH: &str = r"X:\scratch";
 
-    /// Profiles as in-memory hives; every call is recorded in `log`.
+    /// Profiles as in-memory hives (stamp size 1, modified 1 unless set); every call that does
+    /// work is recorded in `log`.
     #[derive(Default)]
     pub(crate) struct FakeHiveOps {
-        /// By profile folder; moved to `copies` when copied.
-        pub hives: Mutex<HashMap<PathBuf, FakeRegistry>>,
-        copies: Mutex<HashMap<PathBuf, FakeRegistry>>,
+        hives: HashMap<PathBuf, Arc<FakeRegistry>>,
+        stamps: Mutex<HashMap<PathBuf, HiveStamp>>,
+        copies: Mutex<HashMap<PathBuf, Arc<FakeRegistry>>>,
         pub locked: HashSet<PathBuf>,
         pub log: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeHiveOps {
         pub(crate) fn with(mut self, profile: &str, hive: FakeRegistry) -> Self {
-            self.hives.get_mut().unwrap().insert(PathBuf::from(profile), hive);
+            self.hives.insert(PathBuf::from(profile), Arc::new(hive));
             self
+        }
+
+        pub(crate) fn set_stamp(&self, profile: &str, stamp: HiveStamp) {
+            self.stamps.lock().unwrap().insert(PathBuf::from(profile), stamp);
         }
 
         pub(crate) fn calls(&self) -> Vec<String> {
@@ -422,7 +651,7 @@ pub(crate) mod fake {
     }
 
     struct Recorded {
-        inner: FakeRegistry,
+        inner: Arc<FakeRegistry>,
         name: String,
         log: Arc<Mutex<Vec<String>>>,
     }
@@ -446,6 +675,13 @@ pub(crate) mod fake {
     }
 
     impl HiveOps for FakeHiveOps {
+        fn stamp(&self, profile: &Path) -> Result<HiveStamp, String> {
+            if !self.hives.contains_key(profile) {
+                return Err("missing".into());
+            }
+            Ok(self.stamps.lock().unwrap().get(profile).copied().unwrap_or(HiveStamp { size: 1, modified: 1 }))
+        }
+
         fn create_scratch(&self) -> Result<ScratchDir, String> {
             self.push(format!("create {SCRATCH}"));
             let log = self.log.clone();
@@ -459,7 +695,7 @@ pub(crate) mod fake {
             if self.locked.contains(profile) {
                 return Err("sharing violation".into());
             }
-            let hive = self.hives.lock().unwrap().remove(profile).ok_or("missing")?;
+            let hive = self.hives.get(profile).ok_or("missing")?.clone();
             self.push(format!("copy {} -> {}", profile.display(), dest.display()));
             let copy = dest.join(HIVE_FILE);
             self.copies.lock().unwrap().insert(copy.clone(), hive);
@@ -482,6 +718,7 @@ mod tests {
 
     const A: &str = "S-1-5-21-9-1001";
     const B: &str = "S-1-5-21-9-1002";
+    const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
     fn hive_with(path: &str, name: &str) -> FakeRegistry {
         let mut r = FakeRegistry::new();
@@ -496,22 +733,33 @@ mod tests {
         live
     }
 
+    fn load(profiles: &[(String, PathBuf)], loaded: &HashSet<String>, ops: &FakeHiveOps) -> OfflineHives {
+        OfflineHives::load(profiles, loaded, ops, &HiveCache::default())
+    }
+
     #[test]
     fn overlay_lists_live_and_offline_sids() {
         let live = live_with_sid(A);
-        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive_with(r"Software\Off", "y"));
-        let hives = OfflineHives::load(&[(B.into(), r"C:\Users\b".into())], &HashSet::new(), &ops);
+        let mut hive = hive_with(RUN, "y");
+        hive.set(key(Hive::Users, r"Software\Elsewhere"), "z", RegValue::Dword(1));
+        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive);
+        let hives = load(&[(B.into(), r"C:\Users\b".into())], &HashSet::new(), &ops);
         assert_eq!(hives.sids(), vec![B.to_string()]);
         let overlay = UsersOverlay { live: &live, offline: &hives };
         let mut sids = overlay.subkeys(&key(Hive::Users, "")).unwrap();
         sids.sort();
         assert_eq!(sids, vec![A.to_string(), format!("{A}_Classes"), B.to_string()]);
-        // Offline keys come from the copy, live ones from the live registry.
-        assert_eq!(overlay.subkeys(&key(Hive::Users, &format!(r"{B}\Software"))).unwrap(), vec!["Off".to_string()]);
-        assert!(overlay.key_exists(&key(Hive::Users, &format!(r"{}\software\off", B.to_lowercase()))));
-        assert_eq!(overlay.values(&key(Hive::Users, &format!(r"{B}\Software\Off"))).unwrap().len(), 1);
+        // Offline keys come from the snapshot (only the keys usage reads), live ones from the
+        // live registry.
+        let cv = format!(r"{B}\Software\Microsoft\Windows\CurrentVersion");
+        assert_eq!(overlay.subkeys(&key(Hive::Users, &cv)).unwrap(), vec!["Run".to_string()]);
+        assert_eq!(overlay.subkeys(&key(Hive::Users, B)).unwrap(), vec!["Software".to_string()]);
+        assert!(overlay.key_exists(&key(Hive::Users, &format!(r"{}\{}", B.to_lowercase(), RUN.to_uppercase()))));
+        assert_eq!(overlay.values(&key(Hive::Users, &format!(r"{B}\{RUN}"))).unwrap().len(), 1);
+        assert!(!overlay.key_exists(&key(Hive::Users, &format!(r"{B}\Software\Elsewhere"))));
+        assert!(!overlay.key_exists(&key(Hive::Users, &format!(r"{B}\Software\Microsoft\Windows\CurrentVersion\Ru"))));
         assert_eq!(overlay.subkeys(&key(Hive::Users, &format!(r"{A}\Software"))).unwrap(), vec!["Live".to_string()]);
-        assert!(!overlay.key_exists(&key(Hive::Users, &format!(r"{A}\Software\Off"))));
+        assert!(!overlay.key_exists(&key(Hive::Users, &format!(r"{A}\{RUN}"))));
         assert!(overlay.subkeys(&key(Hive::LocalMachine, "")).unwrap().is_empty());
     }
 
@@ -519,20 +767,19 @@ mod tests {
     fn loaded_sid_is_not_copied() {
         let live = live_with_sid(A);
         let ops = FakeHiveOps::default()
-            .with(r"C:\Users\a", hive_with("Software", "x"))
-            .with(r"C:\Users\b", hive_with("Software", "x"));
+            .with(r"C:\Users\a", hive_with(RUN, "x"))
+            .with(r"C:\Users\b", hive_with(RUN, "x"));
         let profiles = [(A.to_lowercase(), PathBuf::from(r"C:\Users\a")), (B.into(), PathBuf::from(r"C:\Users\b"))];
         let loaded = loaded_sids(&live);
         assert_eq!(loaded, HashSet::from([A.to_string()]), "_Classes and .DEFAULT are not SIDs");
-        let hives = OfflineHives::load(&profiles, &loaded, &ops);
+        let hives = load(&profiles, &loaded, &ops);
         assert_eq!(hives.sids(), vec![B.to_string()]);
         assert!(ops.calls().iter().all(|c| !c.contains(r"C:\Users\a")), "{:?}", ops.calls());
 
         // Nothing to copy: no copy folder at all.
         let ops = FakeHiveOps::default();
-        let hives = OfflineHives::load(&profiles[..1], &loaded, &ops);
+        let hives = load(&profiles[..1], &loaded, &ops);
         assert!(hives.sids().is_empty());
-        drop(hives);
         assert!(ops.calls().is_empty(), "{:?}", ops.calls());
     }
 
@@ -556,40 +803,102 @@ mod tests {
         assert_eq!(profiles, vec![(A.to_string(), PathBuf::from(r"C:\Users\a")), (B.to_string(), PathBuf::from(r"D:\Profiles\b"))]);
 
         // B's folder (or hive) is missing: skipped, A loads.
-        let ops = FakeHiveOps::default().with(r"C:\Users\a", hive_with("Software", "x"));
-        let hives = OfflineHives::load(&profiles, &HashSet::new(), &ops);
+        let ops = FakeHiveOps::default().with(r"C:\Users\a", hive_with(RUN, "x"));
+        let hives = load(&profiles, &HashSet::new(), &ops);
         assert_eq!(hives.sids(), vec![A.to_string()]);
     }
 
     #[test]
     fn locked_hive_is_skipped_silently() {
         let mut ops = FakeHiveOps::default()
-            .with(r"C:\Users\a", hive_with("Software", "x"))
-            .with(r"C:\Users\b", hive_with("Software", "x"));
+            .with(r"C:\Users\a", hive_with(RUN, "x"))
+            .with(r"C:\Users\b", hive_with(RUN, "x"));
         ops.locked.insert(PathBuf::from(r"C:\Users\a"));
         let profiles = [(A.into(), PathBuf::from(r"C:\Users\a")), (B.into(), PathBuf::from(r"C:\Users\b"))];
-        let hives = OfflineHives::load(&profiles, &HashSet::new(), &ops);
+        let hives = load(&profiles, &HashSet::new(), &ops);
         assert_eq!(hives.sids(), vec![B.to_string()]);
         assert!(!ops.calls().iter().any(|c| c.starts_with(r"copy C:\Users\a")));
     }
 
+    /// The keys are closed and the copies deleted before `load` returns: the hives handed to the
+    /// scan hold no key and no file.
     #[test]
     fn drop_closes_keys_and_removes_copies() {
         let ops = FakeHiveOps::default()
-            .with(r"C:\Users\a", hive_with("Software", "x"))
-            .with(r"C:\Users\b", hive_with("Software", "x"));
+            .with(r"C:\Users\a", hive_with(RUN, "x"))
+            .with(r"C:\Users\b", hive_with(RUN, "x"));
         let profiles = [(A.into(), PathBuf::from(r"C:\Users\a")), (B.into(), PathBuf::from(r"C:\Users\b"))];
         let slot = OfflineSlot::default();
-        let guard = slot.fill(OfflineHives::load(&profiles, &HashSet::new(), &ops));
-        assert!(slot.is_filled());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("close") || c.starts_with("remove")));
-        drop(guard);
-        assert!(!slot.is_filled());
+        let guard = slot.fill(load(&profiles, &HashSet::new(), &ops));
         let a = Path::new(SCRATCH).join("0").join(HIVE_FILE).display().to_string();
         let b = Path::new(SCRATCH).join("1").join(HIVE_FILE).display().to_string();
         let calls = ops.calls();
-        let tail: Vec<&str> = calls[calls.len() - 3..].iter().map(String::as_str).collect();
-        assert_eq!(tail, [format!("close {a}"), format!("close {b}"), format!("remove {SCRATCH}")]);
+        let dest = |n: &str| Path::new(SCRATCH).join(n).display().to_string();
+        assert_eq!(
+            calls,
+            [
+                format!("create {SCRATCH}"),
+                format!(r"copy C:\Users\a -> {}", dest("0")),
+                format!("load {a}"),
+                format!("close {a}"),
+                format!(r"copy C:\Users\b -> {}", dest("1")),
+                format!("load {b}"),
+                format!("close {b}"),
+                format!("remove {SCRATCH}"),
+            ]
+        );
+        assert!(slot.is_filled());
+        drop(guard);
+        assert!(!slot.is_filled());
+        assert_eq!(ops.calls(), calls, "nothing left to close or remove");
+    }
+
+    #[test]
+    fn untrusted_hives_root_skips_offline_hives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("hives");
+        let trusted = RootTrust { owned_by_admins: &|_| Some(true), is_reparse: &|_| false };
+        // A missing root is created locked later; an admin-owned plain folder is fine.
+        assert!(root_trusted(true, &root, &trusted).is_ok());
+        std::fs::create_dir(&root).unwrap();
+        assert!(root_trusted(true, &root, &trusted).is_ok());
+        // Not secured, not admin-owned, unknown owner or a reparse point: no offline hives at all.
+        assert!(root_trusted(false, &root, &trusted).is_err());
+        assert!(root_trusted(true, &root, &RootTrust { owned_by_admins: &|_| Some(false), is_reparse: &|_| false }).is_err());
+        assert!(root_trusted(true, &root, &RootTrust { owned_by_admins: &|_| None, is_reparse: &|_| false }).is_err());
+        assert!(root_trusted(true, &root, &RootTrust { owned_by_admins: &|_| Some(true), is_reparse: &|_| true }).is_err());
+
+        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive_with(RUN, "x"));
+        let untrusted = RootTrust { owned_by_admins: &|_| Some(false), is_reparse: &|_| false };
+        let profiles = [(B.to_string(), PathBuf::from(r"C:\Users\b"))];
+        let hives = load_for_scan(true, &root, &untrusted, &profiles, &HashSet::new(), &ops, &HiveCache::default());
+        assert!(hives.is_none());
+        let hives = load_for_scan(false, &root, &trusted, &profiles, &HashSet::new(), &ops, &HiveCache::default());
+        assert!(hives.is_none());
+        assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+        let hives = load_for_scan(true, &root, &trusted, &profiles, &HashSet::new(), &ops, &HiveCache::default());
+        assert_eq!(hives.map(|h| h.sids()), Some(vec![B.to_string()]));
+    }
+
+    #[test]
+    fn unchanged_offline_hive_is_not_copied_twice() {
+        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive_with(RUN, "x"));
+        let profiles = [(B.to_string(), PathBuf::from(r"C:\Users\b"))];
+        let cache = HiveCache::default();
+        let copies = |ops: &FakeHiveOps| ops.calls().iter().filter(|c| c.starts_with("copy")).count();
+        let first = OfflineHives::load(&profiles, &HashSet::new(), &ops, &cache);
+        assert_eq!(copies(&ops), 1);
+        drop(first);
+        let before = ops.calls().len();
+        let second = OfflineHives::load(&profiles, &HashSet::new(), &ops, &cache);
+        assert_eq!(ops.calls().len(), before, "a refresh copies nothing and creates no folder: {:?}", ops.calls());
+        let overlay = UsersOverlay { live: &FakeRegistry::new(), offline: &second };
+        assert_eq!(overlay.values(&key(Hive::Users, &format!(r"{B}\{RUN}"))).unwrap().len(), 1, "served from the cache");
+        drop(second);
+        // The hive changed (size or last write): copied again.
+        ops.set_stamp(r"C:\Users\b", HiveStamp { size: 2, modified: 2 });
+        let _third = OfflineHives::load(&profiles, &HashSet::new(), &ops, &cache);
+        assert_eq!(copies(&ops), 2);
     }
 
     #[test]
@@ -597,16 +906,17 @@ mod tests {
         let slot = OfflineSlot::default();
         let reader = slot.reader(Arc::new(live_with_sid(A)));
         assert_eq!(loaded_sids(&reader), HashSet::from([A.to_string()]));
-        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive_with("Software", "x"));
-        let guard = slot.fill(OfflineHives::load(&[(B.into(), r"C:\Users\b".into())], &HashSet::new(), &ops));
+        let ops = FakeHiveOps::default().with(r"C:\Users\b", hive_with(RUN, "x"));
+        let guard = slot.fill(load(&[(B.into(), r"C:\Users\b".into())], &HashSet::new(), &ops));
         assert_eq!(loaded_sids(&reader), HashSet::from([A.to_string(), B.to_string()]));
         drop(guard);
         assert_eq!(loaded_sids(&reader), HashSet::from([A.to_string()]));
     }
 
-    /// Elevated. Copies and loads the hive of a signed-out account when one exists, else the
-    /// Default profile's (never loaded), below a temporary folder; checks that dropping the hives
-    /// unloads them and deletes the copies. The originals are only read.
+    /// Elevated. Copies (with SeBackupPrivilege) and loads the hive of a signed-out account when
+    /// one exists, else the Default profile's (never loaded), below a temporary folder; checks the
+    /// loaded copy reads, that the copies are gone once `load` returns, and that a second load with
+    /// the same cache copies nothing. The originals are only read.
     #[test]
     #[ignore]
     fn offline_hive_copy_loads_and_unloads() {
@@ -623,21 +933,36 @@ mod tests {
             profiles.push(("S-1-5-21-0-0-0-DEFAULT".into(), default));
         }
         let tmp = tempfile::tempdir().unwrap();
-        let ops = LiveHiveOps::with_root(tmp.path().join("hives"));
-        let hives = OfflineHives::load(&profiles, &loaded, &ops);
+        let root = tmp.path().join("hives");
+        let ops = LiveHiveOps::with_root(root.clone());
+
+        // The raw copy and load.
+        let scratch = ops.create_scratch().unwrap();
+        let name = scratch.path().file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        let hive = ops.copy_hive(&profiles[0].1, &scratch.path().join("0")).unwrap();
+        let reader = ops.load(&hive).unwrap();
+        let subs = reader.subkeys(&key(Hive::Users, "")).unwrap();
+        println!("{}: {subs:?}", profiles[0].0);
+        assert!(subs.iter().any(|s| s.eq_ignore_ascii_case("Software")));
+        drop(reader);
+        let dir = scratch.path().to_path_buf();
+        drop(scratch);
+        assert!(!dir.exists(), "the copy folder is deleted once the key is closed");
+
+        // Through `OfflineHives::load` and the cache.
+        let cache = HiveCache::default();
+        let hives = OfflineHives::load(&profiles, &loaded, &ops, &cache);
         println!("loaded: {:?}", hives.sids());
         assert!(!hives.sids().is_empty(), "no hive could be copied and loaded");
         let overlay = UsersOverlay { live: &WinRegistry, offline: &hives };
         for sid in hives.sids() {
-            let subs = overlay.subkeys(&key(Hive::Users, &sid)).unwrap();
-            println!("{sid}: {subs:?}");
-            assert!(subs.iter().any(|s| s.eq_ignore_ascii_case("Software")));
             let ua = overlay.subkeys(&key(Hive::Users, &format!(r"{sid}\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist")));
             println!("{sid} UserAssist: {ua:?}");
         }
-        let copies: Vec<PathBuf> = std::fs::read_dir(tmp.path().join("hives")).unwrap().flatten().map(|e| e.path()).collect();
-        assert_eq!(copies.len(), 1);
-        drop(hives);
-        assert!(!copies[0].exists(), "copies are deleted once the keys are closed");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "no copy outlives load");
+        let again = OfflineHives::load(&profiles, &loaded, &ops, &cache);
+        assert_eq!(again.sids(), hives.sids());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }

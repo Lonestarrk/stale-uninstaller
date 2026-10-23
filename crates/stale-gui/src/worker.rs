@@ -28,12 +28,14 @@ use windows::Win32::System::Com::{
 use crate::warning::{Msg, Warning};
 
 /// Starts a scan on the "stale-scan" thread; events arrive on the returned channel.
-pub fn spawn_scan() -> Receiver<ScanEvent> {
+/// `data_dir_secured`: the data folder was locked down at start, so signed-out accounts' hives
+/// may be copied into it ([`ScanSources::live`]).
+pub fn spawn_scan(data_dir_secured: bool) -> Receiver<ScanEvent> {
     let (tx, rx) = channel();
     let fallback = tx.clone();
     let spawned = std::thread::Builder::new()
         .name("stale-scan".into())
-        .spawn(move || run_scan(ScanSources::live(), tx));
+        .spawn(move || run_scan(ScanSources::live(data_dir_secured), tx));
     if let Err(e) = spawned {
         log::error!("could not spawn scan thread: {e}");
         let _ = fallback.send(ScanEvent::Warning(ScanWarning::ThreadFailed { error: e.to_string() }));

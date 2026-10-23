@@ -75,6 +75,7 @@ fn main() -> eframe::Result {
     }
     // Before anything (the log included) is written below the data folder.
     let secured = stale_core::paths::secure_data_dir();
+    let data_dir_secured = secured.is_ok();
     if let Err(e) = &secured {
         eprintln!("could not lock down the data folder: {e}");
     }
@@ -103,7 +104,7 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(t().app_title, options, Box::new(|cc| Ok(Box::new(StaleApp::new(cc)))))
+    eframe::run_native(t().app_title, options, Box::new(move |cc| Ok(Box::new(StaleApp::new(cc, data_dir_secured)))))
 }
 
 /// `--uninstall-cleanup`, run by Stale's own uninstaller in two phases:

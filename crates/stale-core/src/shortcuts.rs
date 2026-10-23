@@ -26,7 +26,8 @@ pub fn startup_dirs() -> Vec<PathBuf> {
 }
 
 /// [`start_menu_dirs`] plus each profile's own Start Menu `Programs` folder: existing folders
-/// only, deduplicated.
+/// only, deduplicated. Other profiles' shortcuts only steer the main-exe choice and labels in
+/// usage matching, never what is removed (the leftover scan keeps [`start_menu_dirs`]).
 pub fn profile_start_menu_dirs(profiles: &[PathBuf]) -> Vec<PathBuf> {
     let per_profile = profiles.iter().map(|p| p.join(r"AppData\Roaming").join(START_MENU_PROGRAMS));
     existing_unique(start_menu_dirs().into_iter().chain(per_profile))
