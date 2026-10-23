@@ -15,6 +15,8 @@ merged. `X.Y.Z` below is the new version.
   (the exe's version resource comes from the stale-gui version through `build.rs`; the exe
   manifest carries no version).
 - Update the lockfile to the new versions: `cargo update -w`.
+- `cargo` is in `%USERPROFILE%\.cargo\bin`; if a shell cannot find it, put that folder on `PATH`
+  first (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`).
 - Commit both Cargo.toml files and `Cargo.lock` together: `chore: version X.Y.Z`.
 
 ## 2. Test and build
@@ -42,13 +44,21 @@ Depending on how winget runs it, `ISCC.exe` lands in `%ProgramFiles(x86)%\Inno S
 Get-FileHash installer\Output\StaleUninstaller-Setup-X.Y.Z.exe
 ```
 
+From Git Bash, prefix the call with `MSYS_NO_PATHCONV=1`: otherwise Git Bash turns
+`/DAppVersion=X.Y.Z` into a path and ISCC stops with "You may not specify more than one script
+filename".
+
 The setup lands in `installer\Output\` (gitignored). Note its SHA-256 for the release notes.
 `stale.iss` stops with an error when `/DAppVersion` differs from the first three parts of the
 version of `target\release\StaleUninstaller.exe`, so rebuild the exe after the version bump.
 
 ## 4. Elevated smoke test
 
-Run it as a job through the elevated runner: drop a `.ps1` into `.superpowers/elevated/jobs/`,
+Run it as a job through the elevated runner. The ready-made job is `smoke-job.ps1` next to this
+file: copy it to `.superpowers/elevated/jobs/NNN-installer-X.Y.Z.ps1` (NNN one higher than the
+newest file in `.superpowers/elevated/done/`), set `$version`, and run it. It does steps 1–6 below,
+prints every result to the log and skips both the launch and the uninstall when the quarantine
+holds anything. In general: drop a `.ps1` into `.superpowers/elevated/jobs/`,
 run `schtasks /run /tn StaleDevElevated`, wait for a new `=== end` line in
 `.superpowers/elevated/log.txt`. `lib.ps1` has `Save-Shot`/`Stop-Stale` and the window finder
 `[G]::MainWindow(pid)`. Posted mouse clicks do not reach egui: launch and screenshot only.
@@ -74,8 +84,10 @@ run `schtasks /run /tn StaleDevElevated`, wait for a new `=== end` line in
 6. Restore the backup with the same robocopy flags, put the saved SDDL back with `Set-Acl`, and
    check that `settings.json` and `important.json` are back.
 
-Record the steps, exit codes, sizes and the setup's SHA-256 in
-`docs/research/<date>-installer-smoke.md` (plain language).
+Record the steps, exit codes, sizes and the setup's SHA-256 as a new "Version X.Y.Z (date)"
+section at the end of `docs/research/2026-10-18-installer-smoke.md` (plain language), and commit
+it before tagging. When the uninstall was skipped, say so there and tell the user that the new
+version is now installed on their machine.
 
 ## 5. Tag and publish
 
@@ -85,12 +97,17 @@ git push origin vX.Y.Z
 gh release create vX.Y.Z installer\Output\StaleUninstaller-Setup-X.Y.Z.exe --title "Stale Uninstaller X.Y.Z" --notes-file <notes.md>
 ```
 
-The notes file (kept out of the repo, e.g. in `.superpowers/`) holds:
+Push `main` first so the tag's commit is on GitHub. The notes file
+(`.superpowers/release-notes-X.Y.Z.md`, kept out of the repo; copy the previous one) holds:
 
-- the features of this release (from the README's Features list),
+- a "What's new in X.Y.Z" list of what changed since the last release (`git log vPREV..HEAD`),
+  worded for users like the README's Features list, plus a link to the README's features,
 - "The installer is not code-signed yet, so Windows SmartScreen may warn on first run: choose
   More info → Run anyway.",
 - the SHA-256 of the setup file.
+
+Afterwards check the uploaded asset against your hash:
+`gh release view vX.Y.Z --json assets --jq '.assets[] | .name + " " + .digest'`.
 
 The README's Download section points to the Releases page, so it needs no change per release.
 
