@@ -16,6 +16,13 @@ pub struct OwnPaths {
     folders: Vec<String>,
 }
 
+/// The exe's folder when it is Stale's install folder (named `Stale Uninstaller`); a portable
+/// exe in `Downloads` or `C:\Tools` does not make that whole folder ours.
+fn own_exe_dir(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_string_lossy();
+    name.eq_ignore_ascii_case("Stale Uninstaller").then(|| dir.to_path_buf())
+}
+
 impl OwnPaths {
     /// The data folder, every drive's `<drive>:\Stale Uninstaller` (quarantine payload roots),
     /// the running exe's folder and `%ProgramFiles%\Stale Uninstaller`. Only paths are computed;
@@ -23,9 +30,7 @@ impl OwnPaths {
     pub fn live() -> OwnPaths {
         let mut folders: Vec<PathBuf> = vec![crate::paths::data_dir()];
         folders.extend(('A'..='Z').map(|d| PathBuf::from(format!(r"{d}:\Stale Uninstaller"))));
-        if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
-            folders.push(dir);
-        }
+        folders.extend(std::env::current_exe().ok().and_then(|e| e.parent().and_then(own_exe_dir)));
         for var in ["ProgramFiles", "ProgramW6432"] {
             if let Some(pf) = std::env::var_os(var) {
                 folders.push(Path::new(&pf).join("Stale Uninstaller"));
@@ -90,5 +95,16 @@ mod tests {
         assert!(own.is_own_key(&k(r"Software\Stale Uninstaller")));
         assert!(own.is_own_key(&k(r"Software\WOW6432Node\Stale Uninstaller\x")));
         assert!(!own.is_own_key(&k(r"Software\Stale Uninstaller Pro")));
+    }
+
+    #[test]
+    fn exe_in_shared_folder_hides_only_the_exe() {
+        assert_eq!(own_exe_dir(Path::new(r"C:\Tools")), None);
+        assert_eq!(own_exe_dir(Path::new(r"C:\Users\A\Downloads")), None);
+        let installed = PathBuf::from(r"D:\Apps\stale uninstaller");
+        assert_eq!(own_exe_dir(&installed), Some(installed));
+        let own = OwnPaths::from_folders(own_exe_dir(Path::new(r"C:\Tools")));
+        assert!(own.is_own_path(Path::new(r"C:\Tools\StaleUninstaller.exe")));
+        assert!(!own.is_own_path(Path::new(r"C:\Tools\Other\tool.dll")));
     }
 }
