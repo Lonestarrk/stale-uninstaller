@@ -104,3 +104,18 @@ manifests, data folder backed up and restored (4 of 4 entries, SDDL identical).
 - `--uninstall-cleanup --ask --silent`: exit 10, data folder untouched.
 - Silent uninstall: exit 0; `--ask` exit 10, `--apply remove` exit 0, then file deletions; program
   folder, uninstall key, shortcut and `%ProgramData%\Stale Uninstaller` gone.
+
+## Version 0.1.3 (2026-10-23)
+
+Setup `StaleUninstaller-Setup-0.1.3.exe`, 5 934 669 bytes, SHA-256
+`22DA741C2BE5E755B17BA9675B9775460A08304C10622BE9BB883EC159A614D0`. The data folder was backed up
+and restored (8 of 8 entries, SDDL identical).
+
+- Silent install: exit 0; DisplayVersion 0.1.3; installed exe version 0.1.3; Start-menu shortcut
+  present.
+- Elevated launch: main window shown at the new 150 % scale, no side-by-side events.
+- The quarantine held 2 manifests (made by hand earlier the same day), so the uninstall half was
+  skipped and 0.1.3 stays installed. The job still launched the program, which runs the automatic
+  purge; both quarantines were a few hours old, far below the purge age, and a read-only check
+  afterwards found both manifests and both payload folders under `C:\Stale Uninstaller\quarantine`.
+  The job for the next release must skip the launch too when manifests exist.
