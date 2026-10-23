@@ -452,14 +452,14 @@ impl StaleApp {
     }
 
     /// Saves a zoom changed with the keyboard (Ctrl + / - / 0); true when it differed from the
-    /// stored scale. Called every frame, saves only on a change.
-    fn sync_zoom_at(&mut self, zoom: f32, path: &Path) -> bool {
-        let zoom = (zoom * 100.0).round() / 100.0;
-        if (zoom - self.ui_scale()).abs() < 0.005 {
-            return false;
+    /// stored scale. Called every frame, saves only on a change. Returns the zoom to show: `zoom`
+    /// kept within the valid range (0.75..=3.0), which the caller applies when it differs.
+    fn sync_zoom_at(&mut self, zoom: f32, path: &Path) -> f32 {
+        let clamped = ((zoom * 100.0).round() / 100.0).clamp(0.75, 3.0);
+        if (clamped - self.ui_scale()).abs() >= 0.005 {
+            self.set_ui_scale_at(clamped, path);
         }
-        self.set_ui_scale_at(zoom, path);
-        true
+        clamped
     }
 
     /// Opens the summary dialog for the checked rows that are visible under the current filters.
@@ -1025,7 +1025,11 @@ impl eframe::App for StaleApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Utc::now();
-        self.sync_zoom_at(ui.ctx().zoom_factor(), &Settings::path());
+        let zoom = ui.ctx().zoom_factor();
+        let shown = self.sync_zoom_at(zoom, &Settings::path());
+        if (shown - zoom).abs() > 0.001 {
+            ui.ctx().set_zoom_factor(shown);
+        }
         egui::Panel::top("top").show(ui, |ui| {
             toolbar::show(ui, self);
             if !self.warnings.is_empty() {
@@ -1515,8 +1519,6 @@ mod tests {
         assert_eq!(Settings::load_from_with(&path, &trust_all).quarantine_days, 7);
     }
 
-    /// Swedish only: the language is process-wide and other tests running in parallel expect
-    /// Swedish text.
     #[test]
     fn ui_scale_defaults_to_150_percent() {
         let app = StaleApp::empty(Settings::default());
@@ -1539,13 +1541,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let mut app = StaleApp::empty(Settings::default());
-        assert!(!app.sync_zoom_at(1.5, &path), "unchanged: nothing saved");
-        assert!(!path.exists());
-        assert!(app.sync_zoom_at(1.6000001, &path));
-        assert!(!app.sync_zoom_at(1.6000001, &path), "same value again is not saved again");
+        app.sync_zoom_at(1.5, &path);
+        assert!(!path.exists(), "unchanged: nothing saved");
+        app.sync_zoom_at(1.6000001, &path);
         assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(1.6));
+        std::fs::remove_file(&path).unwrap();
+        app.sync_zoom_at(1.6000001, &path);
+        assert!(!path.exists(), "same value again is not saved again");
     }
 
+    #[test]
+    fn keyboard_zoom_is_clamped_to_the_valid_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = StaleApp::empty(Settings::default());
+        assert_eq!(app.sync_zoom_at(5.0, &path), 3.0);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(3.0));
+        assert_eq!(app.sync_zoom_at(0.2, &path), 0.75);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(0.75));
+        assert_eq!(app.sync_zoom_at(1.0, &path), 1.0);
+        assert_eq!(Settings::load_from_with(&path, &trust_all).ui_scale, Some(1.0));
+    }
+
+    /// Swedish only: the language is process-wide and other tests running in parallel expect
+    /// Swedish text.
     #[test]
     fn chosen_language_is_saved() {
         let dir = tempfile::tempdir().unwrap();
