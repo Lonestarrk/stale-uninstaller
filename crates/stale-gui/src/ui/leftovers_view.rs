@@ -84,6 +84,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     }
     if open_popup.is_some() {
         app.leftover_popup = open_popup;
+        // Show the popup now, not on the next input event.
+        ui.ctx().request_repaint();
     }
     match action {
         Some(Action::Back) => app.leave_leftovers(),
@@ -103,38 +105,59 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 
 const ROW_HEIGHT: f32 = 24.0;
 
-/// One program's row: checkbox, name, "N av M" and the size of what is checked. A click ticks or
-/// unticks the program's items, a double-click asks for the popup (returns true).
-fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup) -> bool {
+/// What the user did to a compact row.
+pub(super) struct RowClicks {
+    pub clicked: bool,
+    pub double_clicked: bool,
+}
+
+/// A compact, clickable row of fixed height with a hover highlight. `contents` draws it
+/// (centered vertically). The row senses clicks under
+/// the contents, so the check box keeps its own click.
+pub(super) fn compact_row(ui: &mut egui::Ui, index: usize, contents: impl FnOnce(&mut egui::Ui)) -> RowClicks {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::hover());
-    // The row senses clicks under its contents, so the check box keeps its own click.
     let row = ui.interact(rect, ui.scope_id().with(("leftover_row", index)), egui::Sense::click());
     if row.hovered() {
         ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    let mut box_clicked = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-        ui.horizontal_centered(|ui| {
-            let mut on = group.checked_count() > 0;
-            box_clicked = ui.checkbox(&mut on, "").clicked();
-            if box_clicked {
-                group.toggle_all();
-            }
-            ui.label(&group.program_name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format::human_size(Some(group.checked_bytes())));
-                ui.label(strings::items_checked(group.checked_count(), group.items.len()));
+        ui.horizontal_centered(contents);
+    });
+    RowClicks { clicked: row.clicked(), double_clicked: row.double_clicked() }
+}
+
+/// One program's row: checkbox, name, "N av M" and the size of what is checked. A click ticks or
+/// unticks the program's items, a double-click asks for the popup (returns true).
+fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup) -> bool {
+    let mut box_clicked = false;
+    let clicks = compact_row(ui, index, |ui| {
+        let mut on = group.checked_count() > 0;
+        box_clicked = ui.checkbox(&mut on, "").clicked();
+        if box_clicked {
+            group.toggle_all();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format::human_size(Some(group.checked_bytes())));
+            ui.label(strings::items_checked(group.checked_count(), group.items.len()));
+            // A long name is cut off instead of pushing the numbers away.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(&group.program_name).truncate());
             });
         });
     });
-    row_click(group, box_clicked, row.clicked(), row.double_clicked())
+    row_click(group, box_clicked, clicks.clicked, clicks.double_clicked)
+}
+
+/// Whether a row's own click toggles its check mark: not when the click was on the check box.
+pub(super) fn row_toggles(box_clicked: bool, clicked: bool) -> bool {
+    clicked && !box_clicked
 }
 
 /// Applies a row's click to its group and says whether the popup is wanted. Both clicks of a
 /// double-click report `clicked()` (egui adds `double_clicked()` to the second), so they toggle
 /// twice and leave the check boxes as they were; the box's own click was already handled.
 fn row_click(group: &mut LeftoverGroup, box_clicked: bool, clicked: bool, double_clicked: bool) -> bool {
-    if clicked && !box_clicked {
+    if row_toggles(box_clicked, clicked) {
         group.toggle_all();
     }
     double_clicked

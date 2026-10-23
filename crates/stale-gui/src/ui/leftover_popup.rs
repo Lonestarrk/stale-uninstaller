@@ -22,6 +22,8 @@ pub fn show(ctx: &egui::Context, id: egui::Id, title: &str, info: &[String], gro
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            // Long paths wrap instead of stretching the window.
+            ui.set_max_width(ctx.content_rect().width() * 0.8);
             egui::ScrollArea::vertical().max_height(max_height).auto_shrink([true, true]).show(ui, |ui| {
                 for line in info {
                     ui.colored_label(stale_color(ui.visuals()), line);
@@ -60,7 +62,7 @@ fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bo
     ui.horizontal(|ui| {
         ui.add_enabled(editable, egui::Checkbox::without_text(checked));
         ui.weak(kind_label(&item.kind));
-        ui.label(item_text(&item.kind));
+        ui.add(egui::Label::new(item_text(&item.kind)).wrap());
         if item.confidence == Confidence::Low {
             let warning = match &item.note {
                 Some(note) => format!("{} {}", strings::t().warning_icon, note_text(note)),

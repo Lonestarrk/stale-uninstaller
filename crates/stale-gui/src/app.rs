@@ -26,6 +26,7 @@ use stale_core::{Program, ProgramId, RegKeyPath, Scope};
 use crate::filter::{bucket_counts, visible_rows, Filters, Sort};
 use crate::flow::FlowState;
 use crate::ghost_sel::GhostSelection;
+use crate::leftover_sel::LeftoverGroup;
 use crate::leftover_sel::LeftoverSelection;
 use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
 use crate::warning::{Msg, Warning};
@@ -113,6 +114,8 @@ pub struct KeptGhost {
     /// Its row in the ghosts view, and whether it was checked.
     index: usize,
     checked: bool,
+    /// Its removal choices (the details popup's check marks).
+    group: LeftoverGroup,
     /// The keep list before the ghost was kept.
     keep_before: KeepList,
 }
@@ -188,6 +191,10 @@ pub struct StaleApp {
     pub last_kept: Option<KeptGhost>,
     /// The view the leftovers view's back button returns to: `Programs` or `Ghosts`.
     pub leftovers_origin: View,
+    /// The ghost whose details popup is open (an index into the ghost selection).
+    pub ghost_popup: Option<usize>,
+    /// The ghosts view's "Ta bort markerade" confirmation is open.
+    pub ghost_confirm: bool,
     /// Every program from the scan, hidden ones included.
     programs: Vec<Program>,
     /// Usage and sizes received so far, kept for hidden programs too.
@@ -268,6 +275,8 @@ impl StaleApp {
             keep_window_open: false,
             last_kept: None,
             leftovers_origin: View::Programs,
+            ghost_popup: None,
+            ghost_confirm: false,
             programs: Vec::new(),
             usage: HashMap::new(),
             sizes: HashMap::new(),
@@ -621,6 +630,7 @@ impl StaleApp {
             if self.leftovers_origin == View::Ghosts {
                 // The ghosts just quarantined must not be offered again.
                 self.ghosts = None;
+                self.ghost_popup = None;
                 self.refresh_ghosts();
             } else if !self.queue_running() {
                 // Its reports name what was just quarantined: "Visa rester" must not offer them again.
@@ -829,9 +839,9 @@ impl StaleApp {
     fn keep_ghost_at(&mut self, key: &str, path: &Path) {
         let Some(sel) = self.ghosts.as_mut() else { return };
         let Some(index) = sel.ghosts.iter().position(|g| g.key == key) else { return };
-        let ghost = &sel.ghosts[index];
-        self.last_kept =
-            Some(KeptGhost { ghost: ghost.clone(), index, checked: sel.checked[index], keep_before: self.keep.clone() });
+        let Some((ghost, checked, group)) = sel.remove_by_key(key) else { return };
+        self.ghost_popup = None;
+        let keep_before = self.keep.clone();
         self.keep.keep_name(ghost.name.clone());
         for e in &ghost.evidence {
             match e {
@@ -840,7 +850,7 @@ impl StaleApp {
                 Evidence::DanglingRef { .. } | Evidence::UsageTrace { .. } => {}
             }
         }
-        sel.remove_by_key(key);
+        self.last_kept = Some(KeptGhost { ghost, index, checked, group, keep_before });
         if let Err(e) = self.keep.save_to(path) {
             log::warn!("could not save the keep list to {}: {e}", path.display());
             self.warnings.push(Warning::Detail(Msg::KeepSaveFailed, e.to_string()));
@@ -858,9 +868,7 @@ impl StaleApp {
         self.keep = kept.keep_before;
         self.save_keep(path);
         if let Some(sel) = self.ghosts.as_mut() {
-            let at = kept.index.min(sel.ghosts.len());
-            sel.ghosts.insert(at, kept.ghost);
-            sel.checked.insert(at, kept.checked);
+            sel.insert(kept.index, (kept.ghost, kept.checked, kept.group));
         }
     }
 
@@ -888,15 +896,25 @@ impl StaleApp {
         }
     }
 
-    /// "Visa rester för markerade": the checked ghosts' leftovers in the leftovers view.
-    pub fn open_leftovers_from_ghosts(&mut self) {
-        let Some(sel) = &self.ghosts else { return };
-        let reports = sel.checked_reports();
-        if reports.is_empty() {
+    /// "Ta bort" in the ghosts view's confirmation: the checked ghosts' items go through the
+    /// leftovers view's removal (drive window, progress, summary); "Tillbaka" returns here.
+    pub fn remove_checked_ghosts(&mut self) {
+        self.remove_checked_ghosts_with(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes);
+    }
+
+    fn remove_checked_ghosts_with(&mut self, volume_ok: &dyn Fn(char) -> bool, free_bytes: &dyn Fn(char) -> Option<u64>) {
+        self.ghost_confirm = false;
+        if self.removal_running() {
             return;
         }
-        self.show_leftovers(LeftoverSelection::from_reports(&reports));
+        let Some(sel) = &self.ghosts else { return };
+        let selection = sel.removal_selection();
+        if selection.groups.is_empty() {
+            return;
+        }
+        self.show_leftovers(selection);
         self.leftovers_origin = View::Ghosts;
+        self.request_removal(volume_ok, free_bytes);
     }
 
     /// True while a ghost scan runs.
@@ -965,7 +983,9 @@ impl StaleApp {
         match rx.try_recv() {
             Ok(GhostEvent::Done(ghosts)) => {
                 log::info!("ghost scan found {} ghosts", ghosts.len());
-                self.ghosts = Some(GhostSelection::new(ghosts));
+                self.ghost_popup = None;
+                self.ghost_confirm = false;
+                self.ghosts = Some(GhostSelection::new(ghosts, &stale_core::paths::tasks_root()));
                 self.last_kept = None;
             }
             Ok(GhostEvent::Failed(msg)) => {
@@ -1603,7 +1623,7 @@ mod tests {
         use stale_core::ghosts::Assessment;
         let mut app = StaleApp::empty(Settings::default());
         app.apply_event(ScanEvent::Programs(vec![program("a", false)]));
-        app.ghosts = Some(GhostSelection::new(vec![ghost("Alpha", Assessment::LeftoversOnly, 1)]));
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![ghost("Alpha", Assessment::LeftoversOnly, 1)]));
         app.ghosts_generation = Some(app.programs_generation);
         app.show_ghosts();
         assert_eq!(app.view, View::Ghosts);
@@ -1628,7 +1648,7 @@ mod tests {
         let path = dir.path().join("important.json");
         let mut app = StaleApp::empty(Settings::default());
         app.keep.keep_name("Earlier".into());
-        app.ghosts = Some(GhostSelection::new(vec![
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![
             ghost("Alpha", Assessment::LeftoversOnly, 1),
             ghost("Beta", Assessment::ProbablyUninstalled, 2),
             ghost("Gamma", Assessment::LeftoversOnly, 3),
@@ -1686,7 +1706,7 @@ mod tests {
             partly_live: false,
         });
         let mut app = StaleApp::empty(Settings::default());
-        app.ghosts = Some(GhostSelection::new(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![alpha, ghost("Beta", Assessment::LeftoversOnly, 1)]));
 
         app.keep_ghost_at("alpha", &path);
         let saved = KeepList::load_from_with(&path, &trust_all);
@@ -1702,23 +1722,39 @@ mod tests {
     }
 
     #[test]
-    fn open_leftovers_from_ghosts_sets_origin_and_groups() {
+    fn remove_checked_ghosts_opens_leftovers_with_origin_ghosts() {
         use crate::ghost_sel::tests::ghost;
         use stale_core::ghosts::Assessment;
         let mut app = StaleApp::empty(Settings::default());
         app.view = View::Ghosts;
-        app.ghosts = Some(GhostSelection::new(vec![
-            ghost("Alpha", Assessment::ProbablyUninstalled, 100),
+        app.ghost_confirm = true;
+        // Alpha's folder is on E:, which cannot hold a payload: the drive window opens, so the
+        // test never starts a real removal.
+        let mut alpha = ghost("Alpha", Assessment::ProbablyUninstalled, 100);
+        if let Evidence::Folder { path, .. } = &mut alpha.evidence[0] {
+            *path = PathBuf::from(r"E:\Alpha");
+        }
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![
+            alpha,
             ghost("Beta", Assessment::Uncertain, 50),
             ghost("Gamma", Assessment::LeftoversOnly, 7),
         ]));
         // Leftovers-only ghosts start unchecked; the user ticks Gamma.
         app.ghosts.as_mut().unwrap().checked[2] = true;
-        app.open_leftovers_from_ghosts();
+        app.remove_checked_ghosts_with(&|d| d != 'E', &|_| Some(1_000_000));
+        assert!(!app.ghost_confirm);
         assert_eq!((app.view, app.leftovers_origin), (View::Leftovers, View::Ghosts));
         let sel = app.leftovers.as_ref().expect("selection built");
         let groups: Vec<(&str, usize)> = sel.groups.iter().map(|g| (g.program_name.as_str(), g.items.len())).collect();
         assert_eq!(groups, vec![("Alpha", 2), ("Gamma", 2)]);
+        assert!(app.removal_plan.is_some() && app.quarantine_rx.is_none(), "the drive window comes before the removal");
+
+        // Nothing to remove: the view stays where it is.
+        let mut none = StaleApp::empty(Settings::default());
+        none.view = View::Ghosts;
+        none.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![ghost("Beta", Assessment::Uncertain, 50)]));
+        none.remove_checked_ghosts_with(&|_| true, &|_| Some(1_000));
+        assert_eq!(none.view, View::Ghosts);
 
         app.leave_leftovers();
         assert_eq!(app.view, View::Ghosts, "back returns to the ghosts view");

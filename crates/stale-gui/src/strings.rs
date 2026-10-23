@@ -316,7 +316,8 @@ pub struct Strings {
     pub keep: &'static str,
     pub keep_save_failed: &'static str,
     pub keep_tip: &'static str,
-    pub show_ghost_leftovers: &'static str,
+    pub remove_ghosts: &'static str,
+    pub remove: &'static str,
     /// The leftovers view's back button when it was opened from the ghosts view.
     pub back: &'static str,
     pub ref_run: &'static str,
@@ -594,7 +595,8 @@ pub static SV: Strings = Strings {
     keep: "Behåll",
     keep_save_failed: "Kunde inte spara listan över behållna program",
     keep_tip: "Visa aldrig det här programmet, dess mappar eller nycklar igen",
-    show_ghost_leftovers: "Visa rester för markerade",
+    remove_ghosts: "Ta bort markerade…",
+    remove: "Ta bort",
     back: "Tillbaka",
     ref_run: "Autostart",
     ref_app_paths: "App Paths",
@@ -853,7 +855,8 @@ pub static EN: Strings = Strings {
     keep: "Keep",
     keep_save_failed: "Could not save the list of kept programs",
     keep_tip: "Never show this program, its folders or keys again",
-    show_ghost_leftovers: "Show leftovers of checked programs",
+    remove_ghosts: "Remove checked…",
+    remove: "Remove",
     back: "Back",
     ref_run: "Autostart",
     ref_app_paths: "App Paths",
@@ -1059,11 +1062,20 @@ pub fn uncertain_section(count: usize) -> String {
     }
 }
 
-/// The header of a ghost's evidence list: "Spår (4)".
-pub fn evidence_header(count: usize) -> String {
-    match lang() {
-        Lang::Sv => format!("Spår ({count})"),
-        Lang::En => format!("Traces ({count})"),
+/// The ghosts view's confirmation: how many items from how many programs go to quarantine.
+pub fn ghost_remove_confirm(items: usize, programs: usize, size: &str) -> String {
+    ghost_remove_confirm_in(lang(), items, programs, size)
+}
+
+/// [`ghost_remove_confirm`] in `lang`.
+pub fn ghost_remove_confirm_in(lang: Lang, items: usize, programs: usize, size: &str) -> String {
+    match lang {
+        Lang::Sv => format!("Flytta {items} rester från {programs} program ({size}) till karantänen? Du kan återställa dem från Karantän."),
+        Lang::En => format!(
+            "Move {items} {} from {programs} {} ({size}) to quarantine? You can restore them from Quarantine.",
+            plural(items, "leftover", "leftovers"),
+            plural(programs, "program", "programs")
+        ),
     }
 }
 
@@ -1445,6 +1457,14 @@ mod tests {
         assert_eq!(section_counts_in(Lang::En, 3, "3 MB"), "(3 hits, 3 MB)");
         assert_eq!(items_checked_in(Lang::Sv, 2, 5), "2 av 5");
         assert_eq!(items_checked_in(Lang::En, 2, 5), "2 of 5");
+        assert_eq!(
+            ghost_remove_confirm_in(Lang::En, 1, 1, "3 MB"),
+            "Move 1 leftover from 1 program (3 MB) to quarantine? You can restore them from Quarantine."
+        );
+        assert_eq!(
+            ghost_remove_confirm_in(Lang::Sv, 4, 2, "3 MB"),
+            "Flytta 4 rester från 2 program (3 MB) till karantänen? Du kan återställa dem från Karantän."
+        );
         assert_eq!(run_count_in(Lang::En, 1), "1 run");
         assert_eq!(run_count_in(Lang::En, 5), "5 runs");
         assert_eq!(run_count_in(Lang::Sv, 5), "5 körningar");
