@@ -67,6 +67,49 @@ impl RegistryReader for WinRegistry {
     }
 }
 
+/// Read-only access to a hive file loaded as an application hive (`RegLoadAppKeyW`, `KEY_READ`).
+/// Keys are addressed by their path inside the hive; the `hive` field of a [`RegKeyPath`] is
+/// ignored. Dropping it closes the key, which unloads the hive once nothing else holds it.
+pub struct HiveFileReader {
+    root: RegKey,
+}
+
+// SAFETY: the registry functions may be called on one HKEY from any thread; the reader only
+// opens subkeys and enumerates, and the key is closed once, on drop.
+unsafe impl Send for HiveFileReader {}
+// SAFETY: as above; no method mutates the reader.
+unsafe impl Sync for HiveFileReader {}
+
+impl HiveFileReader {
+    /// Loads `file` read-only. The file must be Stale's own copy: the registry keeps it open.
+    pub fn load(file: &std::path::Path) -> Result<HiveFileReader, String> {
+        RegKey::load_app_key_with_flags(file, KEY_READ, 0)
+            .map(|root| HiveFileReader { root })
+            .map_err(|e| format!("load {}: {e}", file.display()))
+    }
+
+    fn open(&self, key: &RegKeyPath) -> Result<RegKey, RegError> {
+        self.root.open_subkey_with_flags(key.path.trim_matches('\\'), KEY_READ).map_err(map_err)
+    }
+}
+
+impl RegistryReader for HiveFileReader {
+    fn subkeys(&self, key: &RegKeyPath) -> Result<Vec<String>, RegError> {
+        self.open(key)?.enum_keys().map(|r| r.map_err(map_err)).collect()
+    }
+
+    fn values(&self, key: &RegKeyPath) -> Result<Vec<(String, RegValue)>, RegError> {
+        self.open(key)?
+            .enum_values()
+            .map(|r| r.map(|(n, v)| (n, convert(&v))).map_err(map_err))
+            .collect()
+    }
+
+    fn key_exists(&self, key: &RegKeyPath) -> bool {
+        self.open(key).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

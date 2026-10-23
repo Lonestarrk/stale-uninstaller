@@ -25,6 +25,24 @@ pub fn startup_dirs() -> Vec<PathBuf> {
     start_menu_dirs().into_iter().map(|d| d.join("Startup")).collect()
 }
 
+/// [`start_menu_dirs`] plus each profile's own Start Menu `Programs` folder: existing folders
+/// only, deduplicated.
+pub fn profile_start_menu_dirs(profiles: &[PathBuf]) -> Vec<PathBuf> {
+    let per_profile = profiles.iter().map(|p| p.join(r"AppData\Roaming").join(START_MENU_PROGRAMS));
+    existing_unique(start_menu_dirs().into_iter().chain(per_profile))
+}
+
+/// [`startup_dirs`] plus each profile's own Startup folder: existing folders only, deduplicated.
+pub fn profile_startup_dirs(profiles: &[PathBuf]) -> Vec<PathBuf> {
+    let per_profile = profiles.iter().map(|p| p.join(r"AppData\Roaming").join(START_MENU_PROGRAMS).join("Startup"));
+    existing_unique(startup_dirs().into_iter().chain(per_profile))
+}
+
+fn existing_unique(dirs: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    dirs.filter(|d| d.is_dir() && seen.insert(norm(d))).collect()
+}
+
 /// Keeps COM initialized on the calling thread for its lifetime. If the thread already uses
 /// another apartment model (`RPC_E_CHANGED_MODE`) COM is usable as-is and nothing is undone.
 struct ComGuard {
@@ -130,8 +148,22 @@ fn collect_lnks(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Writes a shortcut `lnk` to `target` (which need not exist).
+    pub(crate) fn write_lnk(lnk: &Path, target: &Path) {
+        use windows::Win32::UI::Shell::IShellLinkW;
+        let _com = ComGuard::init();
+        let target = crate::pathutil::wide(target);
+        let file = crate::pathutil::wide(lnk);
+        // SAFETY: COM is initialized; both strings are NUL-terminated and outlive the calls.
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetPath(PCWSTR(target.as_ptr())).unwrap();
+            link.cast::<IPersistFile>().unwrap().Save(PCWSTR(file.as_ptr()), true).unwrap();
+        }
+    }
 
     #[test]
     fn start_menu_dirs_are_the_two_programs_folders() {

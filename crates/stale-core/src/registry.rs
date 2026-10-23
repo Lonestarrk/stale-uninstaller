@@ -4,7 +4,7 @@ pub mod fake;
 pub mod win;
 
 pub use fake::FakeRegistry;
-pub use win::WinRegistry;
+pub use win::{HiveFileReader, WinRegistry};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RegValue {
