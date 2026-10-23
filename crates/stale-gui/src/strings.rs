@@ -1070,11 +1070,16 @@ pub fn ghost_remove_confirm(items: usize, programs: usize, size: &str) -> String
 /// [`ghost_remove_confirm`] in `lang`.
 pub fn ghost_remove_confirm_in(lang: Lang, items: usize, programs: usize, size: &str) -> String {
     match lang {
-        Lang::Sv => format!("Flytta {items} rester från {programs} program ({size}) till karantänen? Du kan återställa dem från Karantän."),
+        Lang::Sv => format!(
+            "Flytta {items} {} från {programs} program ({size}) till karantänen? Du kan återställa {} från Karantän.",
+            plural(items, "rest", "rester"),
+            plural(items, "den", "dem")
+        ),
         Lang::En => format!(
-            "Move {items} {} from {programs} {} ({size}) to quarantine? You can restore them from Quarantine.",
+            "Move {items} {} from {programs} {} ({size}) to quarantine? You can restore {} from Quarantine.",
             plural(items, "leftover", "leftovers"),
-            plural(programs, "program", "programs")
+            plural(programs, "program", "programs"),
+            plural(items, "it", "them")
         ),
     }
 }
@@ -1459,7 +1464,11 @@ mod tests {
         assert_eq!(items_checked_in(Lang::En, 2, 5), "2 of 5");
         assert_eq!(
             ghost_remove_confirm_in(Lang::En, 1, 1, "3 MB"),
-            "Move 1 leftover from 1 program (3 MB) to quarantine? You can restore them from Quarantine."
+            "Move 1 leftover from 1 program (3 MB) to quarantine? You can restore it from Quarantine."
+        );
+        assert_eq!(
+            ghost_remove_confirm_in(Lang::Sv, 1, 1, "3 MB"),
+            "Flytta 1 rest från 1 program (3 MB) till karantänen? Du kan återställa den från Karantän."
         );
         assert_eq!(
             ghost_remove_confirm_in(Lang::Sv, 4, 2, "3 MB"),

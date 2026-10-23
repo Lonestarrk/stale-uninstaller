@@ -912,6 +912,7 @@ impl StaleApp {
         if selection.groups.is_empty() {
             return;
         }
+        self.ghost_popup = None;
         self.show_leftovers(selection);
         self.leftovers_origin = View::Ghosts;
         self.request_removal(volume_ok, free_bytes);
