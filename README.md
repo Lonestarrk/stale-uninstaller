@@ -25,7 +25,9 @@ Download the latest installer from the [Releases page](https://github.com/Lonest
 
 ## Future features
 
-- Junk finder: growing AppData and cache folders, explained in plain language with a safety rating, sharing the keep list.
+- Folder explainer: growing AppData and cache folders, explained in plain language with a safety rating, sharing the keep list.
+- "Where did the space go?": compare drive snapshots over time to see what grew.
+- Compacting Docker and WSL virtual disks.
 - Microsoft Store apps.
 - Elevation on demand instead of at start-up.
 - Parallel scanning and an NTFS fast path for folder sizes.
