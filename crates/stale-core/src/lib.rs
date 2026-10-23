@@ -27,6 +27,7 @@ pub mod services;
 pub mod settings;
 pub mod shortcuts;
 pub mod size;
+pub mod space;
 pub mod trusted;
 pub mod uninstall;
 pub mod usage;
