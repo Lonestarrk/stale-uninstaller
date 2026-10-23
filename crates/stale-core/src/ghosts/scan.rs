@@ -68,6 +68,7 @@ pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
     let shortcuts: Vec<ShortcutTarget> = l.start_menu_targets.iter().chain(&l.desktop_targets).cloned().collect();
     let roots = NameRoots::new(&l.fs_roots, &fs.profile_dirs(), &src.programs);
     let mut evidence: Vec<Evidence> = orphan_folders(fs, &l.fs_roots, &installed, keep);
+    evidence.retain(|e| !l.own.is_own_evidence(e));
     let folder_names: Vec<String> = evidence.iter().filter_map(|e| ghost_name_of(e, &roots)).collect();
     let collected: Vec<Collected> = vec![
         registry_collect(reg, fs, &l.reg_roots, &installed, keep, drive_present, &folder_names),
@@ -78,7 +79,7 @@ pub fn scan_ghosts(src: &GhostSources) -> Vec<Ghost> {
     ];
     let mut live_targets = Vec::new();
     for c in collected {
-        evidence.extend(c.evidence);
+        evidence.extend(c.evidence.into_iter().filter(|e| !l.own.is_own_evidence(e)));
         live_targets.extend(c.live_targets);
     }
     let live = LiveRefs::from_targets(live_targets.iter().map(|p| (src.long_path)(p)));
@@ -119,6 +120,7 @@ mod tests {
                 start_menu_targets: Vec::new(),
                 desktop_targets: Vec::new(),
                 keep: KeepList::default(),
+                own: crate::own::OwnPaths::default(),
                 reg,
                 fs,
             },
@@ -303,6 +305,38 @@ mod tests {
     }
 
     #[test]
+    fn own_data_dir_is_never_ghost_evidence() {
+        let fs = base_fs().file(r"C:\ProgramData\Stale Uninstaller\settings.json", 5).file(r"D:\Stale Uninstaller\quarantine\x\f.bin", 5);
+        let mut src = sources(fs, FakeRegistry::new());
+        src.long_path = Box::new(Path::to_path_buf);
+        assert!(scan_ghosts(&src).iter().any(|g| g.name == "Stale Uninstaller"), "the fake must be a ghost without the filter");
+        src.leftovers.own = crate::own::OwnPaths::from_folders([PathBuf::from(r"C:\ProgramData\Stale Uninstaller"), PathBuf::from(r"D:\Stale Uninstaller")]);
+        let ghosts = scan_ghosts(&src);
+        assert!(ghosts.is_empty(), "{ghosts:?}");
+    }
+
+    #[test]
+    fn own_install_dir_and_exe_traces_are_dropped() {
+        let fs = base_fs().file(r"C:\Program Files\Stale Uninstaller\StaleUninstaller.exe", 5);
+        let mut reg = FakeRegistry::new();
+        let hkcu = |p: &str| key(Hive::CurrentUser, p);
+        reg.set(hkcu(r"Software\Stale Uninstaller"), "Language", RegValue::Str("sv".into()));
+        let mut src = sources(fs, reg);
+        src.leftovers.reg_roots.software = vec![hkcu("Software")];
+        src.unmatched_hits = vec![UsageHit {
+            exe_path: r"C:\Program Files\Stale Uninstaller\StaleUninstaller.exe".into(),
+            last_run: Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            source: UsageSource::Bam,
+            run_count: None,
+        }];
+        assert!(scan_ghosts(&src).iter().any(|g| g.name == "Stale Uninstaller"), "the fake must be a ghost without the filter");
+        // The exe name and the key are dropped wherever they are; the folder through the install dir.
+        src.leftovers.own = crate::own::OwnPaths::from_folders([PathBuf::from(r"C:\Program Files\Stale Uninstaller")]);
+        let ghosts = scan_ghosts(&src);
+        assert!(ghosts.is_empty(), "{ghosts:?}");
+    }
+
+    #[test]
     fn scan_ghosts_end_to_end_with_fakes() {
         let fs = FakeFs::new()
             .env("ProgramFiles", r"C:\Program Files")
@@ -323,6 +357,7 @@ mod tests {
                 start_menu_targets: Vec::new(),
                 desktop_targets: Vec::new(),
                 keep: KeepList::default(),
+                own: crate::own::OwnPaths::default(),
                 reg,
                 fs,
             },

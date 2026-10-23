@@ -5,6 +5,7 @@ use super::other_scan::{desktop_dirs, scan_services, scan_shortcuts, scan_tasks}
 use super::reg_scan::{scan_registry, RegScanRoots};
 use super::{mark_used_by_others, Confidence, Leftover, LeftoverKind, LeftoverReport, ProgramHint};
 use crate::keep::KeepList;
+use crate::own::OwnPaths;
 use crate::fsys::{FsReader, RealFs};
 use crate::pathutil::norm;
 use crate::registry::{RegistryReader, WinRegistry};
@@ -23,6 +24,8 @@ pub struct LeftoverSources {
     pub start_menu_targets: Vec<ShortcutTarget>,
     pub desktop_targets: Vec<ShortcutTarget>,
     pub keep: KeepList,
+    /// Stale's own folders and key, never reported.
+    pub own: OwnPaths,
 }
 
 impl LeftoverSources {
@@ -37,6 +40,7 @@ impl LeftoverSources {
             start_menu_targets: shortcut_targets(&start_menu_dirs()),
             desktop_targets: shortcut_targets(&desktop_dirs(&*fs)),
             keep: KeepList::load_from(&crate::paths::keep_list_path()),
+            own: OwnPaths::live(),
             reg,
             fs,
         }
@@ -86,6 +90,8 @@ pub fn scan_leftovers(src: &LeftoverSources, hint: &ProgramHint) -> LeftoverRepo
                 .into_iter()
                 .filter(|l| matches!(&l.kind, LeftoverKind::Shortcut { lnk, .. } if src.fs.exists(lnk))),
         );
+
+    let all = all.filter(|l| !src.own.is_own_leftover(&l.kind));
 
     let mut items: Vec<Leftover> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -145,6 +151,7 @@ mod tests {
             start_menu_targets: shortcuts,
             desktop_targets: Vec::new(),
             keep: KeepList::default(),
+            own: OwnPaths::default(),
             reg,
             fs,
         }
@@ -262,5 +269,30 @@ mod tests {
         assert!(!report.items.is_empty());
         assert!(report.items.iter().all(|l| l.confidence != Confidence::High), "{report:?}");
         assert!(report.items.iter().all(|l| !matches!(l.kind, LeftoverKind::Shortcut { .. })));
+    }
+
+    #[test]
+    fn own_folders_are_never_leftovers() {
+        let fs = FakeFs::new()
+            .dir(r"C:\ProgramData\Stale Uninstaller", 10)
+            .dir(r"D:\Stale Uninstaller", 10)
+            .dir(r"C:\Program Files\Stale Uninstaller", 10)
+            .dir(r"C:\Users\A\AppData\Roaming\Stale Uninstaller", 5)
+            .file(r"C:\Menu\Stale Uninstaller.lnk", 1);
+        let mut reg = FakeRegistry::new();
+        reg.add_key(key(Hive::CurrentUser, r"Software\Stale Uninstaller"));
+        let own_lnk = lnk(r"C:\Program Files\Stale Uninstaller\StaleUninstaller.exe", r"C:\Menu\Stale Uninstaller.lnk");
+        let mut src = sources(fs, reg, vec![own_lnk]);
+        let hint = ProgramHint::manual("Stale Uninstaller", Some(PathBuf::from(r"C:\Program Files\Stale Uninstaller")));
+        assert!(scan_leftovers(&src, &hint).items.len() > 1, "the fakes must produce items without the filter");
+        src.own = OwnPaths::from_folders([
+            PathBuf::from(r"C:\ProgramData\Stale Uninstaller"),
+            PathBuf::from(r"D:\Stale Uninstaller"),
+            PathBuf::from(r"C:\Program Files\Stale Uninstaller"),
+        ]);
+        let left: Vec<String> = scan_leftovers(&src, &hint).items.iter().map(|l| format!("{:?}", l.kind)).collect();
+        // Only the profile folder is not one of ours; the key and the shortcut are.
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains("AppData"), "{left:?}");
     }
 }

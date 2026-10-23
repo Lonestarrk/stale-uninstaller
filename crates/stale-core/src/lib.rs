@@ -11,6 +11,7 @@ pub mod knownfolders;
 pub mod leftovers;
 pub mod model;
 pub mod offline_hives;
+pub mod own;
 pub mod pathutil;
 pub mod paths;
 pub mod proc;

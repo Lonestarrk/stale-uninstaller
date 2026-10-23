@@ -4,11 +4,10 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
 use stale_core::quarantine::{DestinationPlan, QuarantineManifest};
 use stale_core::RegKeyPath;
 
-use super::stale_color;
+use super::{leftover_popup, stale_color};
 use crate::app::{StaleApp, View};
 use crate::leftover_sel::LeftoverGroup;
 use crate::{format, strings};
@@ -25,6 +24,7 @@ enum Action {
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let removing = app.removal_running();
     let mut action = None;
+    let mut open_popup = None;
     let back = back_label(app.leftovers_origin);
     ui.horizontal(|ui| {
         ui.heading(strings::t().leftovers_title);
@@ -69,12 +69,23 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 ui.label(strings::t().no_leftovers);
             }
             for (gi, group) in sel.groups.iter_mut().enumerate() {
-                egui::CollapsingHeader::new(&group.program_name)
-                    .id_salt(("leftover_group", gi))
-                    .default_open(true)
-                    .show(ui, |ui| group_body(ui, group, !removing));
+                if group_row(ui, gi, group, !removing) {
+                    open_popup = Some(gi);
+                }
             }
         });
+        if let Some(gi) = app.leftover_popup {
+            let title = sel.groups[gi].program_name.clone();
+            let id = ui.scope_id().with(("leftover_popup", gi));
+            if !leftover_popup::show(ui.ctx(), id, &title, &[], &mut sel.groups[gi], !removing) {
+                app.leftover_popup = None;
+            }
+        }
+    }
+    if open_popup.is_some() {
+        app.leftover_popup = open_popup;
+        // Show the popup now, not on the next input event.
+        ui.ctx().request_repaint();
     }
     match action {
         Some(Action::Back) => app.leave_leftovers(),
@@ -87,9 +98,73 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             app.request_removal(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes)
         }
         Some(Action::ConfirmRemove) => app.confirm_removal(),
-        Some(Action::CancelRemove) => app.removal_plan = None,
+        Some(Action::CancelRemove) => app.cancel_removal_plan(),
         None => {}
     }
+}
+
+const ROW_HEIGHT: f32 = 24.0;
+
+/// What the user did to a compact row.
+pub(super) struct RowClicks {
+    pub clicked: bool,
+    pub double_clicked: bool,
+}
+
+/// A compact, clickable row of fixed height with a hover highlight. `contents` draws it
+/// (centered vertically). The row senses clicks under
+/// the contents, so the check box keeps its own click.
+pub(super) fn compact_row(ui: &mut egui::Ui, index: usize, contents: impl FnOnce(&mut egui::Ui)) -> RowClicks {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::hover());
+    let row = ui.interact(rect, ui.scope_id().with(("leftover_row", index)), egui::Sense::click());
+    if row.hovered() {
+        ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.horizontal_centered(contents);
+    });
+    RowClicks { clicked: row.clicked(), double_clicked: row.double_clicked() }
+}
+
+/// One program's row: checkbox, name, "N av M" and the size of what is checked. A click ticks or
+/// unticks the program's items, a double-click asks for the popup (returns true).
+fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup, editable: bool) -> bool {
+    let mut box_clicked = false;
+    let clicks = compact_row(ui, index, |ui| {
+        let mut on = group.checked_count() > 0;
+        box_clicked = ui.add_enabled(editable, egui::Checkbox::new(&mut on, "")).clicked();
+        if box_clicked {
+            group.toggle_all();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format::human_size(Some(group.checked_bytes())));
+            ui.label(strings::items_checked(group.checked_count(), group.items.len()));
+            // A long name is cut off instead of pushing the numbers away.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(&group.program_name).truncate());
+            });
+        });
+    });
+    if !editable {
+        // A removal is running: the choices are frozen, the popup still opens to look.
+        return clicks.double_clicked;
+    }
+    row_click(group, box_clicked, clicks.clicked, clicks.double_clicked)
+}
+
+/// Whether a row's own click toggles its check mark: not when the click was on the check box.
+pub(super) fn row_toggles(box_clicked: bool, clicked: bool) -> bool {
+    clicked && !box_clicked
+}
+
+/// Applies a row's click to its group and says whether the popup is wanted. Both clicks of a
+/// double-click report `clicked()` (egui adds `double_clicked()` to the second), so they toggle
+/// twice and leave the check boxes as they were; the box's own click was already handled.
+fn row_click(group: &mut LeftoverGroup, box_clicked: bool, clicked: bool, double_clicked: bool) -> bool {
+    if row_toggles(box_clicked, clicked) {
+        group.toggle_all();
+    }
+    double_clicked
 }
 
 /// Before a removal that copies files to C: or lacks space: one line per fallback drive and per
@@ -117,43 +192,6 @@ fn removal_confirm_window(ui: &egui::Ui, plan: &DestinationPlan, action: &mut Op
                 }
             });
         });
-}
-
-/// One program's leftovers in three sections; check boxes are disabled while a removal runs.
-fn group_body(ui: &mut egui::Ui, group: &mut LeftoverGroup, editable: bool) {
-    for (section, title) in
-        [strings::t().section_files, strings::t().section_registry, strings::t().section_other].into_iter().enumerate()
-    {
-        let indices: Vec<usize> = (0..group.items.len()).filter(|&i| section_of(&group.items[i].kind) == section).collect();
-        if indices.is_empty() {
-            continue;
-        }
-        let bytes = indices.iter().filter_map(|&i| group.items[i].size()).sum();
-        ui.strong(format!("{title} {}", strings::section_counts(indices.len(), &format::human_size(Some(bytes)))));
-        for i in indices {
-            item_row(ui, &group.items[i], &mut group.checked[i], editable);
-        }
-    }
-}
-
-fn item_row(ui: &mut egui::Ui, item: &Leftover, checked: &mut bool, editable: bool) {
-    ui.horizontal(|ui| {
-        ui.add_enabled(editable, egui::Checkbox::without_text(checked));
-        ui.weak(kind_label(&item.kind));
-        ui.label(item_text(&item.kind));
-        if item.confidence == Confidence::Low {
-            let warning = match &item.note {
-                Some(note) => format!("{} {}", strings::t().warning_icon, note_text(note)),
-                None => strings::t().warning_icon.to_string(),
-            };
-            ui.colored_label(stale_color(ui.visuals()), warning);
-        }
-        if let LeftoverKind::Dir { size, .. } | LeftoverKind::File { size, .. } = &item.kind {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format::human_size(*size));
-            });
-        }
-    });
 }
 
 /// A removal's failures, one line each, with the core's error codes worded.
@@ -228,41 +266,9 @@ fn back_label(origin: View) -> &'static str {
     if origin == View::Ghosts { strings::t().back } else { strings::t().back_to_programs }
 }
 
-/// 0: folders and files, 1: registry, 2: everything else.
-fn section_of(kind: &LeftoverKind) -> usize {
-    match kind {
-        LeftoverKind::Dir { .. } | LeftoverKind::File { .. } => 0,
-        LeftoverKind::RegKey { .. } | LeftoverKind::RegValue { .. } => 1,
-        LeftoverKind::Shortcut { .. } | LeftoverKind::Service { .. } | LeftoverKind::ScheduledTask { .. } => 2,
-    }
-}
-
-fn kind_label(kind: &LeftoverKind) -> &'static str {
-    match kind {
-        LeftoverKind::Dir { .. } => strings::t().kind_dir,
-        LeftoverKind::File { .. } => strings::t().kind_file,
-        LeftoverKind::RegKey { .. } => strings::t().kind_regkey,
-        LeftoverKind::RegValue { .. } => strings::t().kind_regvalue,
-        LeftoverKind::Shortcut { .. } => strings::t().kind_shortcut,
-        LeftoverKind::Service { .. } => strings::t().kind_service,
-        LeftoverKind::ScheduledTask { .. } => strings::t().kind_task,
-    }
-}
-
 /// `HKLM\<path>`, `HKCU\<path>` or `HKU\<path>`.
 pub(crate) fn key_text(key: &RegKeyPath) -> String {
     format!(r"{}\{}", key.hive.short_name(), key.path)
-}
-
-/// The path, key or name that identifies a leftover.
-fn item_text(kind: &LeftoverKind) -> String {
-    match kind {
-        LeftoverKind::Dir { path, .. } | LeftoverKind::File { path, .. } => path.display().to_string(),
-        LeftoverKind::RegKey { key } => key_text(key),
-        LeftoverKind::RegValue { key, name } => format!("{} → {name}", key_text(key)),
-        LeftoverKind::Shortcut { lnk, .. } => lnk.display().to_string(),
-        LeftoverKind::Service { name, .. } | LeftoverKind::ScheduledTask { name, .. } => name.clone(),
-    }
 }
 
 /// The user's text for a core note or ghost reason key; unknown keys are shown as they are.
@@ -293,7 +299,27 @@ pub(crate) fn note_text(note: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stale_core::Hive;
+    use stale_core::leftovers::LeftoverKind;
+
+    #[test]
+    fn double_click_leaves_row_check_unchanged() {
+        use stale_core::leftovers::{Confidence, Leftover};
+        let item = |p: &str, confidence| Leftover {
+            kind: LeftoverKind::Dir { path: PathBuf::from(p), size: Some(1) },
+            confidence,
+            note: None,
+        };
+        let report = stale_core::leftovers::LeftoverReport { items: vec![item(r"C:\A", Confidence::High), item(r"C:\B", Confidence::Medium)] };
+        let mut group = crate::leftover_sel::LeftoverSelection::from_reports(&[("A".into(), report)]).groups.remove(0);
+        let before = group.checked.clone();
+        assert!(!row_click(&mut group, false, true, false), "first click: no popup");
+        assert_eq!(group.checked, vec![false, false]);
+        assert!(row_click(&mut group, false, true, true), "second click: popup");
+        assert_eq!(group.checked, before);
+        // A click on the box itself is not toggled a second time by the row.
+        assert!(!row_click(&mut group, true, true, false));
+        assert_eq!(group.checked, before);
+    }
 
     #[test]
     fn notes_map_to_swedish_and_unknown_pass_through() {
@@ -346,26 +372,5 @@ mod tests {
     fn back_button_names_its_destination() {
         assert_eq!(back_label(View::Ghosts), strings::t().back);
         assert_eq!(back_label(View::Programs), strings::t().back_to_programs);
-    }
-
-    #[test]
-    fn registry_items_show_hive_abbreviation() {
-        let key = |hive| RegKeyPath { hive, path: r"Software\Foo".into() };
-        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::LocalMachine) }), r"HKLM\Software\Foo");
-        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::CurrentUser) }), r"HKCU\Software\Foo");
-        assert_eq!(item_text(&LeftoverKind::RegKey { key: key(Hive::Users) }), r"HKU\Software\Foo");
-        assert_eq!(
-            item_text(&LeftoverKind::RegValue { key: key(Hive::CurrentUser), name: "Foo".into() }),
-            r"HKCU\Software\Foo → Foo"
-        );
-        assert_eq!(kind_label(&LeftoverKind::RegValue { key: key(Hive::Users), name: String::new() }), strings::t().kind_regvalue);
-    }
-
-    #[test]
-    fn sections_split_files_registry_other() {
-        let path = PathBuf::from(r"C:\x");
-        assert_eq!(section_of(&LeftoverKind::File { path: path.clone(), size: None }), 0);
-        assert_eq!(section_of(&LeftoverKind::RegKey { key: RegKeyPath { hive: Hive::LocalMachine, path: "x".into() } }), 1);
-        assert_eq!(section_of(&LeftoverKind::Service { name: "s".into(), image: path }), 2);
     }
 }

@@ -95,7 +95,7 @@ fn main() -> eframe::Result {
     strings::set_lang(strings::startup_lang(settings.language.as_deref()));
     log::info!("language: {}", strings::lang().code());
     spawn_auto_purge(settings.quarantine_days);
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]).with_title(t().app_title);
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1500.0, 950.0]).with_title(t().app_title);
     match eframe::icon_data::from_png_bytes(WINDOW_ICON_PNG) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(e) => log::warn!("could not decode the window icon: {e}"),

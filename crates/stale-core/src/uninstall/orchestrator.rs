@@ -195,6 +195,7 @@ mod tests {
             start_menu_targets: Vec::new(),
             desktop_targets: Vec::new(),
             keep: crate::keep::KeepList::default(),
+            own: crate::own::OwnPaths::default(),
             reg: reg.clone(),
             fs: fs.clone(),
         };

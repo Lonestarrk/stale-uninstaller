@@ -1,18 +1,16 @@
-//! The ghosts view ("Spökprogram"): programs gone from the uninstall list that left traces, each
-//! with its evidence and Behåll; the checked ones go on to the leftovers view.
+//! The ghosts view ("Spökprogram"): programs gone from the uninstall list that left traces, one
+//! compact row each with Behåll; a double-click shows the details and "Ta bort markerade…" moves
+//! the checked ones' leftovers to the quarantine through the leftovers view.
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::ghosts::{parse_location, Assessment, Evidence, Ghost, RefKind};
 
-use super::leftovers_view::{key_text, note_text};
-use super::stale_color;
+use super::leftovers_view::{compact_row, key_text, note_text, row_toggles};
+use super::{leftover_popup, stale_color};
 use crate::app::{KeepEntry, StaleApp, View};
 use stale_core::keep::KeepList;
 use crate::{format, strings};
-
-/// Evidence lists longer than this start collapsed.
-const OPEN_EVIDENCE_MAX: usize = 5;
 
 /// What a click in the view asks for, applied after drawing.
 enum Action {
@@ -20,13 +18,16 @@ enum Action {
     Refresh,
     Keep(String),
     UndoKeep,
-    ShowLeftovers,
+    AskRemove,
+    CancelRemove,
+    ConfirmRemove,
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
     let busy = app.ghost_scan_busy();
     let removing = app.removal_running();
     let mut action = None;
+    let mut open_popup = None;
     ui.horizontal(|ui| {
         ui.heading(strings::t().ghosts_title);
         if ui.button(strings::t().back_to_programs).clicked() {
@@ -56,15 +57,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
         if sel.ghosts.is_empty() {
             ui.label(strings::t().ghosts_empty);
         } else {
-            let (checked, total, bytes) = sel.summary();
-            let can_show = checked > 0 && !removing;
+            let (checked, items, bytes) = sel.summary();
+            let can_remove = items > 0 && !removing;
+            if app.ghost_confirm {
+                remove_confirm_window(ui.ctx(), items, checked, bytes, &mut action);
+            }
             egui::Panel::bottom("ghosts_footer").show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(strings::ghost_summary(checked, total, &format::human_size(Some(bytes))));
+                    ui.label(strings::ghost_summary(checked, sel.ghosts.len(), &format::human_size(Some(bytes))));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(can_show, egui::Button::new(strings::t().show_ghost_leftovers)).clicked() {
-                            action = Some(Action::ShowLeftovers);
+                        if ui.add_enabled(can_remove, egui::Button::new(strings::t().remove_ghosts)).clicked() {
+                            action = Some(Action::AskRemove);
                         }
                     });
                 });
@@ -83,19 +87,39 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp, now: DateTime<Utc>) {
                         .default_open(open)
                         .show(ui, |ui| {
                             for i in rows {
-                                ghost_row(ui, &sel.ghosts[i], &mut sel.checked[i], now, &mut action);
+                                if ghost_row(ui, i, &sel.ghosts[i], &mut sel.checked[i], now, &mut action) {
+                                    open_popup = Some(i);
+                                }
                             }
                         });
                 }
             });
+            if let Some(gi) = app.ghost_popup {
+                match (sel.ghosts.get(gi), sel.leftovers.get_mut(gi)) {
+                    (Some(ghost), Some(group)) => {
+                        let id = ui.scope_id().with(("ghost_popup", gi));
+                        if !leftover_popup::show(ui.ctx(), id, &ghost.name, &popup_info(ghost), group, !removing) {
+                            app.ghost_popup = None;
+                        }
+                    }
+                    _ => app.ghost_popup = None,
+                }
+            }
         }
+    }
+    if open_popup.is_some() {
+        app.ghost_popup = open_popup;
+        // Show the popup now, not on the next input event.
+        ui.ctx().request_repaint();
     }
     match action {
         Some(Action::Back) => app.view = View::Programs,
         Some(Action::Refresh) => app.refresh_ghosts(),
         Some(Action::Keep(key)) => app.keep_ghost(&key),
         Some(Action::UndoKeep) => app.undo_keep(),
-        Some(Action::ShowLeftovers) => app.open_leftovers_from_ghosts(),
+        Some(Action::AskRemove) => app.ghost_confirm = true,
+        Some(Action::CancelRemove) => app.ghost_confirm = false,
+        Some(Action::ConfirmRemove) => app.remove_checked_ghosts(),
         None => {}
     }
 }
@@ -138,41 +162,69 @@ fn keep_entries(keep: &KeepList) -> Vec<(KeepEntry, String)> {
     names.chain(paths).chain(keys).collect()
 }
 
-/// Check box, name, assessment, size, last use and Behåll; then why it is uncertain and its evidence.
-fn ghost_row(ui: &mut egui::Ui, ghost: &Ghost, checked: &mut bool, now: DateTime<Utc>, action: &mut Option<Action>) {
-    ui.horizontal(|ui| {
-        ui.add(egui::Checkbox::without_text(checked));
-        ui.strong(&ghost.name);
-        if let Some(publisher) = &ghost.publisher {
-            ui.weak(publisher);
-        }
-        let badge = assessment_label(ghost.assessment);
-        if ghost.assessment == Assessment::Uncertain {
-            ui.colored_label(stale_color(ui.visuals()), badge);
-        } else {
-            ui.label(badge);
-        }
-        ui.label(format::human_size(Some(ghost.total_size)));
-        ui.label(format::relative_date(ghost.last_used, now));
+/// "Ta bort markerade…": what goes to the quarantine, then Avbryt / Ta bort.
+fn remove_confirm_window(ctx: &egui::Context, items: usize, programs: usize, bytes: u64, action: &mut Option<Action>) {
+    egui::Window::new(strings::t().remove_ghosts)
+        .id(egui::Id::unique("remove_ghosts_window"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(ctx.content_rect().width() * 0.6);
+            ui.label(strings::ghost_remove_confirm(items, programs, &format::human_size(Some(bytes))));
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(strings::t().cancel).clicked() {
+                    *action = Some(Action::CancelRemove);
+                }
+                if ui.button(strings::t().remove).clicked() {
+                    *action = Some(Action::ConfirmRemove);
+                }
+            });
+        });
+}
+
+/// One compact row: check box, name, publisher, badge (with a warning for an uncertain one), size,
+/// last use and Behåll. A click toggles the check box, a double-click asks for the popup (true).
+fn ghost_row(ui: &mut egui::Ui, index: usize, ghost: &Ghost, checked: &mut bool, now: DateTime<Utc>, action: &mut Option<Action>) -> bool {
+    let mut box_clicked = false;
+    let clicks = compact_row(ui, index, |ui| {
+        box_clicked = ui.add(egui::Checkbox::without_text(checked)).clicked();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(strings::t().keep).on_hover_text(strings::t().keep_tip).clicked() {
                 *action = Some(Action::Keep(ghost.key.clone()));
             }
+            ui.label(format::relative_date(ghost.last_used, now));
+            ui.label(format::human_size(Some(ghost.total_size)));
+            let badge = assessment_label(ghost.assessment);
+            if ghost.assessment == Assessment::Uncertain {
+                ui.colored_label(stale_color(ui.visuals()), badge);
+            } else {
+                ui.label(badge);
+            }
+            if let Some(why) = uncertainty_text(ghost) {
+                ui.colored_label(stale_color(ui.visuals()), strings::t().warning_icon).on_hover_text(why);
+            }
+            // Long names are cut off instead of pushing the columns away.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&ghost.name).strong()).truncate());
+                if let Some(publisher) = &ghost.publisher {
+                    ui.add(egui::Label::new(egui::RichText::new(publisher).weak()).truncate());
+                }
+            });
         });
     });
-    if let Some(why) = uncertainty_text(ghost) {
-        ui.colored_label(stale_color(ui.visuals()), format!("{} {why}", strings::t().warning_icon));
+    // Both clicks of a double-click toggle, which leaves the check box as it was.
+    if row_toggles(box_clicked, clicks.clicked) {
+        *checked = !*checked;
     }
-    let lines: Vec<String> = ghost.evidence.iter().map(evidence_line).collect();
-    egui::CollapsingHeader::new(strings::evidence_header(lines.len()))
-        .id_salt(("ghost_evidence", &ghost.key))
-        .default_open(lines.len() <= OPEN_EVIDENCE_MAX)
-        .show(ui, |ui| {
-            for line in &lines {
-                ui.label(line);
-            }
-        });
-    ui.add_space(4.0);
+    clicks.double_clicked
+}
+
+/// The popup's lines above the items: why the ghost is uncertain, then its usage traces.
+fn popup_info(ghost: &Ghost) -> Vec<String> {
+    let traces = ghost.evidence.iter().filter(|e| matches!(e, Evidence::UsageTrace { .. })).map(evidence_line);
+    uncertainty_text(ghost).into_iter().chain(traces).collect()
 }
 
 fn section_title(a: Assessment, count: usize) -> String {
@@ -297,6 +349,17 @@ mod tests {
         assert_eq!(uncertainty_text(&g), Some(both));
         g.reasons.clear();
         assert_eq!(uncertainty_text(&g).as_deref(), Some(strings::t().note_other_profile));
+    }
+
+    #[test]
+    fn popup_info_is_the_uncertainty_then_usage_traces_only() {
+        let mut g = ghost("Foo", Assessment::Uncertain, 1);
+        assert!(popup_info(&g).is_empty(), "folders and keys are the popup's items, not info");
+        g.reasons = vec![REASON_SIBLING_OWNED.into()];
+        let when = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+        let trace = Evidence::UsageTrace { exe: r"C:\Foo\foo.exe".into(), last_run: when, source: UsageSource::Bam };
+        g.evidence.push(trace.clone());
+        assert_eq!(popup_info(&g), vec![strings::t().note_sibling_owned.to_string(), evidence_line(&trace)]);
     }
 
     #[test]
