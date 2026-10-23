@@ -50,7 +50,7 @@ const NEVER_LISTED: &[&str] = &[
     "$windows.~tmp",
 ];
 
-fn never_listed(name: &str) -> bool {
+pub(super) fn never_listed(name: &str) -> bool {
     let lower = name.to_lowercase();
     NEVER_LISTED.contains(&lower.as_str()) || lower.starts_with("dumpstack.log")
 }

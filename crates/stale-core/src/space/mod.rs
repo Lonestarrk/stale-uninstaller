@@ -1,7 +1,9 @@
 //! The space scan behind "Sök rester": folders and files that no installed program owns, plus the
 //! big Windows space hogs (`Windows.old` and its kind). [`list_entries`] lists without sizes;
-//! [`measure`] sizes one entry, so the caller can stream the sizes.
+//! [`measure`] sizes one entry, so the caller can stream the sizes. [`children`] lists what is below
+//! an opened entry.
 
+mod browse;
 mod catalog;
 mod scan;
 
@@ -9,6 +11,7 @@ use crate::ghosts::RootKind;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
+pub use browse::{children, BlockReason, Child, BROWSE_LIMIT};
 pub use scan::{fixed_drives, list_entries, measure, measure_at, removal_items, USER_TEMP_MIN_AGE_DAYS};
 
 /// What a space entry is.
