@@ -91,3 +91,16 @@ identical).
 - `--uninstall-cleanup --ask --silent`: exit 10, data folder untouched.
 - Silent uninstall: exit 0; log shows `--ask` exit 10, `--apply remove` exit 0, then file deletions;
   program folder, uninstall key, shortcut and `%ProgramData%\Stale Uninstaller` gone.
+
+## Version 0.1.2 (2026-10-23)
+
+Setup `StaleUninstaller-Setup-0.1.2.exe`, 5 876 565 bytes, SHA-256
+`EA1F93F64E07B416B1671A5F33500643900C1B8606431A98B23735DC6C91BAE8`. Same procedure: no quarantine
+manifests, data folder backed up and restored (4 of 4 entries, SDDL identical).
+
+- Silent install: exit 0; DisplayVersion 0.1.2; installed exe version 0.1.2.
+- Elevated launch: main window shown and scanning, no side-by-side events. The `hives` scratch
+  folder was absent while the program ran (both accounts were signed in, so no hive was copied).
+- `--uninstall-cleanup --ask --silent`: exit 10, data folder untouched.
+- Silent uninstall: exit 0; `--ask` exit 10, `--apply remove` exit 0, then file deletions; program
+  folder, uninstall key, shortcut and `%ProgramData%\Stale Uninstaller` gone.
