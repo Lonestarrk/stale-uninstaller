@@ -17,7 +17,7 @@ Download the latest installer from the [Releases page](https://github.com/Lonest
 - **Quarantine instead of delete.** Removed files move to a quarantine folder on the same drive and registry keys are exported first, so everything can be undone with one click. Empty the quarantine when you need the space, or let it clean itself after 30 days.
 - **Ghost programs.** Finds programs that are already uninstalled but left folders, registry keys, dangling autostart, file-type, service, task or shortcut references, or execution traces behind. The evidence is grouped per program and rated "probably uninstalled", "leftovers only" or "uncertain". Uncertain ones, such as data that may belong to an installed program or another user, are never pre-checked. Each ghost is one compact row; a double-click shows its details and lets you untick single items, and the checked ones are removed straight from the ghosts view (moved to the quarantine, so they can be restored).
 - **Keep list.** Mark any folder, key or program as "Keep" and it is left alone in every future scan.
-- **Standalone leftover search** by name for programs that are no longer in the list.
+- **Find leftovers.** One click scans every fixed drive for what no installed program owns: unknown folders and big files at the top of each drive, orphaned folders in Program Files, ProgramData and every account's AppData, and Windows' own space hogs such as `Windows.old`, upgrade leftovers, downloaded updates, crash dumps and week-old temp files. The list appears at once, largest first, and the sizes fill in as they are measured. Nothing is pre-checked; checked entries go to the quarantine, while Windows' own folders get a button that opens Windows' cleanup instead. Double-click an entry to look inside it folder by folder, largest first, and remove a single big file or folder. The search for one program's leftovers by name is still there as a link.
 - **Safety first.** Runs as administrator and treats everything it touches with suspicion: system tools are loaded only from System32, quarantine folders are locked down to administrators, junctions are refused, and nothing is deleted outright.
 - **English and Swedish.** Follows the Windows display language on first start; switch any time in the settings menu.
 - **Adjustable size.** The interface opens at 150 %; pick 100-200 % in the settings menu or zoom with Ctrl +, Ctrl - and Ctrl 0. The choice is remembered.
@@ -25,7 +25,7 @@ Download the latest installer from the [Releases page](https://github.com/Lonest
 
 ## Future features
 
-- Junk finder: Windows temp folders, update caches and growing AppData folders, explained in plain language with a safety rating, sharing the keep list.
+- Junk finder: growing AppData and cache folders, explained in plain language with a safety rating, sharing the keep list.
 - Microsoft Store apps.
 - Elevation on demand instead of at start-up.
 - Parallel scanning and an NTFS fast path for folder sizes.

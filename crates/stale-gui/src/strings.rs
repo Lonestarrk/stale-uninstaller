@@ -327,6 +327,39 @@ pub struct Strings {
     pub ref_service: &'static str,
     pub ref_task: &'static str,
     pub ref_shortcut: &'static str,
+    // Space scan ("Sök rester")
+    pub space_manual_link: &'static str,
+    pub space_listing: &'static str,
+    pub space_empty: &'static str,
+    pub space_kind_program_files: &'static str,
+    pub space_kind_program_data: &'static str,
+    pub space_kind_appdata: &'static str,
+    pub space_kind_unknown_folder: &'static str,
+    pub space_kind_unknown_file: &'static str,
+    pub space_kind_windows: &'static str,
+    pub space_unknown_decide: &'static str,
+    pub space_pending: &'static str,
+    pub space_scan_thread_failed: &'static str,
+    pub space_scan_aborted: &'static str,
+    pub browse_aborted: &'static str,
+    pub open_windows_cleanup: &'static str,
+    pub open_windows_cleanup_tip: &'static str,
+    pub open_in_explorer: &'static str,
+    pub browse_loading: &'static str,
+    pub browse_empty: &'static str,
+    pub block_system: &'static str,
+    pub block_installed: &'static str,
+    pub block_profile: &'static str,
+    pub block_own: &'static str,
+    pub win_bt: &'static str,
+    pub win_ws: &'static str,
+    pub win_tmp: &'static str,
+    pub win_update: &'static str,
+    pub win_temp: &'static str,
+    pub win_user_temp: &'static str,
+    pub win_memory_dump: &'static str,
+    pub win_minidumps: &'static str,
+    pub win_live_kernel: &'static str,
     // Quarantine view
     pub quarantine: &'static str,
     pub quarantine_title: &'static str,
@@ -605,6 +638,38 @@ pub static SV: Strings = Strings {
     ref_service: "Tjänst",
     ref_task: "Schemalagd uppgift",
     ref_shortcut: "Genväg",
+    space_manual_link: "Sök efter ett programs rester…",
+    space_listing: "Letar efter mappar som inget program äger…",
+    space_empty: "Inget hittades",
+    space_kind_program_files: "Rest i Program Files",
+    space_kind_program_data: "Rest i ProgramData",
+    space_kind_appdata: "Rest i AppData",
+    space_kind_unknown_folder: "Okänd mapp",
+    space_kind_unknown_file: "Okänd fil",
+    space_kind_windows: "Windows",
+    space_unknown_decide: "Okänd – avgör själv",
+    space_pending: "…",
+    space_scan_thread_failed: "Kunde inte starta sökningen efter rester",
+    space_scan_aborted: "Sökningen efter rester avbröts oväntat – se loggfilen",
+    browse_aborted: "Mappen kunde inte läsas – se loggfilen",
+    open_windows_cleanup: "Öppna Windows rensning",
+    open_windows_cleanup_tip: "Öppnar Lagringsinställningar i Windows. Stale tar aldrig bort det här själv.",
+    open_in_explorer: "Öppna i Utforskaren",
+    browse_loading: "Läser mappen…",
+    browse_empty: "Mappen är tom",
+    block_system: "Windows eller en systemmapp – tas inte bort här",
+    block_installed: "Ett installerat program finns här",
+    block_profile: "En användares profilmapp",
+    block_own: "Stale Uninstallers egen mapp",
+    win_bt: "Filer från en Windows-uppgradering. Rensas genom Windows.",
+    win_ws: "Installationsfiler från en Windows-uppgradering. Rensas genom Windows.",
+    win_tmp: "Tillfälliga filer från en Windows-uppgradering. Rensas genom Windows.",
+    win_update: "Hämtade Windows-uppdateringar. Windows hämtar dem igen vid behov.",
+    win_temp: "Windows tillfälliga filer. Rensas genom Windows.",
+    win_user_temp: "Tillfälliga filer äldre än en vecka. Bara de räknas och tas bort.",
+    win_memory_dump: "Minnesdump från en krasch. Behövs bara för felsökning.",
+    win_minidumps: "Små minnesdumpar från krascher. Behövs bara för felsökning.",
+    win_live_kernel: "Felrapporter från Windows-kärnan. Behövs bara för felsökning.",
     // Quarantine view
     quarantine: "Karantän",
     quarantine_title: "Karantän",
@@ -865,6 +930,38 @@ pub static EN: Strings = Strings {
     ref_service: "Service",
     ref_task: "Scheduled task",
     ref_shortcut: "Shortcut",
+    space_manual_link: "Search for a program's leftovers…",
+    space_listing: "Looking for folders no program owns…",
+    space_empty: "Nothing found",
+    space_kind_program_files: "Leftover in Program Files",
+    space_kind_program_data: "Leftover in ProgramData",
+    space_kind_appdata: "Leftover in AppData",
+    space_kind_unknown_folder: "Unknown folder",
+    space_kind_unknown_file: "Unknown file",
+    space_kind_windows: "Windows",
+    space_unknown_decide: "Unknown – your call",
+    space_pending: "…",
+    space_scan_thread_failed: "Could not start the search for leftovers",
+    space_scan_aborted: "The search for leftovers stopped unexpectedly – see the log file",
+    browse_aborted: "The folder could not be read – see the log file",
+    open_windows_cleanup: "Open Windows cleanup",
+    open_windows_cleanup_tip: "Opens Windows' Storage settings. Stale never removes this itself.",
+    open_in_explorer: "Open in File Explorer",
+    browse_loading: "Reading the folder…",
+    browse_empty: "The folder is empty",
+    block_system: "Windows or a system folder – not removed here",
+    block_installed: "An installed program lives here",
+    block_profile: "A user's profile folder",
+    block_own: "Stale Uninstaller's own folder",
+    win_bt: "Files left by a Windows upgrade. Cleaned up through Windows.",
+    win_ws: "Setup files from a Windows upgrade. Cleaned up through Windows.",
+    win_tmp: "Temporary files from a Windows upgrade. Cleaned up through Windows.",
+    win_update: "Downloaded Windows updates. Windows downloads them again when needed.",
+    win_temp: "Windows' temporary files. Cleaned up through Windows.",
+    win_user_temp: "Temporary files older than a week. Only those are counted and removed.",
+    win_memory_dump: "Memory dump from a crash. Only needed for troubleshooting.",
+    win_minidumps: "Small memory dumps from crashes. Only needed for troubleshooting.",
+    win_live_kernel: "Error reports from the Windows kernel. Only needed for troubleshooting.",
     // Quarantine view
     quarantine: "Quarantine",
     quarantine_title: "Quarantine",
@@ -1344,6 +1441,74 @@ pub fn purge_error(e: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// A size that is only a lower bound: "minst 3,2 GB".
+pub fn at_least_in(lang: Lang, size: &str) -> String {
+    match lang {
+        Lang::Sv => format!("minst {size}"),
+        Lang::En => format!("at least {size}"),
+    }
+}
+
+/// The space view's footer: "3 markerade · 58 MB".
+pub fn space_summary(checked: usize, size: &str) -> String {
+    space_summary_in(lang(), checked, size)
+}
+
+/// [`space_summary`] in `lang`.
+pub fn space_summary_in(lang: Lang, checked: usize, size: &str) -> String {
+    match lang {
+        Lang::Sv => format!("{checked} markerade · {size}"),
+        Lang::En => format!("{checked} checked · {size}"),
+    }
+}
+
+/// While sizes stream in: "Mäter storlekar… 12 av 448".
+pub fn space_measuring(done: usize, total: usize) -> String {
+    match lang() {
+        Lang::Sv => format!("Mäter storlekar… {done} av {total}"),
+        Lang::En => format!("Measuring sizes… {done} of {total}"),
+    }
+}
+
+/// The space view's confirmation: how many items go to quarantine.
+pub fn space_remove_confirm(items: usize, size: &str) -> String {
+    space_remove_confirm_in(lang(), items, size)
+}
+
+/// [`space_remove_confirm`] in `lang`.
+pub fn space_remove_confirm_in(lang: Lang, items: usize, size: &str) -> String {
+    match lang {
+        Lang::Sv => format!(
+            "Flytta {items} {} ({size}) till karantänen? Du kan återställa {} från Karantän.",
+            plural(items, "mapp eller fil", "mappar och filer"),
+            plural(items, "den", "dem")
+        ),
+        Lang::En => format!(
+            "Move {items} {} ({size}) to quarantine? You can restore {} from Quarantine.",
+            plural(items, "folder or file", "folders and files"),
+            plural(items, "it", "them")
+        ),
+    }
+}
+
+/// The drill-down's last line when children were left out: "… 312 till".
+pub fn more_children_in(lang: Lang, n: usize) -> String {
+    match lang {
+        Lang::Sv => format!("… {n} till"),
+        Lang::En => format!("… {n} more"),
+    }
+}
+
+/// `Windows.old`'s explanation, with the date it was saved when known.
+pub fn windows_old_text_in(lang: Lang, saved: Option<&str>) -> String {
+    match (lang, saved) {
+        (Lang::Sv, Some(d)) => format!("Den förra Windows-installationen, sparad {d}. Behövs bara om du vill gå tillbaka."),
+        (Lang::Sv, None) => "Den förra Windows-installationen. Behövs bara om du vill gå tillbaka.".to_string(),
+        (Lang::En, Some(d)) => format!("The previous Windows installation, saved {d}. Only needed to go back to it."),
+        (Lang::En, None) => "The previous Windows installation. Only needed to go back to it.".to_string(),
+    }
 }
 
 #[cfg(test)]

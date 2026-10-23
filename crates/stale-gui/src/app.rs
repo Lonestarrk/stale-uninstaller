@@ -28,9 +28,10 @@ use crate::flow::FlowState;
 use crate::ghost_sel::GhostSelection;
 use crate::leftover_sel::LeftoverGroup;
 use crate::leftover_sel::LeftoverSelection;
-use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, table, toolbar, uninstall_dialog};
+use crate::space_sel::{BrowseState, SpaceSelection};
+use crate::ui::{details, filter_panel, ghosts_view, leftovers_view, quarantine_view, space_view, table, toolbar, uninstall_dialog};
 use crate::warning::{Msg, Warning};
-use crate::worker::{GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent};
+use crate::worker::{BrowseResult, GhostEvent, LeftoverScanEvent, QuarantineAdminEvent, QuarantineEvent, SpaceEvent};
 use crate::{strings, worker};
 
 /// Provenance probes allowed in flight at once; clicking through the list never starts more.
@@ -71,6 +72,8 @@ pub enum View {
     Leftovers,
     Quarantine,
     Ghosts,
+    /// "Sök rester": folders no program owns and Windows' space hogs.
+    Space,
 }
 
 /// One queued program as the summary dialog shows it.
@@ -189,8 +192,22 @@ pub struct StaleApp {
     pub keep_window_open: bool,
     /// The last ghost kept with "Behåll", for its "Ångra" notice.
     pub last_kept: Option<KeptGhost>,
-    /// The view the leftovers view's back button returns to: `Programs` or `Ghosts`.
+    /// The view the leftovers view's back button returns to: `Programs`, `Ghosts` or `Space`.
     pub leftovers_origin: View,
+    /// The space view's entries, once listed.
+    pub space: Option<SpaceSelection>,
+    space_rx: Option<Receiver<(u64, SpaceEvent)>>,
+    /// Set to stop the running space scan's measuring.
+    space_cancel: Option<Arc<AtomicBool>>,
+    /// Bumped for every space scan; events of an older scan are dropped.
+    space_generation: u64,
+    /// The last space scan measured every entry.
+    space_complete: bool,
+    /// What the space view's "Ta bort markerade…" would move, while its confirmation is open.
+    pub space_pending_removal: Option<LeftoverSelection>,
+    /// The drill-down window, when open.
+    pub space_browse: Option<BrowseState>,
+    browse_rx: Option<Receiver<Result<BrowseResult, Warning>>>,
     /// The ghost whose details popup is open (an index into the ghost selection).
     pub ghost_popup: Option<usize>,
     /// The ghosts view's "Ta bort markerade" confirmation is open.
@@ -275,6 +292,14 @@ impl StaleApp {
             keep_window_open: false,
             last_kept: None,
             leftovers_origin: View::Programs,
+            space: None,
+            space_rx: None,
+            space_cancel: None,
+            space_generation: 0,
+            space_complete: false,
+            space_pending_removal: None,
+            space_browse: None,
+            browse_rx: None,
             ghost_popup: None,
             ghost_confirm: false,
             programs: Vec::new(),
@@ -632,6 +657,9 @@ impl StaleApp {
                 self.ghosts = None;
                 self.ghost_popup = None;
                 self.refresh_ghosts();
+            } else if self.leftovers_origin == View::Space {
+                // The entries just quarantined must not be offered again, and sizes have changed.
+                self.refresh_space();
             } else if !self.queue_running() {
                 // Its reports name what was just quarantined: "Visa rester" must not offer them again.
                 self.close_flow();
@@ -665,10 +693,10 @@ impl StaleApp {
     }
 
     /// "Avbryt" in the removal confirmation: closes it, and a removal that came from the ghosts
-    /// view goes back there, so the choices made in the leftovers view are not left behind.
+    /// or space view goes back there, so the choices made there are not left behind.
     pub fn cancel_removal_plan(&mut self) {
         self.removal_plan = None;
-        if self.leftovers_origin == View::Ghosts && !self.removal_running() {
+        if matches!(self.leftovers_origin, View::Ghosts | View::Space) && !self.removal_running() {
             self.leave_leftovers();
         }
     }
@@ -826,7 +854,10 @@ impl StaleApp {
         let Some(rx) = self.leftover_scan_rx.take() else { return };
         match rx.try_recv() {
             Ok(LeftoverScanEvent::Done(name, report)) => {
-                self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]))
+                // Started from the space view's link: its back button returns there.
+                let origin = if self.view == View::Space { View::Space } else { View::Programs };
+                self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]));
+                self.leftovers_origin = origin;
             }
             Ok(LeftoverScanEvent::Failed(msg)) => {
                 log::error!("{msg:?}");
@@ -925,6 +956,185 @@ impl StaleApp {
         self.ghost_popup = None;
         self.show_leftovers(selection);
         self.leftovers_origin = View::Ghosts;
+        self.request_removal(volume_ok, free_bytes);
+    }
+
+    /// "Sök rester": switches to the space view; a finished removal is closed first. The scan
+    /// starts the first time, and again when the last one was stopped before it finished.
+    pub fn show_space(&mut self) {
+        if self.view == View::Leftovers {
+            self.leave_leftovers();
+        }
+        self.view = View::Space;
+        if !self.space_scan_running() && !self.space_complete {
+            self.refresh_space();
+        }
+    }
+
+    /// Stops any running space scan and starts a new one.
+    pub fn refresh_space(&mut self) {
+        let programs = self.programs.clone();
+        self.begin_space_scan_with(|generation| worker::spawn_space_scan(generation, programs));
+    }
+
+    fn begin_space_scan_with(&mut self, spawn: impl FnOnce(u64) -> (Receiver<(u64, SpaceEvent)>, Arc<AtomicBool>)) {
+        self.cancel_space_scan();
+        self.space_generation += 1;
+        self.space = None;
+        self.space_complete = false;
+        self.space_pending_removal = None;
+        self.close_browse();
+        let (rx, cancel) = spawn(self.space_generation);
+        self.space_rx = Some(rx);
+        self.space_cancel = Some(cancel);
+    }
+
+    /// Stops the running space scan; what it has measured stays, what it still sends is dropped.
+    pub fn cancel_space_scan(&mut self) {
+        if let Some(cancel) = self.space_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.space_rx = None;
+    }
+
+    /// True while a space scan lists or measures.
+    pub fn space_scan_running(&self) -> bool {
+        self.space_rx.is_some()
+    }
+
+    /// The space view, or the leftovers view on its behalf, is shown.
+    fn space_view_active(&self) -> bool {
+        self.view == View::Space || (self.view == View::Leftovers && self.leftovers_origin == View::Space)
+    }
+
+    /// Folds one space scan event into the state; events of an older scan are dropped.
+    fn apply_space_event(&mut self, generation: u64, ev: SpaceEvent) {
+        if generation != self.space_generation {
+            return;
+        }
+        match ev {
+            SpaceEvent::Entries(entries) => self.space = Some(SpaceSelection::new(entries)),
+            SpaceEvent::Size(i, size, partial) => {
+                if let Some(sel) = self.space.as_mut() {
+                    sel.set_size(i, size, partial);
+                }
+            }
+            SpaceEvent::Done => {
+                self.space_complete = true;
+                self.space_rx = None;
+                self.space_cancel = None;
+            }
+            SpaceEvent::Failed(msg) => {
+                log::error!("{msg:?}");
+                self.warnings.push(msg);
+                self.space_rx = None;
+                self.space_cancel = None;
+            }
+        }
+    }
+
+    /// Applies every space scan event waiting on the channel.
+    fn drain_space(&mut self) {
+        let Some(rx) = self.space_rx.take() else { return };
+        let mut events = Vec::new();
+        let gone = loop {
+            match rx.try_recv() {
+                Ok(ev) => events.push(ev),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        self.space_rx = Some(rx);
+        for (generation, ev) in events {
+            self.apply_space_event(generation, ev);
+        }
+        if gone && self.space_rx.is_some() {
+            // Gone without `Done`: the worker panicked (logged by the panic hook).
+            log::error!("space scan worker disconnected before Done");
+            self.warnings.push(Warning::Fixed(Msg::SpaceScanAborted));
+            self.space_rx = None;
+            self.space_cancel = None;
+        }
+    }
+
+    /// Opens the drill-down window on `root` and starts reading it.
+    pub fn open_browse(&mut self, root: PathBuf) {
+        self.space_browse = Some(BrowseState::new(root.clone()));
+        self.browse_rx = Some(worker::spawn_browse(root, self.programs.clone()));
+    }
+
+    /// Shows `dir` in the drill-down window; a listing still running for another folder is
+    /// dropped.
+    pub fn browse_to(&mut self, dir: PathBuf) {
+        let Some(b) = self.space_browse.as_mut() else { return };
+        b.go_to(dir.clone());
+        self.browse_rx = Some(worker::spawn_browse(dir, self.programs.clone()));
+    }
+
+    pub fn close_browse(&mut self) {
+        self.space_browse = None;
+        self.browse_rx = None;
+    }
+
+    /// True while the drill-down window's folder is being read.
+    pub fn browse_running(&self) -> bool {
+        self.browse_rx.is_some()
+    }
+
+    /// Shows the drill-down listing once it is done.
+    fn drain_browse(&mut self) {
+        let Some(rx) = self.browse_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(Ok(r)) => {
+                if let Some(b) = self.space_browse.as_mut() {
+                    b.set_children(&r.dir, r.children, r.more);
+                }
+            }
+            Ok(Err(msg)) => {
+                log::error!("{msg:?}");
+                self.warnings.push(msg);
+            }
+            Err(TryRecvError::Empty) => self.browse_rx = Some(rx),
+            Err(TryRecvError::Disconnected) => {
+                log::error!("browse worker disconnected before its result");
+                self.warnings.push(Warning::Fixed(Msg::BrowseAborted));
+            }
+        }
+    }
+
+    /// "Ta bort markerade…" in the space view: what the checked entries would move, for the
+    /// confirmation (a temp folder's old files are listed here, once).
+    pub fn ask_remove_space(&mut self) {
+        let Some(sel) = &self.space else { return };
+        let removal = sel.removal_selection(&stale_core::fsys::RealFs::default(), Utc::now());
+        self.space_pending_removal = (!removal.groups.is_empty()).then_some(removal);
+    }
+
+    /// "Ta bort markerade…" in the drill-down window.
+    pub fn ask_remove_browse(&mut self) {
+        let Some(b) = &self.space_browse else { return };
+        let removal = b.removal_selection();
+        self.space_pending_removal = (!removal.groups.is_empty()).then_some(removal);
+    }
+
+    pub fn cancel_space_removal(&mut self) {
+        self.space_pending_removal = None;
+    }
+
+    /// "Ta bort" in the space view's confirmation: the items go through the leftovers view's
+    /// removal (drive window, progress, summary); "Tillbaka" returns to the space view.
+    pub fn confirm_space_removal(&mut self) {
+        self.confirm_space_removal_with(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes);
+    }
+
+    fn confirm_space_removal_with(&mut self, volume_ok: &dyn Fn(char) -> bool, free_bytes: &dyn Fn(char) -> Option<u64>) {
+        let Some(selection) = self.space_pending_removal.take() else { return };
+        if self.removal_running() || selection.groups.is_empty() {
+            return;
+        }
+        self.close_browse();
+        self.show_leftovers(selection);
+        self.leftovers_origin = View::Space;
         self.request_removal(volume_ok, free_bytes);
     }
 
@@ -1045,11 +1255,20 @@ impl eframe::App for StaleApp {
         self.drain_quarantine_admin();
         self.drain_ghost_scan();
         self.start_waiting_ghost_scan();
+        self.drain_space();
+        self.drain_browse();
+        if !self.space_view_active() {
+            // Leaving the view stops the measuring; coming back starts it again.
+            self.cancel_space_scan();
+            self.close_browse();
+        }
         self.drain_provenance();
         self.request_provenance();
         if self.scanning
             || !self.provenance_rx.is_empty()
             || self.ghost_scan_running()
+            || self.space_scan_running()
+            || self.browse_rx.is_some()
             || self.queue_running()
             || self.removal_running()
             || self.leftover_search_running()
@@ -1098,6 +1317,7 @@ impl eframe::App for StaleApp {
                 View::Leftovers => return leftovers_view::show(ui, self),
                 View::Quarantine => return quarantine_view::show(ui, self),
                 View::Ghosts => return ghosts_view::show(ui, self, now),
+                View::Space => return space_view::show(ui, self),
             }
             if self.rows.is_empty() {
                 if !self.scanning {
@@ -1850,6 +2070,115 @@ mod tests {
         app.drain_quarantine_admin();
         assert!(!app.quarantine_busy && app.quarantine_admin_rx.is_none());
         assert_eq!(app.quarantine.len(), 1);
+    }
+
+    /// Starts a space scan whose events the test sends itself; returns the sender and the
+    /// scan's cancel flag.
+    fn fake_space_scan(app: &mut StaleApp) -> (std::sync::mpsc::Sender<(u64, SpaceEvent)>, Arc<AtomicBool>, u64) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut generation = 0;
+        app.begin_space_scan_with(|g| {
+            generation = g;
+            (rx, cancel.clone())
+        });
+        (tx, cancel, generation)
+    }
+
+    #[test]
+    fn cancelled_scan_drops_late_sizes() {
+        use crate::space_sel::tests::entry;
+        use stale_core::space::SpaceKind;
+        use std::sync::atomic::Ordering;
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Space;
+        let (tx1, cancel1, g1) = fake_space_scan(&mut app);
+        let entries = vec![entry(r"D:\A", SpaceKind::DriveRoot, None), entry(r"D:\B", SpaceKind::DriveRoot, None)];
+        tx1.send((g1, SpaceEvent::Entries(entries.clone()))).unwrap();
+        tx1.send((g1, SpaceEvent::Size(0, Some(5), false))).unwrap();
+        app.drain_space();
+        assert_eq!(app.space.as_ref().unwrap().entries[0].size, Some(5));
+        assert!(app.space_scan_running());
+
+        // Uppdatera: the old scan is told to stop and its late sizes are dropped.
+        let (tx2, cancel2, g2) = fake_space_scan(&mut app);
+        assert!(cancel1.load(Ordering::SeqCst) && !cancel2.load(Ordering::SeqCst));
+        assert!(g2 > g1 && app.space.is_none());
+        assert!(tx1.send((g1, SpaceEvent::Size(1, Some(99), false))).is_err(), "the old receiver is gone");
+        tx2.send((g2, SpaceEvent::Entries(entries))).unwrap();
+        // A late event of the old scan on the current channel is dropped too.
+        tx2.send((g1, SpaceEvent::Size(1, Some(99), false))).unwrap();
+        tx2.send((g1, SpaceEvent::Done)).unwrap();
+        tx2.send((g2, SpaceEvent::Size(0, Some(7), true))).unwrap();
+        app.drain_space();
+        let sel = app.space.as_ref().unwrap();
+        assert_eq!(sel.entries.iter().map(|e| e.size).collect::<Vec<_>>(), vec![Some(7), None]);
+        assert!(sel.entries[0].partial);
+        assert!(app.space_scan_running() && !app.space_complete, "the old Done ends nothing");
+
+        // Leaving the view stops the measuring; what was measured stays.
+        app.view = View::Programs;
+        assert!(!app.space_view_active());
+        app.cancel_space_scan();
+        assert!(cancel2.load(Ordering::SeqCst) && !app.space_scan_running());
+        assert_eq!(app.space.as_ref().unwrap().entries[0].size, Some(7));
+        assert!(app.warnings.is_empty());
+    }
+
+    #[test]
+    fn space_scan_done_and_lost_worker() {
+        let mut app = StaleApp::empty(Settings::default());
+        let (tx, _, g) = fake_space_scan(&mut app);
+        tx.send((g, SpaceEvent::Entries(Vec::new()))).unwrap();
+        tx.send((g, SpaceEvent::Done)).unwrap();
+        drop(tx);
+        app.drain_space();
+        assert!(app.space_complete && !app.space_scan_running());
+        assert!(app.warnings.is_empty(), "a disconnect after Done is no failure");
+        let (tx, _, _) = fake_space_scan(&mut app);
+        drop(tx);
+        app.drain_space();
+        assert!(!app.space_scan_running());
+        assert_eq!(app.warnings, vec![Warning::Fixed(Msg::SpaceScanAborted)]);
+    }
+
+    #[test]
+    fn removal_from_space_uses_leftovers_flow_with_origin_space() {
+        use crate::space_sel::tests::entry;
+        use stale_core::fsys::FakeFs;
+        use stale_core::space::{SpaceKind, WinItem};
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Space;
+        let (_tx, _, _) = fake_space_scan(&mut app);
+        let mut sel = SpaceSelection::new(vec![
+            entry(r"E:\Foton", SpaceKind::DriveRoot, Some(30)),
+            entry(r"C:\Windows.old", SpaceKind::Windows(WinItem::WindowsOld), Some(70)),
+        ]);
+        sel.toggle(0);
+        sel.toggle(1);
+        let fs = FakeFs::new().dir(r"E:\Foton", 30);
+        app.space_pending_removal = Some(sel.removal_selection(&fs, Utc::now()));
+        app.space = Some(sel);
+        app.space_browse = Some(BrowseState::new(PathBuf::from(r"E:\Foton")));
+        // E: cannot hold a payload: the drive window opens, so no real removal starts.
+        app.confirm_space_removal_with(&|d| d != 'E', &|_| Some(1_000_000));
+        assert_eq!((app.view, app.leftovers_origin), (View::Leftovers, View::Space));
+        assert!(app.space_pending_removal.is_none() && app.space_browse.is_none());
+        let groups: Vec<(&str, usize)> =
+            app.leftovers.as_ref().unwrap().groups.iter().map(|g| (g.program_name.as_str(), g.items.len())).collect();
+        assert_eq!(groups, vec![(r"E:\Foton", 1)], "Windows.old never reaches the quarantine");
+        assert!(app.removal_plan.is_some() && app.quarantine_rx.is_none(), "the drive window comes before the removal");
+        assert!(app.space_view_active(), "the scan keeps measuring meanwhile");
+        assert!(app.space_scan_running());
+
+        app.cancel_removal_plan();
+        assert_eq!(app.view, View::Space, "Avbryt returns to the space view");
+        assert!(app.space.as_ref().unwrap().checked[0], "with the check marks kept");
+
+        // Nothing checked: nothing happens.
+        app.space_pending_removal = None;
+        app.confirm_space_removal_with(&|_| true, &|_| Some(1_000));
+        assert_eq!(app.view, View::Space);
     }
 }
 

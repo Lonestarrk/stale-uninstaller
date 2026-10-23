@@ -3,7 +3,7 @@
 use eframe::egui;
 use stale_core::uninstall::UninstallMode;
 
-use crate::app::{SearchDialog, StaleApp};
+use crate::app::StaleApp;
 use crate::strings;
 
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
@@ -15,9 +15,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 app.open_queue_dialog(mode);
             }
         }
-        let can_search = app.search.is_none() && !app.leftover_search_running() && !app.removal_running();
-        if ui.add_enabled(can_search, egui::Button::new(strings::t().find_leftovers)).clicked() {
-            app.search = Some(SearchDialog::default());
+        // The space scan starts the first time the view opens; the search by name is a link there.
+        if ui.add_enabled(!app.removal_running(), egui::Button::new(strings::t().find_leftovers)).clicked() {
+            app.show_space();
         }
         // Leaving the leftovers view waits for a running removal, like its own back button.
         let quarantine = strings::quarantine_button(app.quarantine.len());

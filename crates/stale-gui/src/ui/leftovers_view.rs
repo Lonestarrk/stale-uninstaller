@@ -261,9 +261,10 @@ pub fn search_window(ui: &mut egui::Ui, app: &mut StaleApp) {
     }
 }
 
-/// The back button's text: "Tillbaka" to the ghosts view, else "Till programlistan".
+/// The back button's text: "Till programlistan" to the program list, else "Tillbaka" (to the
+/// ghosts or space view).
 fn back_label(origin: View) -> &'static str {
-    if origin == View::Ghosts { strings::t().back } else { strings::t().back_to_programs }
+    if origin == View::Programs { strings::t().back_to_programs } else { strings::t().back }
 }
 
 /// `HKLM\<path>`, `HKCU\<path>` or `HKU\<path>`.
@@ -371,6 +372,7 @@ mod tests {
     #[test]
     fn back_button_names_its_destination() {
         assert_eq!(back_label(View::Ghosts), strings::t().back);
+        assert_eq!(back_label(View::Space), strings::t().back);
         assert_eq!(back_label(View::Programs), strings::t().back_to_programs);
     }
 }

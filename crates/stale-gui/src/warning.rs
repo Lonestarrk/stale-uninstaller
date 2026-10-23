@@ -21,6 +21,9 @@ pub enum Msg {
     GhostScanThreadFailed,
     GhostsNeedPrograms,
     KeepSaveFailed,
+    SpaceScanAborted,
+    SpaceScanThreadFailed,
+    BrowseAborted,
 }
 
 impl Msg {
@@ -41,6 +44,9 @@ impl Msg {
             Msg::GhostScanThreadFailed => s.ghost_scan_thread_failed,
             Msg::GhostsNeedPrograms => s.ghosts_need_programs,
             Msg::KeepSaveFailed => s.keep_save_failed,
+            Msg::SpaceScanAborted => s.space_scan_aborted,
+            Msg::SpaceScanThreadFailed => s.space_scan_thread_failed,
+            Msg::BrowseAborted => s.browse_aborted,
         }
     }
 }
