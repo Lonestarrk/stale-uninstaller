@@ -69,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 ui.label(strings::t().no_leftovers);
             }
             for (gi, group) in sel.groups.iter_mut().enumerate() {
-                if group_row(ui, gi, group) {
+                if group_row(ui, gi, group, !removing) {
                     open_popup = Some(gi);
                 }
             }
@@ -98,7 +98,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             app.request_removal(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes)
         }
         Some(Action::ConfirmRemove) => app.confirm_removal(),
-        Some(Action::CancelRemove) => app.removal_plan = None,
+        Some(Action::CancelRemove) => app.cancel_removal_plan(),
         None => {}
     }
 }
@@ -128,11 +128,11 @@ pub(super) fn compact_row(ui: &mut egui::Ui, index: usize, contents: impl FnOnce
 
 /// One program's row: checkbox, name, "N av M" and the size of what is checked. A click ticks or
 /// unticks the program's items, a double-click asks for the popup (returns true).
-fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup) -> bool {
+fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup, editable: bool) -> bool {
     let mut box_clicked = false;
     let clicks = compact_row(ui, index, |ui| {
         let mut on = group.checked_count() > 0;
-        box_clicked = ui.checkbox(&mut on, "").clicked();
+        box_clicked = ui.add_enabled(editable, egui::Checkbox::new(&mut on, "")).clicked();
         if box_clicked {
             group.toggle_all();
         }
@@ -145,6 +145,10 @@ fn group_row(ui: &mut egui::Ui, index: usize, group: &mut LeftoverGroup) -> bool
             });
         });
     });
+    if !editable {
+        // A removal is running: the choices are frozen, the popup still opens to look.
+        return clicks.double_clicked;
+    }
     row_click(group, box_clicked, clicks.clicked, clicks.double_clicked)
 }
 

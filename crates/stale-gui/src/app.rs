@@ -664,6 +664,15 @@ impl StaleApp {
         }
     }
 
+    /// "Avbryt" in the removal confirmation: closes it, and a removal that came from the ghosts
+    /// view goes back there, so the choices made in the leftovers view are not left behind.
+    pub fn cancel_removal_plan(&mut self) {
+        self.removal_plan = None;
+        if self.leftovers_origin == View::Ghosts && !self.removal_running() {
+            self.leave_leftovers();
+        }
+    }
+
     /// "Fortsätt" in the removal confirmation; refused while a drive is short of space.
     pub fn confirm_removal(&mut self) {
         if self.removal_plan.as_ref().is_some_and(|p| p.insufficient.is_empty()) {
@@ -866,6 +875,7 @@ impl StaleApp {
     fn undo_keep_at(&mut self, path: &Path) {
         let Some(kept) = self.last_kept.take() else { return };
         self.keep = kept.keep_before;
+        self.ghost_popup = None;
         self.save_keep(path);
         if let Some(sel) = self.ghosts.as_mut() {
             sel.insert(kept.index, (kept.ghost, kept.checked, kept.group));
@@ -1720,6 +1730,43 @@ mod tests {
 
         app.keep_ghost_at("missing", &path);
         assert_eq!(KeepList::load_from_with(&path, &trust_all), saved, "an unknown key changes nothing");
+    }
+
+    #[test]
+    fn ghost_removal_cancel_returns_to_ghosts() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::Assessment;
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Ghosts;
+        let mut alpha = ghost("Alpha", Assessment::ProbablyUninstalled, 100);
+        if let Evidence::Folder { path, .. } = &mut alpha.evidence[0] {
+            *path = PathBuf::from(r"E:\Alpha");
+        }
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![alpha]));
+        app.remove_checked_ghosts_with(&|d| d != 'E', &|_| Some(1_000_000));
+        assert!(app.removal_plan.is_some());
+        app.cancel_removal_plan();
+        assert_eq!(app.view, View::Ghosts);
+        assert!(app.removal_plan.is_none() && !app.removal_running());
+    }
+
+    #[test]
+    fn keep_and_undo_close_the_ghost_popup() {
+        use crate::ghost_sel::tests::ghost;
+        use stale_core::ghosts::Assessment;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("important.json");
+        let mut app = StaleApp::empty(Settings::default());
+        app.ghosts = Some(crate::ghost_sel::tests::selection_of(vec![
+            ghost("Alpha", Assessment::LeftoversOnly, 1),
+            ghost("Beta", Assessment::LeftoversOnly, 2),
+        ]));
+        app.ghost_popup = Some(1);
+        app.keep_ghost_at("alpha", &path);
+        assert_eq!(app.ghost_popup, None);
+        app.ghost_popup = Some(0);
+        app.undo_keep_at(&path);
+        assert_eq!(app.ghost_popup, None);
     }
 
     #[test]
