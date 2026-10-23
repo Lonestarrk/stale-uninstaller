@@ -4,6 +4,7 @@
 use super::scan::never_listed;
 use crate::fsys::FsReader;
 use crate::ghosts::InstalledIndex;
+use crate::keep::KeepList;
 use crate::own::OwnPaths;
 use crate::pathutil::{drive_letter, is_shared_root, norm, normed_under};
 use std::cmp::Ordering;
@@ -23,6 +24,8 @@ pub enum BlockReason {
     OtherProfileRoot,
     /// Stale Uninstaller's own folder or file.
     Own,
+    /// On the keep list ("Behåll"), or inside a kept folder.
+    Kept,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,7 +56,7 @@ fn in_windows_owned(n: &str) -> bool {
 }
 
 /// `windows` and `profiles` are [`norm`]ed.
-fn block_reason(path: &Path, windows: &str, profiles: &[String], installed: &InstalledIndex, own: &OwnPaths) -> Option<BlockReason> {
+fn block_reason(path: &Path, windows: &str, profiles: &[String], installed: &InstalledIndex, keep: &KeepList, own: &OwnPaths) -> Option<BlockReason> {
     let n = norm(path);
     if profiles.contains(&n) {
         return Some(BlockReason::OtherProfileRoot);
@@ -73,12 +76,16 @@ fn block_reason(path: &Path, windows: &str, profiles: &[String], installed: &Ins
     if own.is_own_path(path) {
         return Some(BlockReason::Own);
     }
+    if keep.is_path_kept(path) {
+        return Some(BlockReason::Kept);
+    }
     (installed.covers_path(path) || installed.holds_location(path)).then_some(BlockReason::InstalledProgram)
 }
 
 /// The direct children of `dir`, largest first (unknown sizes last), at most `limit` of them, and
-/// how many more there are. Links are skipped; folders are measured.
-pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, own: &OwnPaths, limit: usize) -> (Vec<Child>, usize) {
+/// how many more there are. Links are skipped; folders are measured. Kept paths are listed but
+/// blocked.
+pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, keep: &KeepList, own: &OwnPaths, limit: usize) -> (Vec<Child>, usize) {
     if fs.is_reparse(dir) {
         return (Vec::new(), 0);
     }
@@ -112,7 +119,7 @@ pub fn children(fs: &dyn FsReader, dir: &Path, installed: &InstalledIndex, own: 
     let more = out.len().saturating_sub(limit);
     out.truncate(limit);
     for c in &mut out {
-        c.blocked = block_reason(&c.path, &windows, &profiles, installed, own);
+        c.blocked = block_reason(&c.path, &windows, &profiles, installed, keep, own);
     }
     (out, more)
 }
@@ -156,14 +163,14 @@ mod tests {
             .file(r"D:\Data\mid.bin", 100)
             .dir(r"D:\Data\Tiny", 1);
         let (i, o) = none();
-        let (all, more) = children(&fs, Path::new(r"D:\Data"), &i, &o, 10);
+        let (all, more) = children(&fs, Path::new(r"D:\Data"), &i, &KeepList::default(), &o, 10);
         assert_eq!(more, 0);
         assert_eq!(all.iter().map(|c| c.size).collect::<Vec<_>>(), vec![Some(500), Some(100), Some(10), Some(1)]);
-        let (top, more) = children(&fs, Path::new(r"D:\Data"), &i, &o, 2);
+        let (top, more) = children(&fs, Path::new(r"D:\Data"), &i, &KeepList::default(), &o, 2);
         assert_eq!((top.len(), more), (2, 2));
         assert!(top[0].path.ends_with("Big") && top[0].is_dir && top[1].path.ends_with("mid.bin") && !top[1].is_dir);
         assert!(top.iter().all(|c| c.blocked.is_none()));
-        assert_eq!(children(&fs, Path::new(r"D:\Data"), &i, &o, 0).1, 4);
+        assert_eq!(children(&fs, Path::new(r"D:\Data"), &i, &KeepList::default(), &o, 0).1, 4);
     }
 
     #[test]
@@ -182,7 +189,7 @@ mod tests {
         let installed = InstalledIndex::from_programs(&[program("Tool", r"C:\Apps\Tool\bin"), program("Suite", r"C:\Apps\Suite")]);
         let own = OwnPaths::from_folders([PathBuf::from(r"C:\Stale Uninstaller")]);
         let at = |d: &str, name: &str| {
-            let (v, _) = children(&fs, Path::new(d), &installed, &own, 10);
+            let (v, _) = children(&fs, Path::new(d), &installed, &KeepList::default(), &own, 10);
             v.into_iter().find(|c| c.path.ends_with(name)).unwrap().blocked
         };
         for name in ["Windows", "Program Files", "Program Files (x86)", "$Recycle.Bin", "Users"] {
@@ -202,10 +209,21 @@ mod tests {
     }
 
     #[test]
+    fn kept_children_are_blocked() {
+        let fs = FakeFs::new().dir(r"D:\Data\Kept\Sub", 5).dir(r"D:\Data\Free", 1);
+        let keep = KeepList { paths: vec![PathBuf::from(r"d:\data\kept")], ..KeepList::default() };
+        let (i, o) = none();
+        let (c, _) = children(&fs, Path::new(r"D:\Data"), &i, &keep, &o, 10);
+        assert_eq!(c.iter().map(|c| c.blocked).collect::<Vec<_>>(), [Some(BlockReason::Kept), None]);
+        let (c, _) = children(&fs, Path::new(r"D:\Data\Kept"), &i, &keep, &o, 10);
+        assert_eq!(c[0].blocked, Some(BlockReason::Kept), "inside a kept folder too");
+    }
+
+    #[test]
     fn links_are_skipped() {
         let fs = FakeFs::new().dir(r"D:\Data\Real", 5).dir(r"D:\Data\Link", 9).reparse(r"D:\Data\Link").file(r"D:\Data\f.bin", 1);
         let (i, o) = none();
-        let (c, more) = children(&fs, Path::new(r"D:\Data"), &i, &o, 10);
+        let (c, more) = children(&fs, Path::new(r"D:\Data"), &i, &KeepList::default(), &o, 10);
         assert_eq!(more, 0);
         let names: Vec<String> = c.iter().map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["Real", "f.bin"]);
@@ -221,7 +239,7 @@ mod tests {
             .file(r"D:\Data\Part\x.bin", 7)
             .unreadable(r"D:\Data\Part\Sub");
         let (i, o) = none();
-        let (c, _) = children(&fs, Path::new(r"D:\Data"), &i, &o, 10);
+        let (c, _) = children(&fs, Path::new(r"D:\Data"), &i, &KeepList::default(), &o, 10);
         let names: Vec<String> = c.iter().map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["Part", "a.bin", "Locked"]);
         assert_eq!(c.iter().map(|c| (c.size, c.partial)).collect::<Vec<_>>(), [(Some(7), true), (Some(1), false), (None, false)]);
@@ -231,7 +249,7 @@ mod tests {
     fn a_linked_dir_lists_nothing() {
         let fs = FakeFs::new().dir(r"D:\Link\f", 5).reparse(r"D:\Link");
         let (i, o) = none();
-        assert_eq!(children(&fs, Path::new(r"D:\Link"), &i, &o, 10), (vec![], 0));
+        assert_eq!(children(&fs, Path::new(r"D:\Link"), &i, &KeepList::default(), &o, 10), (vec![], 0));
     }
 
     #[test]
@@ -243,7 +261,7 @@ mod tests {
             .dir(r"E:\$Windows.~TMP\z", 5)
             .dir(r"D:\Other\Windows.older", 1);
         let (i, o) = none();
-        let first = |d: &str| children(&fs, Path::new(d), &i, &o, 10).0[0].blocked;
+        let first = |d: &str| children(&fs, Path::new(d), &i, &KeepList::default(), &o, 10).0[0].blocked;
         for d in [r"D:\Windows.old", r"D:\Windows.old\Users", r"C:\$Windows.~BT", r"E:\$Windows.~WS\a\b", r"E:\$Windows.~TMP"] {
             assert_eq!(first(d), Some(BlockReason::System), "{d}");
         }

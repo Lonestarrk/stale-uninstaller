@@ -31,6 +31,8 @@ use windows::Win32::System::Com::{
     RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 
+use crate::leftover_sel::LeftoverSelection;
+use crate::space_sel::removal_selection_of;
 use crate::warning::{Msg, Warning};
 
 /// Starts a scan on the "stale-scan" thread; events arrive on the returned channel.
@@ -396,7 +398,8 @@ pub fn spawn_browse(dir: PathBuf, programs: Vec<Program>) -> Receiver<Result<Bro
         let run = catch_unwind(AssertUnwindSafe(|| {
             let fs = RealFs::live();
             let installed = live_installed(programs);
-            let (children, more) = children(&fs, &dir, &installed, &OwnPaths::live(), BROWSE_LIMIT);
+            let keep = KeepList::load_from(&stale_core::paths::keep_list_path());
+            let (children, more) = children(&fs, &dir, &installed, &keep, &OwnPaths::live(), BROWSE_LIMIT);
             BrowseResult { dir, children, more }
         }));
         // A panic has been logged by the panic hook.
@@ -405,6 +408,23 @@ pub fn spawn_browse(dir: PathBuf, programs: Vec<Program>) -> Receiver<Result<Bro
     if let Err(e) = spawned {
         log::error!("could not spawn browse thread: {e}");
         let _ = fallback.send(Err(Warning::Detail(Msg::BrowseAborted, e.to_string())));
+    }
+    rx
+}
+
+/// Lists what removing the checked space entries `entries` would move (a temp folder's old
+/// files are read from disk) on the "stale-space-removal" thread; sends exactly one result.
+pub fn spawn_space_removal_list(entries: Vec<SpaceEntry>) -> Receiver<Result<LeftoverSelection, Warning>> {
+    let (tx, rx) = channel();
+    let fallback = tx.clone();
+    let spawned = std::thread::Builder::new().name("stale-space-removal".into()).spawn(move || {
+        let run = catch_unwind(AssertUnwindSafe(|| removal_selection_of(&RealFs::default(), &entries, Utc::now())));
+        // A panic has been logged by the panic hook.
+        let _ = tx.send(run.map_err(|_| Warning::Fixed(Msg::RemovalListAborted)));
+    });
+    if let Err(e) = spawned {
+        log::error!("could not spawn space removal thread: {e}");
+        let _ = fallback.send(Err(Warning::Detail(Msg::RemovalListAborted, e.to_string())));
     }
     rx
 }

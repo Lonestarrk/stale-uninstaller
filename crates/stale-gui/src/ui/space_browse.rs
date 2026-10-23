@@ -27,7 +27,8 @@ struct Clicks {
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let removing = app.removal_running();
     let loading = app.browse_running();
-    let asking = app.space_pending_removal.is_some();
+    // While the confirmation is open the window is frozen: no checking, no navigating.
+    let asking = app.space_confirm.is_some();
     let Some(b) = app.space_browse.as_mut() else { return };
     let ctx = ui.ctx().clone();
     let screen = ctx.content_rect();
@@ -40,7 +41,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         .collapsible(false)
         .default_size([screen.width() * 0.6, screen.height() * 0.6])
         .show(&ctx, |ui| {
-            breadcrumb(ui, b, &mut clicks);
+            breadcrumb(ui, b, !asking, &mut clicks);
             ui.separator();
             match b.children.as_ref() {
                 None => {
@@ -56,7 +57,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                 Some(children) if children.is_empty() => {
                     ui.label(strings::t().browse_empty);
                 }
-                Some(_) => listing(ui, b, screen.height() * 0.5, &mut clicks),
+                Some(_) => listing(ui, b, screen.height() * 0.5, !asking, &mut clicks),
             }
             ui.separator();
             footer(ui, b, removing || asking, &mut clicks);
@@ -77,7 +78,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 }
 
 /// From the opened entry down to the folder shown; a click on a step goes back up to it.
-fn breadcrumb(ui: &mut egui::Ui, b: &BrowseState, clicks: &mut Clicks) {
+fn breadcrumb(ui: &mut egui::Ui, b: &BrowseState, editable: bool, clicks: &mut Clicks) {
     ui.horizontal_wrapped(|ui| {
         let crumbs = b.crumbs();
         let last = crumbs.len() - 1;
@@ -87,7 +88,7 @@ fn breadcrumb(ui: &mut egui::Ui, b: &BrowseState, clicks: &mut Clicks) {
             }
             if k == last {
                 ui.strong(label);
-            } else if ui.link(label).clicked() {
+            } else if ui.add_enabled(editable, egui::Link::new(label)).clicked() {
                 clicks.go_to = Some(path);
             }
         }
@@ -96,7 +97,7 @@ fn breadcrumb(ui: &mut egui::Ui, b: &BrowseState, clicks: &mut Clicks) {
 
 /// The children, one compact row each, then "… N till". A click checks a row, a double-click
 /// on a folder goes into it.
-fn listing(ui: &mut egui::Ui, b: &mut BrowseState, max_height: f32, clicks: &mut Clicks) {
+fn listing(ui: &mut egui::Ui, b: &mut BrowseState, max_height: f32, editable: bool, clicks: &mut Clicks) {
     let lang = strings::lang();
     let Some(children) = b.children.as_ref() else { return };
     let mut toggled = None;
@@ -112,11 +113,11 @@ fn listing(ui: &mut egui::Ui, b: &mut BrowseState, max_height: f32, clicks: &mut
                     }
                     continue;
                 };
-                let (toggle, double) = child_row(ui, i, child, &mut b.checked[i], lang);
+                let (toggle, double) = child_row(ui, i, child, &mut b.checked[i], editable, lang);
                 if toggle {
                     toggled = Some(i);
                 }
-                if double && child.is_dir {
+                if editable && double && child.is_dir {
                     clicks.go_to = Some(child.path.clone());
                 }
             }
@@ -129,11 +130,11 @@ fn listing(ui: &mut egui::Ui, b: &mut BrowseState, max_height: f32, clicks: &mut
 
 /// One child: check box (none when blocked), name, the reason it is blocked, kind and size.
 /// Returns whether the row's own click toggles it, and whether it was double-clicked.
-fn child_row(ui: &mut egui::Ui, index: usize, child: &Child, checked: &mut bool, lang: Lang) -> (bool, bool) {
+fn child_row(ui: &mut egui::Ui, index: usize, child: &Child, checked: &mut bool, editable: bool, lang: Lang) -> (bool, bool) {
     let mut box_clicked = false;
     let clicks = compact_row(ui, index, |ui| {
         if child.blocked.is_none() {
-            box_clicked = ui.add(egui::Checkbox::without_text(checked)).clicked();
+            box_clicked = ui.add_enabled(editable, egui::Checkbox::without_text(checked)).clicked();
         } else {
             ui.add_space(ui.spacing().icon_width);
         }
@@ -150,7 +151,7 @@ fn child_row(ui: &mut egui::Ui, index: usize, child: &Child, checked: &mut bool,
             });
         });
     });
-    (child.blocked.is_none() && row_toggles(box_clicked, clicks.clicked), clicks.double_clicked)
+    (editable && child.blocked.is_none() && row_toggles(box_clicked, clicks.clicked), clicks.double_clicked)
 }
 
 /// "N markerade · X", "Öppna i Utforskaren" and "Ta bort markerade…" (off while `busy`).

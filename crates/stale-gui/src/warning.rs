@@ -24,6 +24,7 @@ pub enum Msg {
     SpaceScanAborted,
     SpaceScanThreadFailed,
     BrowseAborted,
+    RemovalListAborted,
 }
 
 impl Msg {
@@ -47,6 +48,7 @@ impl Msg {
             Msg::SpaceScanAborted => s.space_scan_aborted,
             Msg::SpaceScanThreadFailed => s.space_scan_thread_failed,
             Msg::BrowseAborted => s.browse_aborted,
+            Msg::RemovalListAborted => s.removal_list_aborted,
         }
     }
 }

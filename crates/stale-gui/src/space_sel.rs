@@ -23,12 +23,17 @@ pub struct SpaceSelection {
     pub checked: Vec<bool>,
     /// The entry's size has arrived (it may still be unknown).
     pub measured: Vec<bool>,
+    /// Each entry's [`norm`]ed path, the sort's tie-breaker.
+    keys: Vec<String>,
+    /// The row order, until a size changes it.
+    order: Option<Vec<usize>>,
 }
 
 impl SpaceSelection {
     pub fn new(entries: Vec<SpaceEntry>) -> Self {
         let n = entries.len();
-        SpaceSelection { entries, checked: vec![false; n], measured: vec![false; n] }
+        let keys = entries.iter().map(|e| norm(&e.path)).collect();
+        SpaceSelection { entries, checked: vec![false; n], measured: vec![false; n], keys, order: None }
     }
 
     /// Entry `i`'s measured size; an index out of range is ignored.
@@ -37,6 +42,7 @@ impl SpaceSelection {
             e.size = size;
             e.partial = partial;
             self.measured[i] = true;
+            self.order = None;
         }
     }
 
@@ -45,19 +51,22 @@ impl SpaceSelection {
     }
 
     /// The row order: largest first, unknown and not yet measured sizes last, then by path.
-    pub fn order(&self) -> Vec<usize> {
-        let mut idx: Vec<usize> = (0..self.entries.len()).collect();
-        idx.sort_by(|&a, &b| {
-            let (ea, eb) = (&self.entries[a], &self.entries[b]);
-            let by_size = match (ea.size, eb.size) {
-                (Some(x), Some(y)) => y.cmp(&x),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            by_size.then_with(|| norm(&ea.path).cmp(&norm(&eb.path)))
-        });
-        idx
+    /// Sorted again only after a size has changed.
+    pub fn order(&mut self) -> &[usize] {
+        let (entries, keys) = (&self.entries, &self.keys);
+        self.order.get_or_insert_with(|| {
+            let mut idx: Vec<usize> = (0..entries.len()).collect();
+            idx.sort_by(|&a, &b| {
+                let by_size = match (entries[a].size, entries[b].size) {
+                    (Some(x), Some(y)) => y.cmp(&x),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                by_size.then_with(|| keys[a].cmp(&keys[b]))
+            });
+            idx
+        })
     }
 
     /// Only entries that go through the quarantine have a check box; Windows' own space hogs
@@ -82,18 +91,37 @@ impl SpaceSelection {
         self.entries.iter().zip(&self.checked).enumerate().filter(|(i, (_, c))| **c && self.checkable(*i)).map(|(_, (e, _))| e)
     }
 
-    /// What removing the checked entries moves, one group per entry named by its path: the
-    /// entry itself, or a temp folder's old files ([`removal_items`]). Windows-cleanup entries
-    /// never get here (they cannot be checked) and yield nothing anyway.
-    pub fn removal_selection(&self, fs: &dyn FsReader, now: DateTime<Utc>) -> LeftoverSelection {
-        let reports: Vec<(String, LeftoverReport)> = self
-            .checked_entries()
-            .filter(|e| removal(&e.kind) == Removal::Quarantine)
-            .map(|e| (e.path.display().to_string(), LeftoverReport { items: removal_items(fs, e, now) }))
-            .filter(|(_, r)| !r.items.is_empty())
-            .collect();
-        LeftoverSelection::from_reports(&reports)
+    /// The checked entries that go through the quarantine, for [`removal_selection_of`] on a
+    /// worker.
+    pub fn checked_snapshot(&self) -> Vec<SpaceEntry> {
+        self.checked_entries().cloned().collect()
     }
+
+    /// What removing the checked entries moves; see [`removal_selection_of`].
+    pub fn removal_selection(&self, fs: &dyn FsReader, now: DateTime<Utc>) -> LeftoverSelection {
+        removal_selection_of(fs, &self.checked_snapshot(), now)
+    }
+
+    /// `listed` (a [`removal_selection_of`] of an earlier snapshot) cut down to the entries that
+    /// are still checked now: what "Ta bort" removes. An entry checked after the listing is not
+    /// added; the user has not seen it in the confirmation.
+    pub fn still_checked(&self, listed: &LeftoverSelection) -> LeftoverSelection {
+        let names: std::collections::HashSet<String> = self.checked_entries().map(|e| e.path.display().to_string()).collect();
+        LeftoverSelection { groups: listed.groups.iter().filter(|g| names.contains(&g.program_name)).cloned().collect() }
+    }
+}
+
+/// What removing `entries` moves, one group per entry named by its path: the entry itself, or a
+/// temp folder's old files ([`removal_items`]). Windows-cleanup entries yield nothing. Reads the
+/// file system for temp folders, so it runs on a worker.
+pub fn removal_selection_of(fs: &dyn FsReader, entries: &[SpaceEntry], now: DateTime<Utc>) -> LeftoverSelection {
+    let reports: Vec<(String, LeftoverReport)> = entries
+        .iter()
+        .filter(|e| removal(&e.kind) == Removal::Quarantine)
+        .map(|e| (e.path.display().to_string(), LeftoverReport { items: removal_items(fs, e, now) }))
+        .filter(|(_, r)| !r.items.is_empty())
+        .collect();
+    LeftoverSelection::from_reports(&reports)
 }
 
 /// What one row of the space view shows.
@@ -171,6 +199,7 @@ pub fn block_text_in(lang: Lang, reason: BlockReason) -> &'static str {
         BlockReason::InstalledProgram => s.block_installed,
         BlockReason::OtherProfileRoot => s.block_profile,
         BlockReason::Own => s.block_own,
+        BlockReason::Kept => s.block_kept,
     }
 }
 
@@ -284,10 +313,10 @@ pub(crate) mod tests {
             entry(r"D:\Also unknown", SpaceKind::DriveRoot, None),
             entry(r"D:\Mid", SpaceKind::DriveRoot, Some(100)),
         ]);
-        assert_eq!(sel.order(), vec![2, 4, 0, 3, 1]);
+        assert_eq!(sel.order(), [2, 4, 0, 3, 1]);
         // A size arriving later moves its row up.
         sel.set_size(1, Some(1000), true);
-        assert_eq!(sel.order(), vec![1, 2, 4, 0, 3]);
+        assert_eq!(sel.order(), [1, 2, 4, 0, 3], "the cached order is sorted again");
         assert!(sel.entries[1].partial);
         assert_eq!(sel.measured_count(), 5);
         sel.set_size(99, Some(1), false);
@@ -367,6 +396,25 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn confirmation_removes_only_entries_still_checked() {
+        let fs = FakeFs::new().dir(r"D:\Foton", 9).dir(r"D:\ISO", 5).dir(r"D:\Other", 1);
+        let mut sel = sized(vec![
+            entry(r"D:\Foton", SpaceKind::DriveRoot, Some(9)),
+            entry(r"D:\ISO", SpaceKind::DriveRoot, Some(5)),
+            entry(r"D:\Other", SpaceKind::DriveRoot, Some(1)),
+        ]);
+        sel.toggle(0);
+        sel.toggle(1);
+        let listed = removal_selection_of(&fs, &sel.checked_snapshot(), Utc::now());
+        assert_eq!(listed.groups.len(), 2);
+        // While the confirmation is open: Foton is unchecked, Other is checked.
+        sel.toggle(0);
+        sel.toggle(2);
+        let names: Vec<String> = sel.still_checked(&listed).groups.into_iter().map(|g| g.program_name).collect();
+        assert_eq!(names, vec![r"D:\ISO".to_string()], "unchecked is not removed, unseen is not added");
+    }
+
     fn child(path: &str, is_dir: bool, size: Option<u64>, blocked: Option<BlockReason>) -> Child {
         Child { path: PathBuf::from(path), is_dir, size, partial: false, blocked }
     }
@@ -434,6 +482,7 @@ pub(crate) mod tests {
     fn block_reasons_are_worded_in_both_languages() {
         assert_eq!(block_text_in(Lang::Sv, BlockReason::InstalledProgram), "Ett installerat program finns här");
         assert_eq!(block_text_in(Lang::En, BlockReason::Own), "Stale Uninstaller's own folder");
+        assert_eq!(block_text_in(Lang::Sv, BlockReason::Kept), "På listan över behållna – tas inte bort här");
         assert_eq!(strings::more_children_in(Lang::Sv, 312), "… 312 till");
         assert_eq!(strings::more_children_in(Lang::En, 1), "… 1 more");
         assert_eq!(strings::space_remove_confirm_in(Lang::Sv, 2, "3 MB"), "Flytta 2 mappar och filer (3 MB) till karantänen? Du kan återställa dem från Karantän.");

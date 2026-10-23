@@ -26,7 +26,3 @@ Machine: the developer's Windows 11 computer with the fixed drives `C:`, `E:`, `
   `ms-playwright` and VS Code folders. Folders that look like an installed program's (for
   example `Code` next to "Microsoft Visual Studio Code") carry the ghost scan's ambiguity notes,
   which the view shows on the row.
-
-## Live check with the GUI
-
-<!-- To be filled in after the run with the "Sök rester" view. -->

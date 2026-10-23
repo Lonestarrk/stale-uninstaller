@@ -360,6 +360,9 @@ pub struct Strings {
     pub win_memory_dump: &'static str,
     pub win_minidumps: &'static str,
     pub win_live_kernel: &'static str,
+    pub block_kept: &'static str,
+    pub space_confirm_listing: &'static str,
+    pub removal_list_aborted: &'static str,
     // Quarantine view
     pub quarantine: &'static str,
     pub quarantine_title: &'static str,
@@ -670,6 +673,9 @@ pub static SV: Strings = Strings {
     win_memory_dump: "Minnesdump från en krasch. Behövs bara för felsökning.",
     win_minidumps: "Små minnesdumpar från krascher. Behövs bara för felsökning.",
     win_live_kernel: "Felrapporter från Windows-kärnan. Behövs bara för felsökning.",
+    block_kept: "På listan över behållna – tas inte bort här",
+    space_confirm_listing: "Listar vad som ska tas bort…",
+    removal_list_aborted: "Det gick inte att lista vad som skulle tas bort – se loggfilen",
     // Quarantine view
     quarantine: "Karantän",
     quarantine_title: "Karantän",
@@ -962,6 +968,9 @@ pub static EN: Strings = Strings {
     win_memory_dump: "Memory dump from a crash. Only needed for troubleshooting.",
     win_minidumps: "Small memory dumps from crashes. Only needed for troubleshooting.",
     win_live_kernel: "Error reports from the Windows kernel. Only needed for troubleshooting.",
+    block_kept: "On the keep list – not removed here",
+    space_confirm_listing: "Listing what will be removed…",
+    removal_list_aborted: "Could not list what was to be removed – see the log file",
     // Quarantine view
     quarantine: "Quarantine",
     quarantine_title: "Quarantine",

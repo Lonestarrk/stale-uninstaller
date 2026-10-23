@@ -32,16 +32,19 @@ const ROW_HEIGHT: f32 = 24.0;
 pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
     let removing = app.removal_running();
     let scanning = app.space_scan_running();
+    // While the confirmation is open the rows are frozen: it removes what is checked when
+    // "Ta bort" is clicked, and that should be what it showed.
+    let asking = app.space_confirm.is_some();
     let mut action = None;
     ui.horizontal(|ui| {
         ui.heading(strings::t().search_title);
         if ui.button(strings::t().back_to_programs).clicked() {
             action = Some(Action::Back);
         }
-        if ui.add_enabled(!removing, egui::Button::new(strings::t().refresh)).clicked() {
+        if ui.add_enabled(!removing && !asking, egui::Button::new(strings::t().refresh)).clicked() {
             action = Some(Action::Refresh);
         }
-        let can_search = app.search.is_none() && !app.leftover_search_running() && !removing;
+        let can_search = app.search.is_none() && !app.leftover_search_running() && !removing && !asking;
         if ui.add_enabled(can_search, egui::Link::new(strings::t().space_manual_link)).clicked() {
             action = Some(Action::ManualSearch);
         }
@@ -68,7 +71,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
                     }
                     ui.label(strings::space_summary(checked, &format::human_size(Some(bytes))));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let asking = app.space_pending_removal.is_some();
                         if ui.add_enabled(checked > 0 && !removing && !asking, egui::Button::new(strings::t().remove_ghosts)).clicked() {
                             action = Some(Action::AskRemove);
                         }
@@ -78,13 +80,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
             if sel.entries.is_empty() {
                 ui.label(strings::t().space_empty);
             } else {
-                let order = sel.order();
+                let order = sel.order().to_vec();
                 let lang = strings::lang();
                 egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_HEIGHT, order.len(), |ui, range| {
                     for k in range {
                         let i = order[k];
                         let row = space_row_in(lang, &sel.entries[i], sel.measured[i]);
-                        let (toggle, open) = space_row(ui, i, &row, &mut sel.checked[i], &mut action);
+                        let (toggle, open) = space_row(ui, i, &row, &mut sel.checked[i], !asking, &mut action);
                         if toggle {
                             sel.toggle(i);
                         }
@@ -97,9 +99,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
         }
     }
     space_browse::show(ui, app);
-    if let Some(pending) = &app.space_pending_removal {
-        let (items, _, bytes) = pending.summary();
-        remove_confirm_window(ui.ctx(), items, bytes, &mut action);
+    if asking {
+        let summary = app.space_confirm_selection().map(|sel| {
+            let (items, _, bytes) = sel.summary();
+            (items, bytes)
+        });
+        remove_confirm_window(ui.ctx(), summary, &mut action);
     }
     match action {
         Some(Action::Back) => app.view = View::Programs,
@@ -128,12 +133,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut StaleApp) {
 /// One row: check box (or room for one), name, location, explanation, kind and size; a Windows
 /// space hog has "Öppna Windows rensning" instead of a check box. Returns whether a click on the
 /// row (not on its box) toggles it, and whether it was double-clicked.
-fn space_row(ui: &mut egui::Ui, index: usize, row: &SpaceRow, checked: &mut bool, action: &mut Option<Action>) -> (bool, bool) {
+/// Frozen (`!editable`) rows neither toggle nor open.
+fn space_row(ui: &mut egui::Ui, index: usize, row: &SpaceRow, checked: &mut bool, editable: bool, action: &mut Option<Action>) -> (bool, bool) {
     let mut box_clicked = false;
     let clicks = compact_row(ui, index, |ui| {
         if row.checkbox {
             // The box flips `checked` itself; the row's own click goes through `toggle`.
-            box_clicked = ui.add(egui::Checkbox::without_text(checked)).clicked();
+            box_clicked = ui.add_enabled(editable, egui::Checkbox::without_text(checked)).clicked();
         } else {
             ui.add_space(ui.spacing().icon_width);
         }
@@ -157,11 +163,12 @@ fn space_row(ui: &mut egui::Ui, index: usize, row: &SpaceRow, checked: &mut bool
         });
     });
     // Both clicks of a double-click toggle, which leaves the check box as it was.
-    (row.checkbox && row_toggles(box_clicked, clicks.clicked), clicks.double_clicked)
+    (editable && row.checkbox && row_toggles(box_clicked, clicks.clicked), editable && clicks.double_clicked)
 }
 
-/// "Ta bort markerade…": how much goes to the quarantine, then Avbryt / Ta bort.
-fn remove_confirm_window(ctx: &egui::Context, items: usize, bytes: u64, action: &mut Option<Action>) {
+/// "Ta bort markerade…": how much goes to the quarantine (a spinner while it is being listed,
+/// `None`), then Avbryt / Ta bort.
+fn remove_confirm_window(ctx: &egui::Context, summary: Option<(usize, u64)>, action: &mut Option<Action>) {
     egui::Window::new(strings::t().remove_ghosts)
         .id(egui::Id::unique("remove_space_window"))
         .collapsible(false)
@@ -169,13 +176,24 @@ fn remove_confirm_window(ctx: &egui::Context, items: usize, bytes: u64, action: 
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.set_max_width(ctx.content_rect().width() * 0.6);
-            ui.label(strings::space_remove_confirm(items, &format::human_size(Some(bytes))));
+            match summary {
+                Some((items, bytes)) => {
+                    ui.label(strings::space_remove_confirm(items, &format::human_size(Some(bytes))));
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(strings::t().space_confirm_listing);
+                    });
+                }
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button(strings::t().cancel).clicked() {
                     *action = Some(Action::CancelRemove);
                 }
-                if ui.button(strings::t().remove).clicked() {
+                let ready = summary.is_some_and(|(items, _)| items > 0);
+                if ui.add_enabled(ready, egui::Button::new(strings::t().remove)).clicked() {
                     *action = Some(Action::ConfirmRemove);
                 }
             });

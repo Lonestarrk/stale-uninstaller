@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 use stale_core::ghosts::{Evidence, Ghost};
 use stale_core::keep::KeepList;
-use stale_core::leftovers::ProgramHint;
+use stale_core::leftovers::{LeftoverReport, ProgramHint};
+use stale_core::space::SpaceEntry;
 use stale_core::provenance::{InstallSource, Provenance, Signature};
 use stale_core::quarantine::{plan_destinations, DestinationPlan, Failure, QuarantineId, QuarantineManifest, RestoreOutcome};
 use stale_core::scan::ScanEvent;
@@ -123,6 +124,16 @@ pub struct KeptGhost {
     keep_before: KeepList,
 }
 
+/// The space view's "Ta bort markerade…" confirmation. What it removes is built from the check
+/// marks when "Ta bort" is clicked ([`StaleApp::space_confirm_selection`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpaceConfirm {
+    /// The list's checked entries, as listed on a worker; `None` until the listing is done.
+    List(Option<LeftoverSelection>),
+    /// The drill-down window's checked children.
+    Browse,
+}
+
 /// One entry of the keep list, as the "Behållna" window lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeepEntry {
@@ -203,8 +214,13 @@ pub struct StaleApp {
     space_generation: u64,
     /// The last space scan measured every entry.
     space_complete: bool,
-    /// What the space view's "Ta bort markerade…" would move, while its confirmation is open.
-    pub space_pending_removal: Option<LeftoverSelection>,
+    /// The space view's removal confirmation, while open.
+    pub space_confirm: Option<SpaceConfirm>,
+    space_confirm_rx: Option<Receiver<Result<LeftoverSelection, Warning>>>,
+    /// A removal from the space list started: the list is scanned again when the view shows.
+    space_rescan: bool,
+    /// A leftover search that finished while the leftovers view was busy, shown once it is not.
+    waiting_search: Option<(String, LeftoverReport)>,
     /// The drill-down window, when open.
     pub space_browse: Option<BrowseState>,
     browse_rx: Option<Receiver<Result<BrowseResult, Warning>>>,
@@ -297,7 +313,10 @@ impl StaleApp {
             space_cancel: None,
             space_generation: 0,
             space_complete: false,
-            space_pending_removal: None,
+            space_confirm: None,
+            space_confirm_rx: None,
+            space_rescan: false,
+            waiting_search: None,
             space_browse: None,
             browse_rx: None,
             ghost_popup: None,
@@ -658,8 +677,8 @@ impl StaleApp {
                 self.ghost_popup = None;
                 self.refresh_ghosts();
             } else if self.leftovers_origin == View::Space {
-                // The entries just quarantined must not be offered again, and sizes have changed.
-                self.refresh_space();
+                // The space list was dropped when the removal started (`space_rescan`); it is
+                // scanned again once the space view shows, not when the user goes elsewhere.
             } else if !self.queue_running() {
                 // Its reports name what was just quarantined: "Visa rester" must not offer them again.
                 self.close_flow();
@@ -718,6 +737,15 @@ impl StaleApp {
         let batches = sel.checked_items();
         if batches.is_empty() {
             return;
+        }
+        if self.leftovers_origin == View::Space {
+            // The space list is out of date once its entries move: drop it and stop measuring
+            // them; it is scanned again when the space view shows next.
+            self.cancel_space_scan();
+            self.close_browse();
+            self.space = None;
+            self.space_complete = false;
+            self.space_rescan = true;
         }
         let total = batches.iter().map(|(_, items)| items.len()).sum();
         self.removal_progress = Some((0, total, String::new()));
@@ -849,15 +877,36 @@ impl StaleApp {
         }
     }
 
-    /// Opens the leftovers view once the standalone search is done.
+    /// True while the leftovers view is in use, or a removal is being confirmed or runs: a
+    /// finished search must not replace what is about to be removed.
+    fn leftovers_busy(&self) -> bool {
+        self.view == View::Leftovers
+            || self.removal_running()
+            || self.removal_plan.is_some()
+            || self.space_confirm.is_some()
+            || self.ghost_confirm
+    }
+
+    /// Shows a finished search's leftovers once nothing else uses the leftovers view.
+    fn show_waiting_search(&mut self) {
+        if self.leftovers_busy() {
+            return;
+        }
+        let Some((name, report)) = self.waiting_search.take() else { return };
+        // Started from the space view's link: its back button returns there.
+        let origin = if self.view == View::Space { View::Space } else { View::Programs };
+        self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]));
+        self.leftovers_origin = origin;
+    }
+
+    /// Opens the leftovers view once the standalone search is done (see
+    /// [`Self::show_waiting_search`]).
     fn drain_leftover_scan(&mut self) {
         let Some(rx) = self.leftover_scan_rx.take() else { return };
         match rx.try_recv() {
             Ok(LeftoverScanEvent::Done(name, report)) => {
-                // Started from the space view's link: its back button returns there.
-                let origin = if self.view == View::Space { View::Space } else { View::Programs };
-                self.show_leftovers(LeftoverSelection::from_reports(&[(name, report)]));
-                self.leftovers_origin = origin;
+                self.waiting_search = Some((name, report));
+                self.show_waiting_search();
             }
             Ok(LeftoverScanEvent::Failed(msg)) => {
                 log::error!("{msg:?}");
@@ -982,7 +1031,8 @@ impl StaleApp {
         self.space_generation += 1;
         self.space = None;
         self.space_complete = false;
-        self.space_pending_removal = None;
+        self.space_rescan = false;
+        self.cancel_space_removal();
         self.close_browse();
         let (rx, cancel) = spawn(self.space_generation);
         self.space_rx = Some(rx);
@@ -1102,33 +1152,80 @@ impl StaleApp {
         }
     }
 
-    /// "Ta bort markerade…" in the space view: what the checked entries would move, for the
-    /// confirmation (a temp folder's old files are listed here, once).
+    /// "Ta bort markerade…" in the space view: opens the confirmation and lists what the checked
+    /// entries would move on a worker (a temp folder's old files are read from disk).
     pub fn ask_remove_space(&mut self) {
+        self.ask_remove_space_with(worker::spawn_space_removal_list);
+    }
+
+    fn ask_remove_space_with(&mut self, spawn: impl FnOnce(Vec<SpaceEntry>) -> Receiver<Result<LeftoverSelection, Warning>>) {
         let Some(sel) = &self.space else { return };
-        let removal = sel.removal_selection(&stale_core::fsys::RealFs::default(), Utc::now());
-        self.space_pending_removal = (!removal.groups.is_empty()).then_some(removal);
+        let entries = sel.checked_snapshot();
+        if entries.is_empty() {
+            return;
+        }
+        self.space_confirm_rx = Some(spawn(entries));
+        self.space_confirm = Some(SpaceConfirm::List(None));
+    }
+
+    /// Fills the confirmation in once the listing worker is done.
+    fn drain_space_confirm(&mut self) {
+        let Some(rx) = self.space_confirm_rx.take() else { return };
+        let failed = match rx.try_recv() {
+            Ok(Ok(listed)) => {
+                if let Some(SpaceConfirm::List(slot)) = self.space_confirm.as_mut() {
+                    *slot = Some(listed);
+                }
+                None
+            }
+            Ok(Err(msg)) => Some(msg),
+            Err(TryRecvError::Empty) => {
+                self.space_confirm_rx = Some(rx);
+                None
+            }
+            Err(TryRecvError::Disconnected) => Some(Warning::Fixed(Msg::RemovalListAborted)),
+        };
+        if let Some(msg) = failed {
+            log::error!("{msg:?}");
+            self.warnings.push(msg);
+            self.cancel_space_removal();
+        }
     }
 
     /// "Ta bort markerade…" in the drill-down window.
     pub fn ask_remove_browse(&mut self) {
         let Some(b) = &self.space_browse else { return };
-        let removal = b.removal_selection();
-        self.space_pending_removal = (!removal.groups.is_empty()).then_some(removal);
+        if b.summary().0 > 0 {
+            self.space_confirm = Some(SpaceConfirm::Browse);
+        }
     }
 
+    /// What "Ta bort" in the confirmation would remove now, built from the current check marks;
+    /// `None` while the listing runs.
+    pub fn space_confirm_selection(&self) -> Option<LeftoverSelection> {
+        match self.space_confirm.as_ref()? {
+            SpaceConfirm::List(listed) => Some(self.space.as_ref()?.still_checked(listed.as_ref()?)),
+            SpaceConfirm::Browse => Some(self.space_browse.as_ref()?.removal_selection()),
+        }
+    }
+
+    /// Closes the confirmation; a listing still running is dropped.
     pub fn cancel_space_removal(&mut self) {
-        self.space_pending_removal = None;
+        self.space_confirm = None;
+        self.space_confirm_rx = None;
     }
 
-    /// "Ta bort" in the space view's confirmation: the items go through the leftovers view's
-    /// removal (drive window, progress, summary); "Tillbaka" returns to the space view.
+    /// "Ta bort" in the space view's confirmation: what is checked now goes through the
+    /// leftovers view's removal (drive window, progress, summary); "Tillbaka" returns to the
+    /// space view.
     pub fn confirm_space_removal(&mut self) {
         self.confirm_space_removal_with(&stale_core::quarantine::live_volume_ok, &stale_core::quarantine::live_free_bytes);
     }
 
     fn confirm_space_removal_with(&mut self, volume_ok: &dyn Fn(char) -> bool, free_bytes: &dyn Fn(char) -> Option<u64>) {
-        let Some(selection) = self.space_pending_removal.take() else { return };
+        let selection = self.space_confirm_selection();
+        self.cancel_space_removal();
+        let Some(selection) = selection else { return };
         if self.removal_running() || selection.groups.is_empty() {
             return;
         }
@@ -1136,6 +1233,24 @@ impl StaleApp {
         self.show_leftovers(selection);
         self.leftovers_origin = View::Space;
         self.request_removal(volume_ok, free_bytes);
+    }
+
+    /// The space view's per-frame work: its workers' results, stopping it when it is left,
+    /// the rescan after a removal from it, and a search result that waited.
+    fn logic_space(&mut self) {
+        self.drain_space();
+        self.drain_browse();
+        self.drain_space_confirm();
+        if !self.space_view_active() {
+            // Leaving the view stops the measuring and forgets the confirmation; coming back
+            // starts the scan again.
+            self.cancel_space_scan();
+            self.close_browse();
+            self.cancel_space_removal();
+        } else if self.view == View::Space && self.space_rescan {
+            self.refresh_space();
+        }
+        self.show_waiting_search();
     }
 
     /// True while a ghost scan runs.
@@ -1255,13 +1370,7 @@ impl eframe::App for StaleApp {
         self.drain_quarantine_admin();
         self.drain_ghost_scan();
         self.start_waiting_ghost_scan();
-        self.drain_space();
-        self.drain_browse();
-        if !self.space_view_active() {
-            // Leaving the view stops the measuring; coming back starts it again.
-            self.cancel_space_scan();
-            self.close_browse();
-        }
+        self.logic_space();
         self.drain_provenance();
         self.request_provenance();
         if self.scanning
@@ -1269,6 +1378,7 @@ impl eframe::App for StaleApp {
             || self.ghost_scan_running()
             || self.space_scan_running()
             || self.browse_rx.is_some()
+            || self.space_confirm_rx.is_some()
             || self.queue_running()
             || self.removal_running()
             || self.leftover_search_running()
@@ -2156,14 +2266,14 @@ mod tests {
         ]);
         sel.toggle(0);
         sel.toggle(1);
-        let fs = FakeFs::new().dir(r"E:\Foton", 30);
-        app.space_pending_removal = Some(sel.removal_selection(&fs, Utc::now()));
         app.space = Some(sel);
+        ask_with_listing(&mut app, &FakeFs::new().dir(r"E:\Foton", 30));
+        assert_eq!(app.space_confirm_selection().map(|s| s.summary()), Some((1, 1, 30)));
         app.space_browse = Some(BrowseState::new(PathBuf::from(r"E:\Foton")));
         // E: cannot hold a payload: the drive window opens, so no real removal starts.
         app.confirm_space_removal_with(&|d| d != 'E', &|_| Some(1_000_000));
         assert_eq!((app.view, app.leftovers_origin), (View::Leftovers, View::Space));
-        assert!(app.space_pending_removal.is_none() && app.space_browse.is_none());
+        assert!(app.space_confirm.is_none() && app.space_browse.is_none());
         let groups: Vec<(&str, usize)> =
             app.leftovers.as_ref().unwrap().groups.iter().map(|g| (g.program_name.as_str(), g.items.len())).collect();
         assert_eq!(groups, vec![(r"E:\Foton", 1)], "Windows.old never reaches the quarantine");
@@ -2175,10 +2285,102 @@ mod tests {
         assert_eq!(app.view, View::Space, "Avbryt returns to the space view");
         assert!(app.space.as_ref().unwrap().checked[0], "with the check marks kept");
 
-        // Nothing checked: nothing happens.
-        app.space_pending_removal = None;
+        // No confirmation open: nothing happens.
         app.confirm_space_removal_with(&|_| true, &|_| Some(1_000));
         assert_eq!(app.view, View::Space);
+    }
+
+    /// "Ta bort markerade…" in the space list, with the listing worker replaced by `fs` and
+    /// its result already received.
+    fn ask_with_listing(app: &mut StaleApp, fs: &stale_core::fsys::FakeFs) {
+        app.ask_remove_space_with(|entries| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(Ok(crate::space_sel::removal_selection_of(fs, &entries, Utc::now()))).unwrap();
+            rx
+        });
+        assert_eq!(app.space_confirm, Some(SpaceConfirm::List(None)), "a spinner until listed");
+        app.drain_space_confirm();
+    }
+
+    #[test]
+    fn unchecked_while_confirming_is_not_removed() {
+        use crate::space_sel::tests::entry;
+        use stale_core::fsys::FakeFs;
+        use stale_core::space::SpaceKind;
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Space;
+        let mut sel = SpaceSelection::new(vec![entry(r"E:\Foton", SpaceKind::DriveRoot, Some(200)), entry(r"E:\ISO", SpaceKind::DriveRoot, Some(5))]);
+        sel.toggle(0);
+        app.space = Some(sel);
+        ask_with_listing(&mut app, &FakeFs::new().dir(r"E:\Foton", 200).dir(r"E:\ISO", 5));
+        // The user unchecks Foton and checks ISO behind the open confirmation.
+        let sel = app.space.as_mut().unwrap();
+        sel.toggle(0);
+        sel.toggle(1);
+        assert_eq!(app.space_confirm_selection().map(|s| s.groups.len()), Some(0));
+        app.confirm_space_removal_with(&|_| true, &|_| Some(1_000_000));
+        assert_eq!(app.view, View::Space, "nothing is removed");
+        assert!(app.leftovers.is_none() && app.quarantine_rx.is_none() && app.space_confirm.is_none());
+
+        // The drill-down: its confirmation also reads the check marks at "Ta bort".
+        let mut b = BrowseState::new(PathBuf::from(r"E:\Data"));
+        b.set_children(
+            std::path::Path::new(r"E:\Data"),
+            vec![stale_core::space::Child { path: PathBuf::from(r"E:\Data\a.bin"), is_dir: false, size: Some(1), partial: false, blocked: None }],
+            0,
+        );
+        b.toggle(0);
+        app.space_browse = Some(b);
+        app.ask_remove_browse();
+        assert_eq!(app.space_confirm, Some(SpaceConfirm::Browse));
+        app.space_browse.as_mut().unwrap().toggle(0);
+        app.confirm_space_removal_with(&|_| true, &|_| Some(1_000_000));
+        assert_eq!(app.view, View::Space);
+        assert!(app.leftovers.is_none());
+    }
+
+    #[test]
+    fn leaving_the_space_view_forgets_the_confirmation() {
+        use crate::space_sel::tests::entry;
+        use stale_core::space::SpaceKind;
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Space;
+        let mut sel = SpaceSelection::new(vec![entry(r"E:\Foton", SpaceKind::DriveRoot, Some(200))]);
+        sel.toggle(0);
+        app.space = Some(sel);
+        // The listing is still running.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.ask_remove_space_with(|_| rx);
+        assert_eq!(app.space_confirm_selection(), None);
+        app.view = View::Programs;
+        app.logic_space();
+        assert!(app.space_confirm.is_none() && app.space_confirm_rx.is_none());
+    }
+
+    #[test]
+    fn a_search_finishing_during_a_removal_waits() {
+        use stale_core::leftovers::{Confidence, Leftover, LeftoverKind};
+        let dir = |p: &str| Leftover { kind: LeftoverKind::Dir { path: p.into(), size: Some(1) }, confidence: Confidence::High, note: None };
+        let mut app = StaleApp::empty(Settings::default());
+        app.view = View::Leftovers;
+        app.leftovers_origin = View::Space;
+        app.leftovers = Some(LeftoverSelection::from_reports(&[(r"E:\Foton".into(), LeftoverReport { items: vec![dir(r"E:\Foton")] })]));
+        app.removal_plan = Some(plan_destinations(&[], &|_| true, &|_| None));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(LeftoverScanEvent::Done("Foo".into(), LeftoverReport { items: vec![dir(r"C:\Foo")] })).unwrap();
+        app.leftover_scan_rx = Some(rx);
+        app.drain_leftover_scan();
+        assert!(!app.leftover_search_running());
+        assert_eq!(app.leftovers.as_ref().unwrap().groups[0].program_name, r"E:\Foton", "the removal's items stay");
+        assert_eq!(app.leftovers_origin, View::Space);
+        // Avbryt in the drive window goes back to the space view; then the search shows.
+        app.cancel_removal_plan();
+        assert_eq!(app.view, View::Space);
+        app.show_waiting_search();
+        assert_eq!(app.view, View::Leftovers);
+        assert_eq!(app.leftovers.as_ref().unwrap().groups[0].program_name, "Foo");
+        assert_eq!(app.leftovers_origin, View::Space);
+        assert!(app.waiting_search.is_none());
     }
 }
 
