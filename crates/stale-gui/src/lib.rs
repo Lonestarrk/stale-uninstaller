@@ -9,6 +9,7 @@ pub mod format;
 pub mod ghost_sel;
 pub mod leftover_sel;
 pub mod logging;
+pub mod space_sel;
 pub mod strings;
 pub mod ui;
 pub mod warning;

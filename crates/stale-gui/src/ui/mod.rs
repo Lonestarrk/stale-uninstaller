@@ -8,6 +8,8 @@ pub mod ghosts_view;
 pub mod leftover_popup;
 pub mod leftovers_view;
 pub mod quarantine_view;
+pub mod space_browse;
+pub mod space_view;
 pub mod table;
 pub mod toolbar;
 pub mod uninstall_dialog;

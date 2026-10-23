@@ -1,5 +1,6 @@
 //! Manual check of the whole core: `cargo run -p stale-core --example dump` (elevated for BAM/Prefetch).
 //! Prints `drive | name | last used (source) | size`, never-seen first, then oldest first.
+//! `dump space` lists and measures the space scan's entries.
 //! `dump provenance <name>` prints the signature, version info, install date and source.
 
 use std::collections::{HashMap, HashSet};
@@ -95,6 +96,34 @@ fn dump_ghosts() {
         }
     }
     println!("--- {} ghosts", ghosts.len());
+}
+
+/// `dump space`: lists the space scan's entries, measures them and prints the largest. Nothing is
+/// deleted. Run elevated to read `Windows.old` and the other protected folders.
+fn dump_space() {
+    use stale_core::fsys::RealFs;
+    use stale_core::ghosts::InstalledIndex;
+    use stale_core::keep::KeepList;
+    use stale_core::leftovers::fs_scan::FsScanRoots;
+    use stale_core::own::OwnPaths;
+    use stale_core::space::{fixed_drives, list_entries, measure};
+    let started = std::time::Instant::now();
+    let fs = RealFs::live();
+    let programs = enumerate_programs(&WinRegistry);
+    let installed = InstalledIndex::from_programs(&programs);
+    let keep = KeepList::load_from(&stale_core::paths::keep_list_path());
+    let mut entries = list_entries(&fs, &fixed_drives(), &FsScanRoots::from_env(&fs), &installed, &keep, &OwnPaths::live());
+    println!("{} entries listed in {:.1} s", entries.len(), started.elapsed().as_secs_f64());
+    for e in &mut entries {
+        (e.size, e.partial) = measure(&fs, e);
+    }
+    entries.sort_by_key(|e| std::cmp::Reverse(e.size.unwrap_or(0)));
+    for e in entries.iter().take(40) {
+        let size = e.size.map_or("-".to_string(), mb);
+        let at_least = if e.partial { " (at least)" } else { "" };
+        println!("{size}{at_least} | {:?} | {}", e.kind, e.path.display());
+    }
+    println!("--- {} entries, {:.1} s in total", entries.len(), started.elapsed().as_secs_f64());
 }
 
 /// Upper-cased names of the `.exe` files in `dir` and up to three levels below it.
@@ -225,6 +254,10 @@ fn main() {
             Some(name) => dump_provenance(name),
             None => println!("usage: dump provenance <program name>"),
         }
+        return;
+    }
+    if args.first().map(String::as_str) == Some("space") {
+        dump_space();
         return;
     }
     if args.first().map(String::as_str) == Some("deps") {

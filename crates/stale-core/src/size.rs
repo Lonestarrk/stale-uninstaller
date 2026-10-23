@@ -5,24 +5,42 @@ use std::path::{Path, PathBuf};
 /// Total size of all files under `root`, or `None` when `root` is missing or unreadable.
 /// Symlinks and junctions are not followed; unreadable entries below `root` are skipped.
 pub fn dir_size(root: &Path) -> Option<u64> {
+    dir_size_partial(root).map(|(total, _)| total)
+}
+
+/// [`dir_size`] plus whether anything below `root` could not be read (so the size is a lower bound).
+pub fn dir_size_partial(root: &Path) -> Option<(u64, bool)> {
     let mut total = 0;
+    let mut partial = false;
     let mut stack = vec![];
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        add_entry(&entry, &mut total, &mut stack);
-    }
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            add_entry(&entry, &mut total, &mut stack);
+    for entry in std::fs::read_dir(root).ok()? {
+        match entry {
+            Ok(entry) => add_entry(&entry, &mut total, &mut stack, &mut partial),
+            Err(_) => partial = true,
         }
     }
-    Some(total)
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            partial = true;
+            continue;
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => add_entry(&entry, &mut total, &mut stack, &mut partial),
+                Err(_) => partial = true,
+            }
+        }
+    }
+    Some((total, partial))
 }
 
 /// Adds a file's size to `total` or queues a directory; links are skipped.
-fn add_entry(entry: &std::fs::DirEntry, total: &mut u64, stack: &mut Vec<PathBuf>) {
+fn add_entry(entry: &std::fs::DirEntry, total: &mut u64, stack: &mut Vec<PathBuf>, partial: &mut bool) {
     // DirEntry::metadata does not traverse links; junctions report as symlinks.
-    let Ok(meta) = entry.metadata() else { return };
+    let Ok(meta) = entry.metadata() else {
+        *partial = true;
+        return;
+    };
     if meta.file_type().is_symlink() {
         return;
     }

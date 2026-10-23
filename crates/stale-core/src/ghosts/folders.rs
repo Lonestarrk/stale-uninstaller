@@ -73,33 +73,37 @@ fn classify(fs: &dyn FsReader, dir: &Path, container: Option<&str>, installed: &
     }
 }
 
+/// An orphan folder found by [`list_orphan_folders`]: not measured yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanFolder {
+    pub path: PathBuf,
+    pub root_kind: RootKind,
+    /// The publisher folder it sits in, when it was found one level down.
+    pub container: Option<PathBuf>,
+}
+
 /// Folders in the program roots (Program Files, ProgramData and each profile's
-/// `AppData\Roaming`, `AppData\Local`, `AppData\Local\Programs`) that no installed program owns.
-/// Publisher containers are never listed themselves; their children are examined instead.
-pub fn orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &InstalledIndex, keep: &KeepList) -> Vec<Evidence> {
+/// `AppData\Roaming`, `AppData\Local`, `AppData\Local\Programs`) that no installed program owns,
+/// without sizes. Publisher containers are never listed themselves; their children are examined
+/// instead. Each folder appears once.
+pub fn list_orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &InstalledIndex, keep: &KeepList) -> Vec<OrphanFolder> {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<Evidence> = Vec::new();
-    let mut push = |dir: &Path, root_kind: RootKind| {
+    let mut out: Vec<OrphanFolder> = Vec::new();
+    let mut push = |dir: &Path, root_kind: RootKind, container: Option<&Path>| {
         if seen.insert(norm(dir)) {
-            out.push(Evidence::Folder {
-                path: dir.to_path_buf(),
-                size: fs.dir_size(dir),
-                modified: fs.modified(dir),
-                root_kind,
-                holds_user_data: holds_user_data(fs, dir),
-            });
+            out.push(OrphanFolder { path: dir.to_path_buf(), root_kind, container: container.map(Path::to_path_buf) });
         }
     };
     for (root, kind) in scan_roots(fs, roots) {
         for entry in fs.list_dir(&root).into_iter().filter(|e| e.is_dir) {
             match classify(fs, &entry.path, None, installed, keep) {
-                Verdict::Orphan => push(&entry.path, kind),
+                Verdict::Orphan => push(&entry.path, kind, None),
                 Verdict::Ignore => {}
                 Verdict::Container => {
                     let container = file_name(&entry.path);
                     for child in fs.list_dir(&entry.path).into_iter().filter(|e| e.is_dir) {
                         if let Verdict::Orphan = classify(fs, &child.path, Some(&container), installed, keep) {
-                            push(&child.path, kind);
+                            push(&child.path, kind, Some(&entry.path));
                         }
                     }
                 }
@@ -107,6 +111,21 @@ pub fn orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &Instal
         }
     }
     out
+}
+
+/// [`list_orphan_folders`] as evidence, each folder measured with its size, modified time and
+/// whether it holds user data.
+pub fn orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &InstalledIndex, keep: &KeepList) -> Vec<Evidence> {
+    list_orphan_folders(fs, roots, installed, keep)
+        .into_iter()
+        .map(|o| Evidence::Folder {
+            size: fs.dir_size(&o.path),
+            modified: fs.modified(&o.path),
+            root_kind: o.root_kind,
+            holds_user_data: holds_user_data(fs, &o.path),
+            path: o.path,
+        })
+        .collect()
 }
 
 #[cfg(test)]

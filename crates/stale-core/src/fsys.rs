@@ -18,11 +18,20 @@ pub trait FsReader: Send + Sync {
     fn exists(&self, p: &Path) -> bool;
     fn is_dir(&self, p: &Path) -> bool;
     fn dir_size(&self, p: &Path) -> Option<u64>;
+    /// [`FsReader::dir_size`] plus whether a subfolder could not be read (the size is then a lower
+    /// bound).
+    fn dir_size_partial(&self, p: &Path) -> Option<(u64, bool)> {
+        self.dir_size(p).map(|s| (s, false))
+    }
     /// For task XML.
     fn read_text(&self, p: &Path) -> Option<String>;
     /// Every profile dir except Public, Default, Default User and All Users.
     fn profile_dirs(&self) -> Vec<PathBuf>;
     fn env(&self, var: &str) -> Option<String>;
+    /// The Windows folder, pinned to the system (never `%SystemRoot%`).
+    fn windows_dir(&self) -> PathBuf;
+    /// True when `p` itself is a symlink, junction or other reparse point.
+    fn is_reparse(&self, p: &Path) -> bool;
     /// Last-modified time; `None` if unknown or unreadable.
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>>;
 }
@@ -135,6 +144,10 @@ impl FsReader for RealFs {
         crate::size::dir_size(p)
     }
 
+    fn dir_size_partial(&self, p: &Path) -> Option<(u64, bool)> {
+        crate::size::dir_size_partial(p)
+    }
+
     fn read_text(&self, p: &Path) -> Option<String> {
         std::fs::read(p).ok().map(|b| decode_text(&b))
     }
@@ -147,6 +160,14 @@ impl FsReader for RealFs {
 
     fn env(&self, var: &str) -> Option<String> {
         std::env::var(var).ok()
+    }
+
+    fn windows_dir(&self) -> PathBuf {
+        crate::paths::windows_dir()
+    }
+
+    fn is_reparse(&self, p: &Path) -> bool {
+        crate::quarantine::fsmove::is_reparse_point(p)
     }
 
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
@@ -169,6 +190,9 @@ pub struct FakeFs {
     nodes: BTreeMap<String, Node>,
     profiles: Vec<PathBuf>,
     env: BTreeMap<String, String>,
+    unreadable: Vec<String>,
+    reparse: Vec<String>,
+    windows: Option<PathBuf>,
 }
 
 fn parent_of(p: &Path) -> Option<PathBuf> {
@@ -233,6 +257,25 @@ impl FakeFs {
         self
     }
 
+    /// Marks the folder `path` as unreadable: [`FsReader::dir_size_partial`] of a folder above it
+    /// leaves it out and reports a partial size.
+    pub fn unreadable(mut self, path: &str) -> Self {
+        self.unreadable.push(norm(Path::new(path)));
+        self
+    }
+
+    /// Marks `path` as a link (junction, symlink).
+    pub fn reparse(mut self, path: &str) -> Self {
+        self.reparse.push(norm(Path::new(path)));
+        self
+    }
+
+    /// Sets the Windows folder ([`FsReader::windows_dir`]); `C:\Windows` otherwise.
+    pub fn windows_dir(mut self, path: &str) -> Self {
+        self.windows = Some(PathBuf::from(path));
+        self
+    }
+
     pub fn profile(mut self, path: &str) -> Self {
         self.profiles.push(PathBuf::from(path));
         self
@@ -248,6 +291,17 @@ impl FakeFs {
             return s;
         }
         self.children(&n.path).iter().map(|c| self.size_of(c)).sum()
+    }
+
+    /// `size_of` that leaves out unreadable folders and says whether it did.
+    fn size_partial(&self, n: &Node) -> (u64, bool) {
+        if self.unreadable.contains(&norm(&n.path)) {
+            return (0, true);
+        }
+        if let Some(s) = n.size {
+            return (s, false);
+        }
+        self.children(&n.path).iter().map(|c| self.size_partial(c)).fold((0, false), |a, b| (a.0 + b.0, a.1 || b.1))
     }
 }
 
@@ -271,6 +325,14 @@ impl FsReader for FakeFs {
         self.nodes.get(&norm(p)).filter(|n| n.is_dir).map(|n| self.size_of(n))
     }
 
+    fn dir_size_partial(&self, p: &Path) -> Option<(u64, bool)> {
+        let n = self.nodes.get(&norm(p)).filter(|n| n.is_dir)?;
+        if self.unreadable.contains(&norm(p)) {
+            return None;
+        }
+        Some(self.size_partial(n))
+    }
+
     fn read_text(&self, p: &Path) -> Option<String> {
         self.nodes.get(&norm(p)).and_then(|n| n.text.clone())
     }
@@ -281,6 +343,14 @@ impl FsReader for FakeFs {
 
     fn env(&self, var: &str) -> Option<String> {
         self.env.get(&var.to_uppercase()).cloned()
+    }
+
+    fn windows_dir(&self) -> PathBuf {
+        self.windows.clone().unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+    }
+
+    fn is_reparse(&self, p: &Path) -> bool {
+        self.reparse.contains(&norm(p))
     }
 
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
