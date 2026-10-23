@@ -78,6 +78,8 @@ fn classify(fs: &dyn FsReader, dir: &Path, container: Option<&str>, installed: &
 pub struct OrphanFolder {
     pub path: PathBuf,
     pub root_kind: RootKind,
+    /// The publisher folder it sits in, when it was found one level down.
+    pub container: Option<PathBuf>,
 }
 
 /// Folders in the program roots (Program Files, ProgramData and each profile's
@@ -87,21 +89,21 @@ pub struct OrphanFolder {
 pub fn list_orphan_folders(fs: &dyn FsReader, roots: &FsScanRoots, installed: &InstalledIndex, keep: &KeepList) -> Vec<OrphanFolder> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<OrphanFolder> = Vec::new();
-    let mut push = |dir: &Path, root_kind: RootKind| {
+    let mut push = |dir: &Path, root_kind: RootKind, container: Option<&Path>| {
         if seen.insert(norm(dir)) {
-            out.push(OrphanFolder { path: dir.to_path_buf(), root_kind });
+            out.push(OrphanFolder { path: dir.to_path_buf(), root_kind, container: container.map(Path::to_path_buf) });
         }
     };
     for (root, kind) in scan_roots(fs, roots) {
         for entry in fs.list_dir(&root).into_iter().filter(|e| e.is_dir) {
             match classify(fs, &entry.path, None, installed, keep) {
-                Verdict::Orphan => push(&entry.path, kind),
+                Verdict::Orphan => push(&entry.path, kind, None),
                 Verdict::Ignore => {}
                 Verdict::Container => {
                     let container = file_name(&entry.path);
                     for child in fs.list_dir(&entry.path).into_iter().filter(|e| e.is_dir) {
                         if let Verdict::Orphan = classify(fs, &child.path, Some(&container), installed, keep) {
-                            push(&child.path, kind);
+                            push(&child.path, kind, Some(&entry.path));
                         }
                     }
                 }

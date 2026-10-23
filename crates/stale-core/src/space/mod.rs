@@ -9,7 +9,7 @@ use crate::ghosts::RootKind;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
-pub use scan::{fixed_drives, list_entries, measure, measure_at, USER_TEMP_MIN_AGE_DAYS};
+pub use scan::{fixed_drives, list_entries, measure, measure_at, removal_items, USER_TEMP_MIN_AGE_DAYS};
 
 /// What a space entry is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub enum WinItem {
     WindowsBt,
     /// `$Windows.~WS`
     WindowsWs,
+    /// `$Windows.~TMP`
+    WindowsTmp,
     /// `SoftwareDistribution\Download`
     UpdateDownload,
     /// `%SystemRoot%\Temp`
@@ -51,6 +53,9 @@ pub struct SpaceEntry {
     /// The size is a lower bound: something below could not be read.
     pub partial: bool,
     pub modified: Option<DateTime<Utc>>,
+    /// Language-free reason ([`crate::ghosts::group`]'s `REASON_*` codes) why the entry is
+    /// ambiguous; the GUI words it.
+    pub note: Option<&'static str>,
 }
 
 /// How an entry may be removed.

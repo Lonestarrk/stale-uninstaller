@@ -28,6 +28,10 @@ pub trait FsReader: Send + Sync {
     /// Every profile dir except Public, Default, Default User and All Users.
     fn profile_dirs(&self) -> Vec<PathBuf>;
     fn env(&self, var: &str) -> Option<String>;
+    /// The Windows folder, pinned to the system (never `%SystemRoot%`).
+    fn windows_dir(&self) -> PathBuf;
+    /// True when `p` itself is a symlink, junction or other reparse point.
+    fn is_reparse(&self, p: &Path) -> bool;
     /// Last-modified time; `None` if unknown or unreadable.
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>>;
 }
@@ -158,6 +162,14 @@ impl FsReader for RealFs {
         std::env::var(var).ok()
     }
 
+    fn windows_dir(&self) -> PathBuf {
+        crate::paths::windows_dir()
+    }
+
+    fn is_reparse(&self, p: &Path) -> bool {
+        crate::quarantine::fsmove::is_reparse_point(p)
+    }
+
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
         std::fs::metadata(p).ok()?.modified().ok().map(DateTime::<Utc>::from)
     }
@@ -179,6 +191,8 @@ pub struct FakeFs {
     profiles: Vec<PathBuf>,
     env: BTreeMap<String, String>,
     unreadable: Vec<String>,
+    reparse: Vec<String>,
+    windows: Option<PathBuf>,
 }
 
 fn parent_of(p: &Path) -> Option<PathBuf> {
@@ -250,6 +264,18 @@ impl FakeFs {
         self
     }
 
+    /// Marks `path` as a link (junction, symlink).
+    pub fn reparse(mut self, path: &str) -> Self {
+        self.reparse.push(norm(Path::new(path)));
+        self
+    }
+
+    /// Sets the Windows folder ([`FsReader::windows_dir`]); `C:\Windows` otherwise.
+    pub fn windows_dir(mut self, path: &str) -> Self {
+        self.windows = Some(PathBuf::from(path));
+        self
+    }
+
     pub fn profile(mut self, path: &str) -> Self {
         self.profiles.push(PathBuf::from(path));
         self
@@ -317,6 +343,14 @@ impl FsReader for FakeFs {
 
     fn env(&self, var: &str) -> Option<String> {
         self.env.get(&var.to_uppercase()).cloned()
+    }
+
+    fn windows_dir(&self) -> PathBuf {
+        self.windows.clone().unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+    }
+
+    fn is_reparse(&self, p: &Path) -> bool {
+        self.reparse.contains(&norm(p))
     }
 
     fn modified(&self, p: &Path) -> Option<DateTime<Utc>> {
